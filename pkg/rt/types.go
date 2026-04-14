@@ -53,12 +53,37 @@ type LGURL struct {
 	Raw      string `letgo:"raw"`
 }
 
+// WaitResult is the struct behind syscall/waitpid return values.
+type WaitResult struct {
+	Pid    int `letgo:"pid"`
+	Status int `letgo:"status"`
+}
+
+// UnameResult is the struct behind syscall/uname return values.
+type UnameResult struct {
+	Sysname  string `letgo:"sysname"`
+	Machine  string `letgo:"machine"`
+	Release  string `letgo:"release"`
+	Nodename string `letgo:"nodename"`
+}
+
+// SpawnResult is the struct behind syscall/spawn return values.
+type SpawnResult struct {
+	Pid  int    `letgo:"pid"`
+	Exit int    `letgo:"exit"`
+	Out  string `letgo:"out"`
+	Err  string `letgo:"err"`
+}
+
 var (
 	fileStatMapping     *vm.StructMapping
 	shellResultMapping  *vm.StructMapping
 	httpRequestMapping  *vm.StructMapping
 	httpResponseMapping *vm.StructMapping
 	urlMapping          *vm.StructMapping
+	waitResultMapping   *vm.StructMapping
+	unameResultMapping  *vm.StructMapping
+	spawnResultMapping  *vm.StructMapping
 )
 
 // initTypeMappings registers all struct mappings. Called from lang.go init()
@@ -69,4 +94,7 @@ func initTypeMappings() {
 	httpRequestMapping = vm.RegisterStruct[HTTPRequest]("http/Request")
 	httpResponseMapping = vm.RegisterStruct[HTTPResponse]("http/Response")
 	urlMapping = vm.RegisterStruct[LGURL]("io/URL")
+	waitResultMapping = vm.RegisterStruct[WaitResult]("syscall/WaitResult")
+	unameResultMapping = vm.RegisterStruct[UnameResult]("syscall/UnameResult")
+	spawnResultMapping = vm.RegisterStruct[SpawnResult]("syscall/SpawnResult")
 }
