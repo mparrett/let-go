@@ -178,6 +178,9 @@ func installSyscallNS() {
 	ns.Def("sethostname", unsupported("sethostname"))
 	ns.Def("exec", unsupported("exec"))
 	ns.Def("spawn", unsupported("spawn"))
+	ns.Def("spawn-async", unsupported("spawn-async"))
+	ns.Def("pipe", unsupported("pipe"))
+	ns.Def("kill", unsupported("kill"))
 	ns.Def("uname", unsupported("uname"))
 	ns.Def("setuid", unsupported("setuid"))
 	ns.Def("setgid", unsupported("setgid"))
@@ -212,6 +215,15 @@ func installSyscallNS() {
 	ns.Def("MS_NOEXEC", vm.MakeInt(8))
 
 	ns.Def("WNOHANG", vm.MakeInt(1))
+
+	// signals (Linux values — constants load everywhere, call sites error)
+	ns.Def("SIGHUP", vm.MakeInt(1))
+	ns.Def("SIGINT", vm.MakeInt(2))
+	ns.Def("SIGQUIT", vm.MakeInt(3))
+	ns.Def("SIGKILL", vm.MakeInt(9))
+	ns.Def("SIGTERM", vm.MakeInt(15))
+	ns.Def("SIGCHLD", vm.MakeInt(17))
+	ns.Def("SIGWINCH", vm.MakeInt(28))
 
 	RegisterNS(ns)
 }

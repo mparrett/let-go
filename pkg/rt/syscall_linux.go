@@ -435,6 +435,128 @@ func installSyscallNS() {
 		}), nil
 	})
 
+	// syscall/pipe — (syscall/pipe) → [read-handle write-handle]
+	// Creates an anonymous pipe. Both ends are IOHandles (*os.File-backed).
+	pipeFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 0 {
+			return vm.NIL, fmt.Errorf("syscall/pipe expects 0 args")
+		}
+		r, w, err := os.Pipe()
+		if err != nil {
+			return vm.NIL, fmt.Errorf("pipe: %v", err)
+		}
+		return vm.ArrayVector([]vm.Value{
+			vm.NewBoxed(NewIOHandle(r)),
+			vm.NewBoxed(NewIOHandle(w)),
+		}), nil
+	})
+
+	// syscall/kill — (syscall/kill pid sig)
+	killFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 2 {
+			return vm.NIL, fmt.Errorf("syscall/kill expects 2 args (pid sig)")
+		}
+		pid, ok := vs[0].(vm.Int)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/kill expected Int pid")
+		}
+		sig, ok := vs[1].(vm.Int)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/kill expected Int sig")
+		}
+		if err := syscall.Kill(int(pid), syscall.Signal(int(sig))); err != nil {
+			return vm.NIL, fmt.Errorf("kill: %v", err)
+		}
+		return vm.NIL, nil
+	})
+
+	// stdioFile resolves a spawn stdio slot value to an *os.File.
+	// nil → opens /dev/null with the given flag.
+	// IOHandle → returns underlying File.
+	stdioFile := func(v vm.Value, flag int) (*os.File, bool, error) {
+		if v == vm.NIL || v == nil {
+			f, err := os.OpenFile(os.DevNull, flag, 0)
+			if err != nil {
+				return nil, false, err
+			}
+			return f, true, nil // caller must close
+		}
+		h, err := getIOHandle(v)
+		if err != nil {
+			return nil, false, err
+		}
+		return h.File, false, nil
+	}
+
+	// syscall/spawn-async — (syscall/spawn-async path argv env cloneflags stdin stdout stderr)
+	// Non-blocking: returns {:pid p} immediately. Caller waits via syscall/waitpid.
+	// Each stdio slot is nil (→ /dev/null) or an IOHandle. The child gets a dup of
+	// the underlying fd; the parent retains its handle and may close it after spawn.
+	spawnAsyncFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 7 {
+			return vm.NIL, fmt.Errorf("syscall/spawn-async expects 7 args (path argv env cloneflags stdin stdout stderr)")
+		}
+		path, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/spawn-async expected String path")
+		}
+		argvSeq, ok := vs[1].(vm.Sequable)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/spawn-async expected Sequable argv")
+		}
+		envSeq, ok := vs[2].(vm.Sequable)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/spawn-async expected Sequable env")
+		}
+		flags, ok := vs[3].(vm.Int)
+		if !ok {
+			return vm.NIL, fmt.Errorf("syscall/spawn-async expected Int cloneflags")
+		}
+		argv := seqToStrings(argvSeq.Seq())
+		env := seqToStrings(envSeq.Seq())
+
+		stdinF, stdinOwn, err := stdioFile(vs[4], os.O_RDONLY)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("spawn-async stdin: %v", err)
+		}
+		if stdinOwn {
+			defer stdinF.Close()
+		}
+		stdoutF, stdoutOwn, err := stdioFile(vs[5], os.O_WRONLY)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("spawn-async stdout: %v", err)
+		}
+		if stdoutOwn {
+			defer stdoutF.Close()
+		}
+		stderrF, stderrOwn, err := stdioFile(vs[6], os.O_WRONLY)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("spawn-async stderr: %v", err)
+		}
+		if stderrOwn {
+			defer stderrF.Close()
+		}
+
+		proc, err := os.StartProcess(string(path), argv, &os.ProcAttr{
+			Env:   env,
+			Files: []*os.File{stdinF, stdoutF, stderrF},
+			Sys: &syscall.SysProcAttr{
+				Cloneflags: uintptr(flags),
+				// Give the child its own session so it survives the parent's
+				// shell/sudo tearing down the process group. Callers that want
+				// tty-attached children shouldn't use spawn-async.
+				Setsid: true,
+			},
+		})
+		if err != nil {
+			return vm.NIL, fmt.Errorf("spawn-async: %v", err)
+		}
+		// Release the *os.Process — waitpid will reap it via the kernel.
+		pid := proc.Pid
+		_ = proc.Release()
+		return spawnResultMapping.StructToRecord(SpawnResult{Pid: pid}), nil
+	})
+
 	// syscall/spawn — (syscall/spawn path argv env cloneflags)
 	// Fork+exec a child process with namespace cloneflags.
 	// Returns {:pid p :exit e :out "..." :err "..."} after the child exits.
@@ -513,6 +635,9 @@ func installSyscallNS() {
 	// process
 	ns.Def("exec", execFn)
 	ns.Def("spawn", spawnFn)
+	ns.Def("spawn-async", spawnAsyncFn)
+	ns.Def("pipe", pipeFn)
+	ns.Def("kill", killFn)
 	ns.Def("getpid", getpidFn)
 	ns.Def("getuid", getuidFn)
 	ns.Def("getgid", getgidFn)
@@ -543,6 +668,15 @@ func installSyscallNS() {
 	ns.Def("MS_NOSUID", vm.MakeInt(2))
 	ns.Def("MS_NODEV", vm.MakeInt(4))
 	ns.Def("MS_NOEXEC", vm.MakeInt(8))
+
+	// signals
+	ns.Def("SIGHUP", vm.MakeInt(1))
+	ns.Def("SIGINT", vm.MakeInt(2))
+	ns.Def("SIGQUIT", vm.MakeInt(3))
+	ns.Def("SIGKILL", vm.MakeInt(9))
+	ns.Def("SIGTERM", vm.MakeInt(15))
+	ns.Def("SIGCHLD", vm.MakeInt(17))
+	ns.Def("SIGWINCH", vm.MakeInt(28))
 
 	// waitpid options
 	ns.Def("WNOHANG", vm.MakeInt(1))

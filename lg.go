@@ -230,7 +230,7 @@ func checkBundledLGB() []byte {
 
 // bundleBinary creates a standalone executable by copying the lg binary
 // and appending the compiled LGB + footer.
-func bundleBinary(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, dst string) error {
+func bundleBinary(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, dst string, basePath string) error {
 	ctx.SetSource(src)
 	f, err := os.Open(src)
 	if err != nil {
@@ -261,12 +261,15 @@ func bundleBinary(ctx *compiler.Context, nsRes *resolver.NSResolver, src string,
 		}
 	}
 
-	// Copy our own binary
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("finding executable: %w", err)
+	// Base binary: user-supplied target (for cross-OS bundling) or our own exe.
+	if basePath == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("finding executable: %w", err)
+		}
+		basePath = exe
 	}
-	srcBin, err := os.Open(exe)
+	srcBin, err := os.Open(basePath)
 	if err != nil {
 		return err
 	}
@@ -386,6 +389,7 @@ var debug bool
 var showVersion bool
 var compileOutput string
 var bundleOutput string
+var bundleBase string
 var wasmOutput string
 
 func init() {
@@ -398,6 +402,7 @@ func init() {
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&compileOutput, "c", "", "compile .lg file to .lgb bytecode (specify output path)")
 	flag.StringVar(&bundleOutput, "b", "", "bundle .lg file into a standalone executable (specify output path)")
+	flag.StringVar(&bundleBase, "bundle-base", "", "path to target-platform lg binary for cross-OS bundling (defaults to current executable)")
 	flag.StringVar(&wasmOutput, "w", "", "build .lg file into a WASM web app (specify output directory)")
 
 	completionTerminators = map[byte]bool{
@@ -525,7 +530,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: -b requires exactly one input file")
 			os.Exit(1)
 		}
-		if err := bundleBinary(context, nsResolver, files[0], bundleOutput); err != nil {
+		if err := bundleBinary(context, nsResolver, files[0], bundleOutput, bundleBase); err != nil {
 			fmt.Fprint(os.Stderr, vm.FormatError(err))
 			os.Exit(1)
 		}
@@ -545,18 +550,18 @@ func main() {
 		return
 	}
 
+	// Script mode: treat only the first positional as the script to run.
+	// Any further positionals belong to the script (it reads os/args).
 	ranSomething := false
 	if len(files) >= 1 {
-		for i := range files {
-			if filepath.Ext(files[i]) == ".lgb" {
-				// Run precompiled bytecode directly
-				if err := runLGB(files[i]); err != nil {
-					fmt.Print(vm.FormatError(err))
-				}
-			} else {
-				if err := runFile(context, files[i]); err != nil {
-					fmt.Print(vm.FormatError(err))
-				}
+		script := files[0]
+		if filepath.Ext(script) == ".lgb" {
+			if err := runLGB(script); err != nil {
+				fmt.Print(vm.FormatError(err))
+			}
+		} else {
+			if err := runFile(context, script); err != nil {
+				fmt.Print(vm.FormatError(err))
 			}
 		}
 		ranSomething = true
