@@ -358,5 +358,5 @@ go test ./... -count=1 -timeout 30s
 
 - Ever wanted a 20MB pure-Go JS runtime that typechecks and runs TypeScript? check my other project https://github.com/nooga/paserati
 
-[🤓 Follow me on twitter](https://twitter.com/MGasperowicz)
+[🤓 Follow me on X](https://x.com/MGasperowicz)
 [🐬 Check out monk.io](https://monk.io)
