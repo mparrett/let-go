@@ -8,7 +8,8 @@ before:
     - go test -timeout 60s ./...
 
 builds:
-  - main: .
+  - id: unix
+    main: .
     binary: lg
     ldflags:
       - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}}
@@ -20,6 +21,20 @@ builds:
     goarch:
       - amd64
       - arm64
+  # Plan 9 / 9front. Go's plan9 port supports 386, amd64, and arm (32-bit).
+  # No arm64 target exists upstream.
+  - id: plan9
+    main: .
+    binary: lg
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - plan9
+    goarch:
+      - amd64
+      - arm
 
 archives:
   - format: tar.gz
