@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
+	"runtime"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
@@ -171,5 +173,53 @@ func installOsNS() {
 	ns.Def("ls", ls)
 	ns.Def("stat", stat)
 	ns.Def("sh", sh)
+
+	// os/os-name — (os/os-name) → "linux", "darwin", "windows", ...
+	ns.Def("os-name", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.String(runtime.GOOS), nil
+	}))
+
+	// os/arch — (os/arch) → "amd64", "arm64", ...
+	ns.Def("arch", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.String(runtime.GOARCH), nil
+	}))
+
+	// os/user-name — (os/user-name)
+	ns.Def("user-name", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		if u, err := user.Current(); err == nil {
+			return vm.String(u.Username), nil
+		}
+		return vm.String(os.Getenv("USER")), nil
+	}))
+
+	// os/hostname — (os/hostname)
+	ns.Def("hostname", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		h, err := os.Hostname()
+		if err != nil {
+			return vm.NIL, err
+		}
+		return vm.String(h), nil
+	}))
+
+	// os/file-separator, os/path-separator, os/line-separator
+	ns.Def("file-separator", vm.String(string(os.PathSeparator)))
+	ns.Def("path-separator", vm.String(string(os.PathListSeparator)))
+	ns.Def("line-separator", vm.String(lineSeparator()))
+
 	RegisterNS(ns)
+}
+
+func lineSeparator() string {
+	if runtime.GOOS == "windows" {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+func mustWrap(fn func([]vm.Value) (vm.Value, error)) vm.Value {
+	v, err := vm.NativeFnType.Wrap(fn)
+	if err != nil {
+		panic(err)
+	}
+	return v
 }

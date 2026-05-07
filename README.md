@@ -70,7 +70,8 @@ behavior) and a handful of stub namespaces — see below. Workflow guide: [docs/
 | `http`               | Ring-style server + client, streaming responses                                                                 |
 | `json`               | `read-json`, `write-json` — float-preserving, record-aware                                                      |
 | `transit`            | transit+json codec with rolling cache                                                                           |
-| `os`                 | `sh`, `stat`, `ls`, `cwd`, `getenv`, `setenv`, `exit`                                                           |
+| `os`                 | `sh`, `stat`, `ls`, `cwd`, `getenv`/`setenv`, `exit`, `os-name`, `arch`, `user-name`, `hostname`, separators    |
+| `System`             | JVM-shaped: `getProperty`, `getProperties`, `getenv`, `exit`, `lineSeparator`, `currentTimeMillis`, `nanoTime`. Exposes `let-go.version`, `let-go.commit`, `user.home`, `user.dir`, `os.name`, `os.arch`, etc. |
 | `syscall`            | Direct Linux syscalls (mount, unshare, mknod, prctl, capset, seccomp, AppArmor) for systems programming         |
 | `pods`               | Babashka pods over JSON / EDN / transit                                                                         |
 

@@ -464,6 +464,10 @@ func initCompiler(debug bool) *compiler.Context {
 }
 
 func main() {
+	// Propagate version metadata to runtime so System/getProperty exposes it.
+	rt.Version = version
+	rt.Commit = commit
+
 	// Check for appended LGB payload before anything else.
 	// If found, we're a standalone binary — run it directly.
 	if lgbData := checkBundledLGB(); lgbData != nil {
