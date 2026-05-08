@@ -183,6 +183,14 @@ func (c *Context) enterFn(args []vm.Value) (*Context, error) {
 
 	for i := range args {
 		a := args[i]
+		// Strip metadata wrappers from arg symbols: `[^String s]` is read as
+		// `[(with-meta s {:tag String})]`. We don't yet attach meta to locals,
+		// just drop it so the symbol check below succeeds.
+		if lst, ok := a.(*vm.List); ok && lst.First() == vm.Symbol("with-meta") {
+			if rest := lst.Next(); rest != nil {
+				a = rest.First()
+			}
+		}
 		s, ok := a.(vm.Symbol)
 		if !ok {
 			return nil, NewCompileError("all fn formal arguments must be symbols")
@@ -746,6 +754,25 @@ func tryCompiler(c *Context, form vm.Value) error {
 					rest := seq.Next()
 					if rest == nil {
 						return NewCompileError("catch requires a binding symbol")
+					}
+					// Clojure-compatible form: (catch ClassSym bind-sym body...)
+					// vs let-go's bare (catch bind-sym body...).
+					// Disambiguate by counting forms: Clojure requires a body,
+					// so the class form has 3+ tokens after `catch`. If we see
+					// at least 3 tokens and the first two are both symbols,
+					// drop the leading class symbol (catch is catch-all here).
+					restCount := 0
+					for s := rest; s != nil; s = s.Next() {
+						restCount++
+					}
+					if restCount >= 3 {
+						first := rest.First()
+						afterRest := rest.Next()
+						if _, isSym := first.(vm.Symbol); isSym {
+							if _, secondIsSym := afterRest.First().(vm.Symbol); secondIsSym {
+								rest = afterRest
+							}
+						}
 					}
 					bindSym, ok := rest.First().(vm.Symbol)
 					if !ok {

@@ -1435,6 +1435,29 @@
 
 (def ^:dynamic *assert* true)
 
+;; --- print/read tuning dynamic vars (stubs; not yet honored by writers) ---
+
+(def ^:dynamic *print-level* nil)
+(def ^:dynamic *print-length* nil)
+(def ^:dynamic *print-meta* false)
+(def ^:dynamic *print-readably* true)
+(def ^:dynamic *print-dup* false)
+(def ^:dynamic *flush-on-newline* true)
+
+;; --- macro implicit context (stubs) ---
+;; Clojure's compiler binds &env (lexical-env map) and &form (the current
+;; form being expanded) inside macro bodies. let-go's macro invoker doesn't
+;; thread these in yet, so we bind them globally to nil so macros that
+;; reference them at least resolve. Behavior for code that branches on
+;; their value will differ from Clojure — but the file loads.
+(def &env nil)
+(def &form nil)
+
+;; tagged-literal? — let-go has no TaggedLiteral type yet, so no value
+;; is ever a tagged literal. Returning false unconditionally matches
+;; how Clojure treats anything that didn't go through (tagged-literal …).
+(defn tagged-literal? [_] false)
+
 (defmacro assert
   ([x]
    `(when *assert*

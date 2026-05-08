@@ -152,6 +152,16 @@ func postCoreInit() {
 	lsVar := coreNS.LookupOrAdd(vm.Symbol("load-string"))
 	lsVar.(*vm.Var).SetRoot(loadStringFn)
 
+	// set-read-clj!: opt in to matching :clj in reader conditionals.
+	// Used by the real-world compat runner; off by default so the
+	// conformance suite doesn't reach JVM-only :clj branches.
+	setReadCljFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		v := vs[0]
+		SetMatchCljConditional(v != vm.NIL && v != vm.FALSE)
+		return vm.NIL, nil
+	})
+	coreNS.LookupOrAdd(vm.Symbol("set-read-clj!")).(*vm.Var).SetRoot(setReadCljFn)
+
 	// Wire up EDN reader for pod support
 	rt.SetReadEDN(func(s string) (vm.Value, error) {
 		return ReadString(s)

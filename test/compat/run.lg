@@ -14,6 +14,9 @@
 
 (require 'string)
 
+;; Match :clj in reader conditionals: this runner pretends to be Clojure.
+(set-read-clj! true)
+
 (def cache-dir
   (str (os/getenv "HOME") "/.cache/let-go-compat"))
 
