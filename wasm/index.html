@@ -1,271 +1,761 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>let-go — Clojure dialect in Go</title>
-    <script src="wasm_exec.js"></script>
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.terminal/2.42.0/js/jquery.terminal.min.js"></script>
-    <link
-      href="https://cdnjs.cloudflare.com/ajax/libs/jquery.terminal/2.42.0/css/jquery.terminal.min.css"
-      rel="stylesheet"
+    <meta name="color-scheme" content="light dark" />
+    <title>let-go · Almost Clojure in Go</title>
+    <meta
+      name="description"
+      content="A Clojure dialect with a bytecode compiler and stack VM, written in Go. ~10MB binary, ~7ms cold start, no JVM."
     />
+    <link rel="icon" type="image/svg+xml" href="logo.svg" />
+
+    <script src="wasm_exec.js"></script>
+
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Boldonse&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+
     <style>
-      * {
-        box-sizing: border-box;
-        margin: 0;
-        padding: 0;
-      }
-
       :root {
-        --bg: #0c0c0c;
-        --fg: #e8e6df;
-        --dim: #5a584f;
-        --accent: #5ec4b6;
-        --border: #1e1e1e;
-        --mono: "IBM Plex Mono", monospace;
+        --serif: "Boldonse", "Iowan Old Style", Georgia, serif;
+        --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+        /* light — warm off-white */
+        --bg: #f4ecdb;
+        --fg: #1d180f;
+        --muted: #877a5e;
+        --rule: #d6c8a8;
+        --accent: #b45309; /* amber */
+
+        --term-bg: #1a1610;
+        --term-fg: #ede1c4;
+        --term-cursor: #f5b041;
       }
 
-      html,
-      body {
-        height: 100%;
+      :root[data-theme="dark"] {
+        --bg: #1a1610;
+        --fg: #ede1c4;
+        --muted: #7a6d52;
+        --rule: #34291c;
+        --accent: #f5b041;
+
+        --term-bg: #110d08;
+        --term-fg: #ede1c4;
+        --term-cursor: #f5b041;
+      }
+
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      html {
         background: var(--bg);
         color: var(--fg);
         font-family: var(--mono);
+        font-size: 15px;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
       }
-
       body {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
+        min-height: 100vh;
+        line-height: 1.55;
       }
 
-      #page {
-        width: 100%;
-        max-width: 760px;
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        padding: 0 1.5rem;
-      }
-
-      #header {
-        padding: 2.5rem 0 1.5rem;
-        display: flex;
-        align-items: center;
-        gap: 1.2rem;
-      }
-
-      #header .logo {
-        width: 5em;
-        height: 5em;
-        flex-shrink: 0;
-        opacity: 0.9;
-      }
-
-      #header .title {
-        font-weight: 600;
-        font-size: 1.1rem;
-        letter-spacing: -0.02em;
-      }
-
-      #header .subtitle {
-        font-size: 0.8rem;
-        color: var(--dim);
-        margin-top: 0.15rem;
-      }
-
-      #header .links {
-        margin-left: auto;
-        display: flex;
-        gap: 1rem;
-        font-size: 0.75rem;
-      }
-
-      #header .links a {
-        color: var(--dim);
+      a {
+        color: inherit;
         text-decoration: none;
-        transition: color 0.15s;
+        border-bottom: 1px solid var(--rule);
+        transition: color 0.15s ease, border-color 0.15s ease;
+      }
+      a:hover { color: var(--accent); border-color: var(--accent); }
+
+      ::selection { background: var(--accent); color: var(--bg); }
+
+      .shell {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 1.4rem clamp(1rem, 4vw, 2rem) 3rem;
       }
 
-      #header .links a:hover {
+      /* nav */
+      nav.top {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 1.2rem;
+        font-size: 0.82rem;
+        color: var(--muted);
+      }
+      nav.top a { border: 0; color: var(--muted); }
+      nav.top a:hover { color: var(--accent); }
+
+      .theme {
+        background: transparent;
+        border: 0;
+        color: var(--muted);
+        cursor: pointer;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+      }
+      .theme:hover { color: var(--accent); }
+
+      /* hero */
+      header.hero {
+        margin-top: clamp(3rem, 9vw, 5.5rem);
+        display: flex;
+        align-items: center;
+        gap: clamp(1rem, 3vw, 1.6rem);
+      }
+      header.hero img.logo {
+        width: clamp(80px, 14vw, 120px);
+        height: auto;
+        flex-shrink: 0;
+      }
+      header.hero h1 {
+        font-family: var(--serif);
+        font-weight: 400;
+        font-size: clamp(1.7rem, 5vw, 3.2rem);
+        line-height: 1.35;
+        letter-spacing: -0.005em;
+      }
+      header.hero h1 em {
+        font-style: normal;
         color: var(--accent);
       }
 
-      #loading {
-        flex: 1;
+      /* prose */
+      p.intro {
+        margin-top: clamp(1.6rem, 4vw, 2.2rem);
+        max-width: 60ch;
+        font-size: 0.95rem;
+        color: var(--fg);
+      }
+      p.intro a { border-bottom-color: var(--rule); }
+
+      /* stats strip */
+      ul.stats {
+        list-style: none;
+        margin-top: clamp(1.8rem, 4vw, 2.4rem);
+        padding: 0.85rem 0;
+        border-top: 1px solid var(--rule);
+        border-bottom: 1px solid var(--rule);
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.5rem 1rem;
+        font-size: 0.82rem;
+      }
+      @media (max-width: 540px) {
+        ul.stats { grid-template-columns: repeat(2, 1fr); }
+      }
+      ul.stats li {
+        display: flex;
+        flex-direction: column;
+        gap: 0.1rem;
+      }
+      ul.stats .v { color: var(--fg); font-weight: 500; }
+      ul.stats .v em { font-style: normal; color: var(--accent); }
+      ul.stats .k { color: var(--muted); font-size: 0.72rem; letter-spacing: 0.04em; }
+
+      /* terminal — no chrome */
+      .repl {
+        margin-top: clamp(1.6rem, 4vw, 2.2rem);
+        background: var(--term-bg);
+        padding: 0.85rem 0.6rem 0.5rem 0.85rem;
+        border-radius: 6px;
+        height: clamp(360px, 56vh, 520px);
+        position: relative;
+      }
+      .repl .xterm,
+      .repl .xterm-viewport { height: 100%; background: transparent !important; }
+
+      .repl-loading {
+        position: absolute;
+        inset: 0;
         display: flex;
         align-items: center;
         justify-content: center;
         font-size: 0.85rem;
-        color: var(--dim);
-      }
-
-      #loading .dot {
-        animation: pulse 1.2s ease-in-out infinite;
-      }
-
-      @keyframes pulse {
-        0%,
-        100% {
-          opacity: 0.3;
-        }
-        50% {
-          opacity: 1;
-        }
-      }
-
-      #term-wrap {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        padding: 1rem 0 2rem;
-        min-height: 0;
-      }
-
-      .terminal {
-        --color: var(--fg) !important;
-        --background: transparent !important;
-        --font: var(--mono) !important;
-        --size: 0.85rem !important;
-        flex: 1;
-      }
-
-      .terminal .terminal-output .format {
-        color: var(--fg);
-      }
-
-      .cmd .cmd-prompt {
-        color: var(--accent) !important;
-      }
-
-      .cmd .cmd-cursor-line .cmd-cursor {
-        background-color: var(--accent) !important;
-        color: var(--bg) !important;
-      }
-
-      .terminal ::-webkit-scrollbar {
-        width: 4px;
-      }
-      .terminal ::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      .terminal ::-webkit-scrollbar-thumb {
-        background: var(--border);
-        border-radius: 2px;
-      }
-
-      @media (max-width: 600px) {
-        #header {
-          flex-wrap: wrap;
-          padding: 1.5rem 0 1rem;
-        }
-        #header .links {
-          width: 100%;
-          margin-left: 0;
-          margin-top: 0.5rem;
-        }
-        #page {
-          padding: 0 1rem;
-        }
-      }
-
-      #term-wrap {
-        opacity: 0;
+        color: color-mix(in oklab, var(--term-fg) 50%, transparent);
+        background: var(--term-bg);
         transition: opacity 0.3s ease;
       }
-      #term-wrap.visible {
-        opacity: 1;
+      .repl-loading.gone { opacity: 0; pointer-events: none; }
+
+      /* example chips */
+      .examples {
+        margin-top: 0.85rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+        align-items: center;
+        font-size: 0.78rem;
       }
+      .examples .label {
+        font-size: 0.7rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-right: 0.25rem;
+      }
+      .examples button {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        background: transparent;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        padding: 0.25rem 0.65rem;
+        color: var(--fg);
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+      }
+      .examples button:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      .repl-loading .blink { color: var(--accent); animation: blink 1s steps(2) infinite; margin-right: 0.4rem; }
+      @keyframes blink { 50% { opacity: 0.2; } }
+
+      /* sections */
+      section.row {
+        margin-top: clamp(2.4rem, 5vw, 3.4rem);
+      }
+      section.row > h2 {
+        font-size: 0.72rem;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 500;
+        font-family: var(--mono);
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        margin-bottom: 0.85rem;
+      }
+      section.row > h2::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: var(--rule);
+      }
+      section.row > p.lead {
+        font-size: 0.92rem;
+        color: var(--fg);
+        margin: 0 0 1rem;
+        max-width: 60ch;
+      }
+
+      /* usage — three terse rows */
+      ul.usage {
+        list-style: none;
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 0.45rem;
+      }
+      ul.usage li {
+        display: grid;
+        grid-template-columns: 5.5rem 1fr;
+        align-items: baseline;
+        gap: 0.85rem;
+        padding: 0.55rem 0.85rem;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        font-size: 0.84rem;
+        min-width: 0;
+      }
+      ul.usage .label {
+        color: var(--muted);
+        font-size: 0.7rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+      ul.usage code {
+        font-family: var(--mono);
+        color: var(--fg);
+        white-space: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        min-width: 0;
+      }
+      ul.usage code::-webkit-scrollbar { display: none; }
+      ul.usage code::before { content: "$ "; color: var(--accent); }
+      ul.usage .note {
+        grid-column: 2;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+
+      /* embed code block */
+      pre.embed {
+        margin: 0;
+        padding: 0.95rem 1rem;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        font-family: var(--mono);
+        font-size: 0.82rem;
+        line-height: 1.55;
+        color: var(--fg);
+        overflow-x: auto;
+        scrollbar-width: thin;
+        white-space: pre;
+      }
+      pre.embed .c { color: var(--muted); }
+      pre.embed .k { color: var(--accent); }
+      pre.embed .s { color: var(--accent); }
+
+      /* install — two boxes */
+      .install {
+        margin-top: clamp(1.6rem, 4vw, 2.2rem);
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.7rem;
+        font-size: 0.82rem;
+      }
+      @media (max-width: 540px) { .install { grid-template-columns: 1fr; } }
+      .install .box {
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        padding: 0.7rem 0.85rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        min-width: 0;
+      }
+      .install .box .label {
+        font-size: 0.7rem;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .install .box code {
+        font-family: var(--mono);
+        color: var(--fg);
+        font-size: 0.82rem;
+        white-space: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      .install .box code::-webkit-scrollbar { display: none; }
+      .install .box code::before { content: "$ "; color: var(--accent); }
+
+      ul.also {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 0.5rem;
+      }
+      ul.also li {
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 0.85rem;
+        align-items: baseline;
+      }
+      ul.also a {
+        font-family: var(--mono);
+        font-size: 0.88rem;
+        color: var(--fg);
+        border: 0;
+      }
+      ul.also a:hover { color: var(--accent); }
+      ul.also .what {
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+
+      footer {
+        margin-top: clamp(2rem, 4vw, 2.6rem);
+        padding-top: 1rem;
+        border-top: 1px solid var(--rule);
+        font-size: 0.78rem;
+        color: var(--muted);
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      footer a { border: 0; color: var(--muted); }
+      footer a:hover { color: var(--accent); }
     </style>
   </head>
   <body>
-    <div id="page">
-      <div id="header">
-        <a href="https://github.com/nooga/let-go">
-          <img src="logo.svg" class="logo" alt="let-go" />
-        </a>
-        <div>
-          <div class="title">let-go</div>
-          <div class="subtitle">
-            Clojure dialect &middot; bytecode VM &middot; written in Go
+    <div class="shell">
+      <nav class="top">
+        <a href="https://github.com/nooga/let-go#readme">readme</a>
+        <a href="https://github.com/nooga/let-go/releases">releases</a>
+        <a href="https://github.com/nooga/let-go">github</a>
+        <button class="theme" id="themeToggle" type="button" aria-label="Toggle theme">
+          <svg id="themeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"></svg>
+        </button>
+      </nav>
+
+      <header class="hero">
+        <img class="logo" src="logo.svg" alt="" />
+        <h1>Almost <em>Clojure</em><br />in Go.</h1>
+      </header>
+
+      <p class="intro">
+        <em>let-go</em> is a Clojure-like lisp, running on a small Go-built
+        VM instead of the JVM, so it boots fast and fits in a pocket. Your
+        programs compile to standalone binaries.
+      </p>
+
+      <ul class="stats">
+        <li><span class="v"><em>10</em>&nbsp;MB</span><span class="k">binary</span></li>
+        <li><span class="v"><em>6.7</em>&nbsp;ms</span><span class="k">cold start</span></li>
+        <li><span class="v"><em>13.5</em>&nbsp;MB</span><span class="k">idle memory</span></li>
+        <li><span class="v"><em>95</em>&nbsp;%</span><span class="k">jank suite</span></li>
+      </ul>
+
+      <div class="repl" id="replFrame">
+        <div class="repl-loading" id="replLoading"><span class="blink">▌</span>booting wasm…</div>
+        <div id="term" style="height:100%"></div>
+      </div>
+
+      <div class="examples" id="examples">
+        <span class="label">try</span>
+        <button data-send="(->> (range 20) (filter odd?) (map #(* % %)) (take 5))">threading</button>
+        <button data-send="(def n (atom 0))&#10;(dotimes [_ 10] (swap! n inc))&#10;@n">atoms</button>
+        <button data-send="(take 10 (iterate #(* 2 %) 1))">lazy seq</button>
+        <button data-send="(let [{:keys [a b]} {:a 1 :b 2 :c 3}] (+ a b))">destructure</button>
+        <button data-send="(defn fact [n] (if (< n 2) 1 (* n (fact (dec n)))))&#10;(fact 20)">recursion</button>
+      </div>
+
+      <section class="row">
+        <h2>Install</h2>
+        <div class="install">
+          <div class="box">
+            <span class="label">homebrew</span>
+            <code>brew tap nooga/let-go https://github.com/nooga/let-go</code>
+            <code>brew install let-go</code>
+          </div>
+          <div class="box">
+            <span class="label">go</span>
+            <code>go install github.com/nooga/let-go@latest</code>
           </div>
         </div>
-        <div class="links">
-          <a href="https://github.com/nooga/let-go">source</a>
-          <a href="https://github.com/nooga/let-go/releases">install</a>
-        </div>
-      </div>
+      </section>
 
-      <div id="loading">
-        <span>loading wasm<span class="dot">&nbsp;...</span></span>
-      </div>
+      <section class="row">
+        <h2>Usage</h2>
+        <p class="lead">
+          One <code style="font-family:var(--mono);font-size:0.85em">lg</code>
+          binary covers the lifecycle: open a REPL, bundle a script into a
+          standalone executable, or build a self-contained WASM page.
+        </p>
+        <ul class="usage">
+          <li>
+            <span class="label">REPL</span>
+            <code>lg</code>
+          </li>
+          <li>
+            <span class="label">nREPL</span>
+            <code>lg -n</code>
+            <span class="note">starts an nREPL server on port 2137 for Calva, CIDER, etc.</span>
+          </li>
+          <li>
+            <span class="label">Bundle</span>
+            <code>lg -b myprog main.lg</code>
+            <span class="note">produces a standalone binary.</span>
+          </li>
+          <li>
+            <span class="label">WASM</span>
+            <code>lg -w ./out main.lg</code>
+            <span class="note">a static directory with html, wasm, and runtime.</span>
+          </li>
+        </ul>
+      </section>
 
-      <div id="term-wrap" style="display: none">
-        <div id="term"></div>
-      </div>
+      <section class="row">
+        <h2>Embedding</h2>
+        <p class="lead">
+          let-go embeds in any Go program as a library. Define Go values and
+          functions on the runtime, evaluate Clojure source against them.
+          Channels, structs, and slices cross the boundary in both directions.
+        </p>
+<pre class="embed"><span class="c">// go get github.com/nooga/let-go</span>
+<span class="k">import</span> <span class="s">"github.com/nooga/let-go/pkg/api"</span>
+
+lg, _ := api.<span class="k">NewLetGo</span>(<span class="s">"user"</span>)
+
+lg.<span class="k">Def</span>(<span class="s">"x"</span>, <span class="s">42</span>)
+lg.<span class="k">Def</span>(<span class="s">"mul"</span>, <span class="k">func</span>(a, b <span class="k">int</span>) <span class="k">int</span> { <span class="k">return</span> a * b })
+
+v, _ := lg.<span class="k">Run</span>(<span class="s">"(mul x 2)"</span>) <span class="c">// =&gt; 84</span></pre>
+      </section>
+
+      <section class="row">
+        <h2>See also</h2>
+        <ul class="also">
+          <li>
+            <a href="https://github.com/nooga/lgcr">lgcr</a>
+            <span class="what">a small Linux container runtime, written in let-go.</span>
+          </li>
+          <li>
+            <a href="https://github.com/nooga/xsofy">xsofy</a>
+            <span class="what">a roguelike that names itself each run.</span>
+          </li>
+          <li>
+            <a href="https://github.com/nooga/paserati">paserati</a>
+            <span class="what">a TypeScript runtime in Go.</span>
+          </li>
+        </ul>
+      </section>
+
+      <footer>
+        <span>Made by <a href="https://github.com/nooga">@nooga</a> since 2021</span>
+        <a href="https://github.com/nooga/let-go">github.com/nooga/let-go</a>
+      </footer>
     </div>
 
     <script>
-      function loadWasm(path) {
-        const go = new Go();
-        return WebAssembly.instantiateStreaming(
-          fetch(path),
-          go.importObject,
-        ).then((result) => {
-          go.run(result.instance);
-          return result.instance;
+      /* theme */
+      (function () {
+        const SUN  = '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>';
+        const MOON = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+        const root = document.documentElement;
+        const icon = document.getElementById("themeIcon");
+        const stored = localStorage.getItem("let-go-theme");
+        const prefersDark = matchMedia("(prefers-color-scheme: dark)").matches;
+        const setTheme = (t) => {
+          root.setAttribute("data-theme", t);
+          if (icon) icon.innerHTML = t === "dark" ? SUN : MOON;
+          if (window.__lgRetheme) window.__lgRetheme();
+        };
+        setTheme(stored || (prefersDark ? "dark" : "light"));
+
+        document.getElementById("themeToggle").addEventListener("click", () => {
+          const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+          setTheme(next);
+          localStorage.setItem("let-go-theme", next);
         });
+      })();
+
+      function termTheme() {
+        const cs = getComputedStyle(document.documentElement);
+        const v = (n) => cs.getPropertyValue(n).trim();
+        return {
+          background: v("--term-bg"),
+          foreground: v("--term-fg"),
+          cursor: v("--term-cursor"),
+          cursorAccent: v("--term-bg"),
+          selectionBackground: "rgba(245,176,65,0.28)",
+          black: "#1a1611", red: "#e07b5a", green: "#b8c46e", yellow: "#f5b041",
+          blue: "#c8b994", magenta: "#d8a0c4", cyan: "#a8a08a", white: "#ede1c4",
+          brightBlack: "#5a4f3a", brightRed: "#f59273", brightGreen: "#cfd884",
+          brightYellow: "#ffd17a", brightBlue: "#dccdaa", brightMagenta: "#e8b8d4",
+          brightCyan: "#bdb49b", brightWhite: "#fff7e2",
+        };
+      }
+
+      /* example buttons → REPL */
+      document.querySelectorAll("#examples button").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          if (!window.__lgSend) return;
+          window.__lgSend(btn.dataset.send);
+          document.getElementById("replFrame")?.scrollIntoView?.({ block: "nearest" });
+        });
+      });
+
+      /* WASM bootstrap */
+      const bootStart = performance.now();
+      function loadWasm(p) {
+        const go = new Go();
+        return WebAssembly.instantiateStreaming(fetch(p), go.importObject)
+          .then((r) => { go.run(r.instance); return r.instance; });
       }
 
       loadWasm("letgo.wasm")
-        .then((wasm) => {
-          document.getElementById("loading").style.display = "none";
-          const wrap = document.getElementById("term-wrap");
-          wrap.style.display = "flex";
-          requestAnimationFrame(() => wrap.classList.add("visible"));
-
-          jQuery(function ($) {
-            const term = $("#term").terminal(
-              function (command) {
-                if (command !== "") {
-                  var result = Eval(command);
-                  if (result != undefined) {
-                    this.echo(result);
-                  }
-                }
-              },
-              {
-                greetings: false,
-                name: "let_go",
-                prompt: "user> ",
-                ansi: true,
-                onInit: function () {
-                  this.echo(" \u03bb   let-go (wasm)", { raw: false });
-                  this.echo(
-                    ' <span style="color:#5ec4b6">GO</span>&nbsp;&nbsp; <span style="color:#5a584f">type (+ 1 1) to start</span>',
-                    { raw: true },
-                  );
-                  this.echo("");
-                },
-              },
-            );
-            console.log = (...args) => {
-              term.echo(...args);
-            };
-          });
+        .then(() => {
+          const bootMs = (performance.now() - bootStart).toFixed(0);
+          const l = document.getElementById("replLoading");
+          l.classList.add("gone");
+          setTimeout(() => l.remove(), 400);
+          mountTerminal(bootMs);
         })
-        .catch((error) => {
-          document.getElementById("loading").innerHTML =
-            '<span style="color:#e05252">failed to load: ' + error + "</span>";
+        .catch((e) => {
+          document.getElementById("replLoading").innerHTML =
+            '<span style="color:#e07b5a">failed to load wasm: ' +
+            (e && e.message ? e.message : e) + "</span>";
         });
+
+      function mountTerminal(bootMs) {
+        const fit = new FitAddon.FitAddon();
+        const term = new Terminal({
+          cursorBlink: true,
+          cursorStyle: "block",
+          fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
+          fontSize: 13,
+          lineHeight: 1.4,
+          scrollback: 2000,
+          theme: termTheme(),
+          convertEol: true,
+        });
+        term.loadAddon(fit);
+        term.open(document.getElementById("term"));
+        fit.fit();
+        addEventListener("resize", () => fit.fit());
+        window.__lgRetheme = () => (term.options.theme = termTheme());
+
+        const ESC = "\x1b[";
+        const C = {
+          dim:   ESC + "38;2;122;109;82m",
+          amber: ESC + "38;2;245;176;65m",
+          fg:    ESC + "38;2;237;225;196m",
+          err:   ESC + "38;2;224;123;90m",
+          bold:  ESC + "1m",
+          reset: ESC + "0m",
+        };
+
+        // Same banner shape as the native lg binary: bold λ, bold "let-go".
+        term.writeln("");
+        term.writeln(` ${C.bold} λ${C.reset}   ${C.bold}let-go${C.reset} wasm`);
+        term.writeln("");
+
+        const PROMPT = `${C.amber}user${C.reset}${C.dim}=>${C.reset} `;
+        const CONT   = `${C.dim}     |${C.reset} `;
+
+        let buf = "", cursor = 0, acc = "";
+        let history = JSON.parse(localStorage.getItem("let-go-history") || "[]");
+        let histIdx = history.length, histDraft = "";
+
+        const prompt = (cont) => term.write(cont ? CONT : PROMPT);
+        const refresh = () => {
+          term.write("\r" + ESC + "2K");
+          term.write(acc.length ? CONT : PROMPT);
+          term.write(buf);
+          const back = buf.length - cursor;
+          if (back > 0) term.write(ESC + back + "D");
+        };
+
+        function balanced(s) {
+          let p=0, br=0, cu=0, inStr=false, esc=false, inCmt=false;
+          for (let i=0;i<s.length;i++) {
+            const c = s[i];
+            if (inStr) {
+              if (esc) { esc=false; continue; }
+              if (c === "\\") { esc=true; continue; }
+              if (c === '"') inStr=false;
+              continue;
+            }
+            if (inCmt) { if (c === "\n") inCmt=false; continue; }
+            if (c === ";") { inCmt=true; continue; }
+            if (c === '"') { inStr=true; continue; }
+            if (c==="(") p++; else if (c===")") p--;
+            else if (c==="[") br++; else if (c==="]") br--;
+            else if (c==="{") cu++; else if (c==="}") cu--;
+            if (p<0||br<0||cu<0) return true;
+          }
+          return p===0 && br===0 && cu===0 && !inStr;
+        }
+
+        function pushHistory(line) {
+          if (!line.trim()) return;
+          if (history[history.length-1] !== line) history.push(line);
+          if (history.length > 200) history = history.slice(-200);
+          localStorage.setItem("let-go-history", JSON.stringify(history));
+          histIdx = history.length;
+        }
+
+        function evalForm(form) {
+          let r;
+          try { r = window.Eval(form); }
+          catch (e) {
+            term.writeln(`${C.err}; ${e && e.message ? e.message : e}${C.reset}`);
+            return;
+          }
+          if (r === undefined || r === null) return;
+          const s = String(r);
+          const isErr = /^(error|panic|compile error|runtime error|exception)/i.test(s.trim());
+          for (const ln of s.split("\n"))
+            term.writeln((isErr ? C.err : C.fg) + ln + C.reset);
+        }
+
+        function submit() {
+          term.writeln("");
+          const piece = buf;
+          buf = ""; cursor = 0;
+          acc = acc.length ? acc + "\n" + piece : piece;
+          if (!acc.trim()) { acc = ""; prompt(false); return; }
+          if (!balanced(acc)) { prompt(true); return; }
+          pushHistory(acc);
+          evalForm(acc);
+          acc = "";
+          prompt(false);
+        }
+
+        prompt(false);
+
+        // Feed multi-line input through the same path as a paste.
+        function feed(data) {
+          const parts = data.replace(/\r\n?/g, "\n").split("\n");
+          for (let i = 0; i < parts.length; i++) {
+            buf = buf.slice(0, cursor) + parts[i] + buf.slice(cursor);
+            cursor += parts[i].length;
+            refresh();
+            if (i < parts.length - 1) submit();
+          }
+        }
+
+        // Public hook for example buttons: clears anything in flight, then feeds.
+        window.__lgSend = (snippet) => {
+          if (buf || acc) {
+            term.writeln(`${C.dim}^C${C.reset}`);
+            buf = ""; cursor = 0; acc = "";
+            prompt(false);
+          }
+          feed(snippet.endsWith("\n") ? snippet : snippet + "\n");
+          term.focus();
+        };
+
+        term.onData((data) => {
+          if (data.length > 1 && !data.startsWith("\x1b")) {
+            feed(data);
+            return;
+          }
+          const code = data.charCodeAt(0);
+          if (data === ESC + "A") {
+            if (!history.length) return;
+            if (histIdx === history.length) histDraft = buf;
+            histIdx = Math.max(0, histIdx - 1);
+            buf = history[histIdx] || ""; cursor = buf.length; refresh(); return;
+          }
+          if (data === ESC + "B") {
+            if (histIdx >= history.length) return;
+            histIdx++;
+            buf = histIdx === history.length ? histDraft : history[histIdx];
+            cursor = buf.length; refresh(); return;
+          }
+          if (data === ESC + "C") { if (cursor < buf.length) { cursor++; term.write(ESC + "C"); } return; }
+          if (data === ESC + "D") { if (cursor > 0) { cursor--; term.write(ESC + "D"); } return; }
+          if (data === "\x01") { if (cursor > 0) { term.write(ESC + cursor + "D"); cursor = 0; } return; }
+          if (data === "\x05") { const n = buf.length - cursor; if (n > 0) { term.write(ESC + n + "C"); cursor = buf.length; } return; }
+          if (code === 12) { term.write(ESC + "2J" + ESC + "H"); refresh(); return; }
+          if (code === 3)  { term.writeln(`${C.dim}^C${C.reset}`); buf=""; cursor=0; acc=""; prompt(false); return; }
+          if (code === 127 || code === 8) {
+            if (cursor === 0) return;
+            buf = buf.slice(0, cursor - 1) + buf.slice(cursor);
+            cursor--; refresh(); return;
+          }
+          if (code === 13) { submit(); return; }
+          if (code >= 32) {
+            buf = buf.slice(0, cursor) + data + buf.slice(cursor);
+            cursor += data.length;
+            refresh();
+          }
+        });
+
+        term.focus();
+        document.getElementById("replFrame").addEventListener("click", () => term.focus());
+      }
     </script>
   </body>
 </html>

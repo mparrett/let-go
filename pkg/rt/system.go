@@ -8,7 +8,6 @@ package rt
 import (
 	"fmt"
 	"os"
-	"os/user"
 	"runtime"
 	"time"
 
@@ -22,12 +21,7 @@ var (
 )
 
 func systemProperties() *vm.PersistentMap {
-	home := ""
-	uname := ""
-	if u, err := user.Current(); err == nil {
-		home = u.HomeDir
-		uname = u.Username
-	}
+	home, uname := currentUser()
 	if home == "" {
 		home = os.Getenv("HOME")
 	}

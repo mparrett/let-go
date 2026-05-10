@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"runtime"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -186,8 +185,8 @@ func installOsNS() {
 
 	// os/user-name — (os/user-name)
 	ns.Def("user-name", mustWrap(func(vs []vm.Value) (vm.Value, error) {
-		if u, err := user.Current(); err == nil {
-			return vm.String(u.Username), nil
+		if _, name := currentUser(); name != "" {
+			return vm.String(name), nil
 		}
 		return vm.String(os.Getenv("USER")), nil
 	}))
