@@ -58,6 +58,14 @@ func (v *Var) Deref() Value {
 	return v.root
 }
 
+// Root returns the var's root binding directly, bypassing any current
+// dynamic binding on the stack. Use this where Clojure semantics require
+// the root (e.g. alter-var-root) rather than the currently visible deref
+// value.
+func (v *Var) Root() Value {
+	return v.root
+}
+
 // PushBinding pushes a dynamic binding value.
 func (v *Var) PushBinding(val Value) {
 	v.bindings = append(v.bindings, val)

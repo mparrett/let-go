@@ -1,0 +1,84 @@
+;; Tests for alter-var-root (2-arg form): return value, errors,
+;; exception bubbling, and dynamic-binding bypass (root semantics).
+(ns test.alter-var-root-test
+  (:require [test :refer :all]))
+
+;; --- 2-arg form ---
+
+(def t-2arg-x 10)
+
+(deftest two-arg-rebinds-root
+  (testing "(alter-var-root v f) calls (f @v) and sets the result as the new root"
+    (let [result (alter-var-root #'t-2arg-x inc)]
+      (is (= 11 result))
+      (is (= 11 t-2arg-x))
+      (is (= 11 @#'t-2arg-x))
+      (is (= 11 (var-get #'t-2arg-x))))))
+
+;; --- return value vs. var deref ---
+
+(def t-return-x {:n 0})
+
+(deftest return-value-equals-new-root
+  (testing "alter-var-root returns the new root, identical to subsequent deref"
+    (let [result (alter-var-root #'t-return-x (fn [m] (assoc m :n 42)))]
+      (is (= {:n 42} result))
+      (is (= result t-return-x))
+      (is (= result @#'t-return-x)))))
+
+;; --- arity errors ---
+
+(deftest zero-args-errors
+  (testing "(alter-var-root) raises"
+    (is (= :caught (try (alter-var-root) (catch e :caught))))))
+
+(def t-one-arg-x 10)
+
+(deftest one-arg-errors
+  (testing "(alter-var-root v) with no fn raises"
+    (is (= :caught (try (alter-var-root #'t-one-arg-x) (catch e :caught))))))
+
+;; --- type errors ---
+
+(deftest non-var-first-arg-errors
+  (testing "first arg must be a Var"
+    (is (= :caught (try (alter-var-root :not-a-var inc) (catch e :caught))))
+    (is (= :caught (try (alter-var-root 42 inc) (catch e :caught))))
+    (is (= :caught (try (alter-var-root "x" inc) (catch e :caught))))))
+
+(def t-non-fn-x 10)
+
+(deftest non-fn-second-arg-errors
+  (testing "second arg must be a function (numbers, strings, nil are not IFn)"
+    ;; Note: keywords, sets, maps, and vectors *are* IFn in Clojure and pass the
+    ;; gate; that's faithful behaviour, not a defect.
+    (is (= :caught (try (alter-var-root #'t-non-fn-x 42) (catch e :caught))))
+    (is (= :caught (try (alter-var-root #'t-non-fn-x "fn") (catch e :caught))))
+    (is (= :caught (try (alter-var-root #'t-non-fn-x nil) (catch e :caught))))))
+
+;; --- exception bubbling: errors from f propagate, root stays unchanged ---
+
+(def t-throw-x 10)
+
+(deftest fn-throw-leaves-root-unchanged
+  (testing "when f throws, the exception bubbles and the root is not mutated"
+    (is (= :caught
+           (try (alter-var-root #'t-throw-x (fn [_] (throw "boom")))
+                (catch e :caught))))
+    (is (= 10 t-throw-x))
+    (is (= 10 @#'t-throw-x))))
+
+;; --- dynamic-binding bypass (Clojure semantics: read/write root, not binding) ---
+
+(def ^:dynamic *t-dyn-x* 10)
+
+(deftest dynamic-binding-bypassed-2arg
+  (testing "inside a binding, alter-var-root reads root, writes root, and the binding wins for deref"
+    (binding [*t-dyn-x* 99]
+      ;; (inc 10) should be the new root, not (inc 99).
+      (let [result (alter-var-root #'*t-dyn-x* inc)]
+        (is (= 11 result))
+        ;; Within the binding block, *t-dyn-x* still observes the binding value.
+        (is (= 99 *t-dyn-x*))))
+    ;; After the binding pops, the root mutation is visible.
+    (is (= 11 *t-dyn-x*))))

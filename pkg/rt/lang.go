@@ -5434,7 +5434,11 @@ func installLangNS() {
 	})
 	ns.Def("array?", isArrayf)
 
-	// alter-var-root — atomically alter a var's root binding
+	// alter-var-root — alter a var's root binding via (f root).
+	// Reads/writes the root, bypassing any current dynamic binding.
+	// TODO: the read/apply/write is not atomic. let-go evaluates synchronously
+	// today, so contention does not arise. If concurrent evaluation is added,
+	// centralize the RMW under Var-level synchronization.
 	alterVarRoot, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("alter-var-root expects 2 args")
@@ -5447,7 +5451,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-var-root expects a function")
 		}
-		old := v.Deref()
+		old := v.Root()
 		result, err := fn.Invoke([]vm.Value{old})
 		if err != nil {
 			return vm.NIL, err
