@@ -267,6 +267,43 @@ func TestVoidRoundtrip(t *testing.T) {
 	}
 }
 
+func TestUUIDRoundtrip(t *testing.T) {
+	cases := []string{
+		"550e8400-e29b-41d4-a716-446655440000",
+		"00000000-0000-0000-0000-000000000000",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+	}
+	for _, tc := range cases {
+		u := vm.NewUUID(tc)
+		got := roundtripValue(t, u)
+		gu, ok := got.(*vm.UUID)
+		if !ok {
+			t.Fatalf("expected *UUID, got %T", got)
+		}
+		if s := gu.Unbox().(string); s != tc {
+			t.Errorf("UUID roundtrip: got %q, want %q", s, tc)
+		}
+	}
+}
+
+// Uppercase input must canonicalise to lowercase through the reader (ParseUUID),
+// and that lowercase form must survive the bytecode round-trip unchanged.
+func TestUUIDRoundtripCanonicalisesUppercase(t *testing.T) {
+	u := vm.ParseUUID("550E8400-E29B-41D4-A716-446655440000")
+	if u == nil {
+		t.Fatal("ParseUUID returned nil for uppercase input")
+	}
+	got := roundtripValue(t, u)
+	gu, ok := got.(*vm.UUID)
+	if !ok {
+		t.Fatalf("expected *UUID, got %T", got)
+	}
+	want := "550e8400-e29b-41d4-a716-446655440000"
+	if s := gu.Unbox().(string); s != want {
+		t.Errorf("UUID canonicalisation: got %q, want %q", s, want)
+	}
+}
+
 func TestEmptyListRoundtrip(t *testing.T) {
 	got := roundtripValue(t, vm.EmptyList)
 	if got != vm.EmptyList {

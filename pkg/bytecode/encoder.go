@@ -191,6 +191,8 @@ func (b *ModuleBuilder) internStringsForValue(v vm.Value) {
 		}
 	case *vm.Regex:
 		b.internString(val.Pattern())
+	case *vm.UUID:
+		b.internString(val.Unbox().(string))
 	case *vm.List:
 		var s vm.Seq = val
 		for s != nil && s != vm.EmptyList {
@@ -438,6 +440,11 @@ func (e *encoder) writeValue(v vm.Value) error {
 		return e.w.WriteBytes(mag)
 	case *vm.Void:
 		return e.w.WriteByte(TagVoid)
+	case *vm.UUID:
+		if err := e.w.WriteByte(TagUUID); err != nil {
+			return err
+		}
+		return e.writeStringRef(val.Unbox().(string))
 	case *vm.Func:
 		if err := e.w.WriteByte(TagFunc); err != nil {
 			return err
