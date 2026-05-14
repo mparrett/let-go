@@ -1,5 +1,5 @@
-;; Tests for alter-var-root (2-arg form): return value, errors,
-;; exception bubbling, and dynamic-binding bypass (root semantics).
+;; Tests for alter-var-root: 2-arg + n-arg shapes, return value, errors,
+;; argument order, and dynamic-binding bypass (root semantics).
 (ns test.alter-var-root-test
   (:require [test :refer :all]))
 
@@ -15,13 +15,42 @@
       (is (= 11 @#'t-2arg-x))
       (is (= 11 (var-get #'t-2arg-x))))))
 
+;; --- n-arg form ---
+
+(def t-narg-x 10)
+
+(deftest n-arg-extra-args
+  (testing "(alter-var-root v f a b) calls (f @v a b) and sets the result"
+    (let [result (alter-var-root #'t-narg-x + 1 2)]
+      (is (= 13 result))
+      (is (= 13 t-narg-x)))))
+
+(def t-narg-many 0)
+
+(deftest n-arg-many-extras
+  (testing "n-arg form with many trailing args"
+    (let [result (alter-var-root #'t-narg-many + 1 2 3 4 5)]
+      (is (= 15 result))
+      (is (= 15 t-narg-many)))))
+
+;; --- argument order (non-commutative op proves old is first) ---
+
+(def t-order-x 10)
+
+(deftest arg-order-puts-old-first
+  (testing "(alter-var-root v f extra) passes (f old extra), not (f extra old)"
+    ;; If args were reversed, (- 3 10) = -7 would surface here.
+    (let [result (alter-var-root #'t-order-x - 3)]
+      (is (= 7 result))
+      (is (= 7 t-order-x)))))
+
 ;; --- return value vs. var deref ---
 
 (def t-return-x {:n 0})
 
 (deftest return-value-equals-new-root
   (testing "alter-var-root returns the new root, identical to subsequent deref"
-    (let [result (alter-var-root #'t-return-x (fn [m] (assoc m :n 42)))]
+    (let [result (alter-var-root #'t-return-x assoc :n 42)]
       (is (= {:n 42} result))
       (is (= result t-return-x))
       (is (= result @#'t-return-x)))))
@@ -82,3 +111,13 @@
         (is (= 99 *t-dyn-x*))))
     ;; After the binding pops, the root mutation is visible.
     (is (= 11 *t-dyn-x*))))
+
+(def ^:dynamic *t-dyn-y* 10)
+
+(deftest dynamic-binding-bypassed-narg
+  (testing "n-arg form also reads/writes root, not binding"
+    (binding [*t-dyn-y* 99]
+      (let [result (alter-var-root #'*t-dyn-y* + 1 2)]
+        (is (= 13 result))
+        (is (= 99 *t-dyn-y*))))
+    (is (= 13 *t-dyn-y*))))
