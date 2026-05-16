@@ -1499,7 +1499,13 @@
   ([k x] x)
   ([k x y] (if (< (k x) (k y)) x y))
   ([k x y & more]
-   (reduce #(min-key k %1 %2) (min-key k x y) more)))
+   (let [nan-key? (fn [v] (let [kv (k v)] (and (number? kv) (not (= kv kv)))))]
+     (reduce (fn [best candidate]
+               (if (or (nan-key? best) (nan-key? candidate))
+                 best
+                 (min-key k best candidate)))
+             (min-key k x y)
+             more))))
 
 (defn max-key
   ([k x] x)

@@ -47,7 +47,6 @@ var knownFailing = map[string]bool{
 	"int":            true, // int overflow bounds
 	"mapcat":         true, // hash-map iteration order (single edge case)
 	"merge":          true, // merge with nil/meta
-	"min_key":        true, // min-key edge cases
 	"minus":          true, // overflow not detected
 	"nnext":          true, // map ordering
 	"num":            true, // num edge cases

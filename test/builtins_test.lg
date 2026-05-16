@@ -52,6 +52,12 @@
   (testing "min-key finds minimum by key fn"
     (is (= {:x 1} (min-key :x {:x 1} {:x 2} {:x 3}))))
 
+  (testing "min-key preserves Clojure NaN ordering quirks in variadic form"
+    (is (= ##-Inf (min-key identity ##-Inf 1 ##NaN)))
+    (is (NaN? (min-key identity ##-Inf ##NaN 1)))
+    (is (= ##-Inf (min-key identity 1 ##-Inf ##NaN)))
+    (is (NaN? (min-key identity 1 ##NaN ##-Inf))))
+
   (testing "max-key finds maximum by key fn"
     (is (= {:x 3} (max-key :x {:x 1} {:x 2} {:x 3})))))
 
