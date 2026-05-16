@@ -44,7 +44,7 @@ type Pod struct {
 
 	// Response routing
 	pending   map[string]chan podMsg // id -> response channel
-	streaming map[string]bool       // ids that should not auto-close on done
+	streaming map[string]bool        // ids that should not auto-close on done
 	pendingMu sync.Mutex
 	routerUp  bool
 }
@@ -150,7 +150,7 @@ func (p *Pod) startRouter() {
 
 			// Route by id
 			id := bencStr(msg, "id")
-if id == "" {
+			if id == "" {
 				continue
 			}
 
@@ -356,7 +356,13 @@ func (p *Pod) Shutdown() {
 	if p.ops != nil {
 		if _, ok := p.ops["shutdown"]; ok {
 			_ = p.send(map[string]interface{}{"op": "shutdown"})
+			p.stdin.Close()
+			p.cmd.Wait() //nolint:errcheck
+			return
 		}
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
 	}
 	p.stdin.Close()
 	p.cmd.Wait() //nolint:errcheck
@@ -648,7 +654,7 @@ func installPodsNS() {
 						successFn = hmap.ValueAt(vm.Keyword("success"))
 						errorFn = hmap.ValueAt(vm.Keyword("error"))
 						doneFn = hmap.ValueAt(vm.Keyword("done"))
-						}
+					}
 
 					go func() {
 						for val := range ch {
