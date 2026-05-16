@@ -42,7 +42,6 @@ var knownFailing = map[string]bool{
 	"conj":           true, // conj arity/nil edge cases
 	"dec":            true, // dec overflow/type coercion
 	"double_qmark":   true, // no float32/float64 distinction
-	"empty_qmark":    true, // empty? on list containing nil
 	"float":          true, // BigDecimal edge cases
 	"inc":            true, // overflow untested assertion
 	"int":            true, // int overflow bounds
@@ -52,7 +51,6 @@ var knownFailing = map[string]bool{
 	"min_key":        true, // min-key edge cases
 	"minus":          true, // overflow not detected
 	"nnext":          true, // map ordering
-	"not_empty":      true, // not-empty on list containing nil
 	"num":            true, // num edge cases
 	"peek":           true, // peek on cons
 	"plus":           true, // overflow not detected

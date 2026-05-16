@@ -479,6 +479,18 @@ func valueEquals(a, b vm.Value) bool {
 		return true
 	case *vm.List:
 		// b could be any Seq-like type (List, Cons, ArrayVectorSeq, etc.)
+		if av == vm.EmptyList {
+			if bl, ok := b.(*vm.List); ok {
+				return bl == vm.EmptyList || bl.RawCount() == 0
+			}
+			if isSequentialType(b) {
+				return toSeq(b) == nil
+			}
+			return false
+		}
+		if bl, ok := b.(*vm.List); ok && bl == vm.EmptyList {
+			return false
+		}
 		bs, ok := b.(vm.Seq)
 		if !ok {
 			return false
@@ -631,11 +643,28 @@ func isSequentialType(v vm.Value) bool {
 
 // toSeq converts a sequential value to a Seq for element-by-element comparison.
 func toSeq(v vm.Value) vm.Seq {
-	if s, ok := v.(vm.Seq); ok {
+	if v == vm.NIL || v == vm.EmptyList {
+		return nil
+	}
+	if ls, ok := v.(*vm.LazySeq); ok {
+		s := ls.Resolve()
+		if s == vm.EmptyList {
+			return nil
+		}
 		return s
 	}
+	if c, ok := v.(vm.Counted); ok && c.RawCount() == 0 {
+		return nil
+	}
 	if sq, ok := v.(vm.Sequable); ok {
-		return sq.Seq()
+		s := sq.Seq()
+		if s == vm.EmptyList {
+			return nil
+		}
+		return s
+	}
+	if s, ok := v.(vm.Seq); ok {
+		return s
 	}
 	return nil
 }
