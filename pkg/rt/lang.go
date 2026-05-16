@@ -4210,33 +4210,39 @@ func installLangNS() {
 		return vm.TRUE, nil
 	})
 
-	// add-watch — (add-watch atom key fn)
+	// add-watch — (add-watch atom-or-var key fn)
 	addWatch, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 3 {
 			return vm.NIL, fmt.Errorf("add-watch expects 3 args")
-		}
-		a, ok := vs[0].(*vm.Atom)
-		if !ok {
-			return vm.NIL, fmt.Errorf("add-watch expected Atom")
 		}
 		fn, ok := vs[2].(vm.Fn)
 		if !ok {
 			return vm.NIL, fmt.Errorf("add-watch expected Fn")
 		}
-		a.AddWatch(vs[1], fn)
+		switch ref := vs[0].(type) {
+		case *vm.Atom:
+			ref.AddWatch(vs[1], fn)
+		case *vm.Var:
+			ref.AddWatch(vs[1], fn)
+		default:
+			return vm.NIL, fmt.Errorf("add-watch expected Atom or Var")
+		}
 		return vs[0], nil
 	})
 
-	// remove-watch — (remove-watch atom key)
+	// remove-watch — (remove-watch atom-or-var key)
 	removeWatch, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("remove-watch expects 2 args")
 		}
-		a, ok := vs[0].(*vm.Atom)
-		if !ok {
-			return vm.NIL, fmt.Errorf("remove-watch expected Atom")
+		switch ref := vs[0].(type) {
+		case *vm.Atom:
+			ref.RemoveWatch(vs[1])
+		case *vm.Var:
+			ref.RemoveWatch(vs[1])
+		default:
+			return vm.NIL, fmt.Errorf("remove-watch expected Atom or Var")
 		}
-		a.RemoveWatch(vs[1])
 		return vs[0], nil
 	})
 
@@ -5447,13 +5453,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-var-root expects a function")
 		}
-		old := v.Deref()
-		result, err := fn.Invoke([]vm.Value{old})
-		if err != nil {
-			return vm.NIL, err
-		}
-		v.SetRoot(result)
-		return result, nil
+		return v.AlterRoot(fn)
 	})
 	ns.Def("alter-var-root", alterVarRoot)
 

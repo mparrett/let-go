@@ -28,8 +28,6 @@ const memLimitBytes = 512 * 1024 * 1024
 // knownFailing lists test names (filename stems) that are known to fail.
 // Tests that pass but appear here will cause an error so the list stays current.
 var knownFailing = map[string]bool{
-	"add_watch":      true, // var/ref/agent watches not implemented
-	"remove_watch":   true, // var/ref/agent watches not implemented
 	"bigint":         true, // BigInt promotion at Long range boundary
 	"binding":        true, // thread binding propagation to futures
 	"bound_fn":       true, // bound-fn shim doesn't propagate dyn vars

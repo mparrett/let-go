@@ -85,6 +85,25 @@
       (reset! a 2)
       (is (= 1 (deref log))))))
 
+(def watchable-var 0)
+
+(deftest var-watch-test
+  (testing "var watches fire on alter-var-root"
+    (let [messages (atom #{})]
+      (alter-var-root #'watchable-var (fn [_] 0))
+      (add-watch #'watchable-var :w1
+                 (fn [k r o n] (swap! messages conj {:key k :ref r :old o :new n :watcher :w1})))
+      (add-watch #'watchable-var :w2
+                 (fn [k r o n] (swap! messages conj {:key k :ref r :old o :new n :watcher :w2})))
+      (alter-var-root #'watchable-var inc)
+      (remove-watch #'watchable-var :w1)
+      (alter-var-root #'watchable-var inc)
+      (remove-watch #'watchable-var :w2)
+      (is (= #{{:key :w1 :ref #'watchable-var :old 0 :new 1 :watcher :w1}
+               {:key :w2 :ref #'watchable-var :old 0 :new 1 :watcher :w2}
+               {:key :w2 :ref #'watchable-var :old 1 :new 2 :watcher :w2}}
+             (deref messages))))))
+
 ;; --- alter-meta! ---
 
 (deftest alter-meta-test

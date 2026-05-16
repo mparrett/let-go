@@ -5,7 +5,10 @@
 
 package vm
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 type Var struct {
 	root      Value
@@ -16,6 +19,8 @@ type Var struct {
 	isMacro   bool
 	isDynamic bool
 	isPrivate bool
+	mu        sync.Mutex
+	watches   map[Value]Fn
 }
 
 func (v *Var) Invoke(values []Value) (Value, error) {
@@ -47,11 +52,15 @@ func NewVar(nsref *Namespace, ns string, name string) *Var {
 }
 
 func (v *Var) SetRoot(val Value) *Var {
+	v.mu.Lock()
 	v.root = val
+	v.mu.Unlock()
 	return v
 }
 
 func (v *Var) Deref() Value {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if len(v.bindings) > 0 {
 		return v.bindings[len(v.bindings)-1]
 	}
@@ -60,14 +69,67 @@ func (v *Var) Deref() Value {
 
 // PushBinding pushes a dynamic binding value.
 func (v *Var) PushBinding(val Value) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.bindings = append(v.bindings, val)
 }
 
 // PopBinding removes the most recent dynamic binding.
 func (v *Var) PopBinding() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if len(v.bindings) > 0 {
 		v.bindings = v.bindings[:len(v.bindings)-1]
 	}
+}
+
+func (v *Var) notifyWatches(oldVal, newVal Value) error {
+	v.mu.Lock()
+	if len(v.watches) == 0 {
+		v.mu.Unlock()
+		return nil
+	}
+	watches := make(map[Value]Fn, len(v.watches))
+	for key, fn := range v.watches {
+		watches[key] = fn
+	}
+	v.mu.Unlock()
+	for key, fn := range watches {
+		if _, err := fn.Invoke([]Value{key, v, oldVal, newVal}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (v *Var) AlterRoot(fn Fn) (Value, error) {
+	old := v.Deref()
+	result, err := fn.Invoke([]Value{old})
+	if err != nil {
+		return NIL, err
+	}
+	v.mu.Lock()
+	v.root = result
+	v.mu.Unlock()
+	if err := v.notifyWatches(old, result); err != nil {
+		return NIL, err
+	}
+	return result, nil
+}
+
+func (v *Var) AddWatch(key Value, fn Fn) {
+	v.mu.Lock()
+	if v.watches == nil {
+		v.watches = make(map[Value]Fn)
+	}
+	v.watches[key] = fn
+	v.mu.Unlock()
+}
+
+func (v *Var) RemoveWatch(key Value) {
+	v.mu.Lock()
+	delete(v.watches, key)
+	v.mu.Unlock()
 }
 
 func (v *Var) Type() ValueType {
