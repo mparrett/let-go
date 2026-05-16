@@ -405,6 +405,16 @@ func valueEquals(a, b vm.Value) bool {
 	if isNilValue(a) || isNilValue(b) {
 		return false
 	}
+	switch av := a.(type) {
+	case *vm.Range:
+		if av == b {
+			return true
+		}
+	case *vm.InfiniteRange:
+		if av == b {
+			return true
+		}
+	}
 
 	// Allow cross-type comparison for numbers and vectors
 	if a.Type() != b.Type() {
@@ -2074,10 +2084,34 @@ func installLangNS() {
 	})
 
 	atom, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
-		if len(vs) != 1 {
+		if len(vs) < 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		return vm.NewAtom(vs[0]), nil
+		if (len(vs)-1)%2 != 0 {
+			return vm.NIL, fmt.Errorf("atom options must be key/value pairs")
+		}
+		var meta vm.Value
+		var validator vm.Fn
+		for i := 1; i < len(vs); i += 2 {
+			switch vs[i] {
+			case vm.Keyword("meta"):
+				if vs[i+1] != vm.NIL && !isMapType(vs[i+1]) {
+					return vm.NIL, fmt.Errorf("atom :meta must be nil or map")
+				}
+				meta = vs[i+1]
+			case vm.Keyword("validator"):
+				if vs[i+1] == vm.NIL {
+					validator = nil
+					continue
+				}
+				fn, ok := vs[i+1].(vm.Fn)
+				if !ok {
+					return vm.NIL, fmt.Errorf("atom :validator must be nil or function")
+				}
+				validator = fn
+			}
+		}
+		return vm.NewAtomWithMetaValidator(vs[0], meta, validator)
 	})
 
 	// (swap! a fn)
@@ -4222,6 +4256,17 @@ func installLangNS() {
 		return a.AlterMeta(fn, vs[2:])
 	})
 
+	getValidator, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("get-validator expects 1 arg")
+		}
+		a, ok := vs[0].(*vm.Atom)
+		if !ok {
+			return vm.NIL, fmt.Errorf("get-validator expected Atom")
+		}
+		return a.Validator(), nil
+	})
+
 	// subvec — (subvec v start) or (subvec v start end)
 	subvecf, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) < 2 || len(vs) > 3 {
@@ -4856,6 +4901,7 @@ func installLangNS() {
 	ns.Def("add-watch", addWatch)
 	ns.Def("remove-watch", removeWatch)
 	ns.Def("alter-meta!", alterMeta)
+	ns.Def("get-validator", getValidator)
 	ns.Def("subvec", subvecf)
 	ns.Def("print", printf)
 	ns.Def("pr", prf)

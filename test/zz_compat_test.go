@@ -30,7 +30,6 @@ const memLimitBytes = 512 * 1024 * 1024
 var knownFailing = map[string]bool{
 	"add_watch":      true, // var/ref/agent watches not implemented
 	"remove_watch":   true, // var/ref/agent watches not implemented
-	"atom":           true, // atom validator/meta edge cases
 	"bigint":         true, // BigInt promotion at Long range boundary
 	"binding":        true, // thread binding propagation to futures
 	"bound_fn":       true, // bound-fn shim doesn't propagate dyn vars

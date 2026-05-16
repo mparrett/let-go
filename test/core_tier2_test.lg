@@ -93,6 +93,23 @@
       (alter-meta! a assoc :tag :special)
       (is (= {:tag :special} (meta a))))))
 
+(deftest atom-options-test
+  (testing "atom accepts metadata and validators"
+    (let [validator even?
+          a (atom 2 :meta {:tag :counter} :validator validator)]
+      (is (= {:tag :counter} (meta a)))
+      (is (= validator (get-validator a)))
+      (is (= 4 (reset! a 4)))
+      (is (= :caught
+             (try
+               (reset! a 5)
+               :missed
+               (catch e :caught))))
+      (is (= 4 (deref a)))))
+  (testing "nil option pairs are ignored"
+    (let [a (atom nil nil nil nil nil)]
+      (is (nil? (deref a))))))
+
 ;; --- vary-meta ---
 
 (deftest vary-meta-test

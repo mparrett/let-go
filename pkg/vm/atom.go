@@ -33,15 +33,38 @@ var AtomType *theAtomType = &theAtomType{}
 // Swap uses optimistic concurrency with a generation counter — no value comparison needed.
 // The function may be called multiple times under contention.
 type Atom struct {
-	val     Value
-	gen     uint64 // generation counter — incremented on every mutation
-	mu      sync.Mutex
-	meta    Value
-	watches map[Value]Fn // key → watch fn
+	val       Value
+	gen       uint64 // generation counter — incremented on every mutation
+	mu        sync.Mutex
+	meta      Value
+	validator Fn
+	watches   map[Value]Fn // key → watch fn
 }
 
 func NewAtom(root Value) *Atom {
 	return &Atom{val: root}
+}
+
+func NewAtomWithMetaValidator(root Value, meta Value, validator Fn) (*Atom, error) {
+	a := &Atom{val: root, meta: meta, validator: validator}
+	if err := a.validate(root); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (a *Atom) validate(newVal Value) error {
+	if a.validator == nil {
+		return nil
+	}
+	result, err := a.validator.Invoke([]Value{newVal})
+	if err != nil {
+		return err
+	}
+	if !IsTruthy(result) {
+		return fmt.Errorf("validator rejected reference state")
+	}
+	return nil
 }
 
 func (a *Atom) notifyWatches(oldVal, newVal Value) error {
@@ -78,10 +101,17 @@ func (a *Atom) Meta() Value {
 	return a.meta
 }
 
+func (a *Atom) Validator() Value {
+	if a.validator == nil {
+		return NIL
+	}
+	return a.validator
+}
+
 func (a *Atom) WithMeta(m Value) Value {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return &Atom{val: a.val, gen: a.gen, meta: m, watches: a.watches}
+	return &Atom{val: a.val, gen: a.gen, meta: m, validator: a.validator, watches: a.watches}
 }
 
 func (a *Atom) AlterMeta(fn Fn, args []Value) (Value, error) {
@@ -101,6 +131,9 @@ func (a *Atom) AlterMeta(fn Fn, args []Value) (Value, error) {
 }
 
 func (a *Atom) Reset(newVal Value) (Value, error) {
+	if err := a.validate(newVal); err != nil {
+		return NIL, err
+	}
 	a.mu.Lock()
 	oldVal := a.val
 	a.val = newVal
@@ -129,6 +162,9 @@ func (a *Atom) Swap(fn Fn, args []Value) (Value, error) {
 		// Compute new value without holding the lock
 		newVal, err := fn.Invoke(append([]Value{oldVal}, args...))
 		if err != nil {
+			return NIL, err
+		}
+		if err := a.validate(newVal); err != nil {
 			return NIL, err
 		}
 
