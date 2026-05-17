@@ -170,8 +170,9 @@
 (defn *' [& args] (apply * args))
 
 (defn num [x]
-  (if (number? x) x
-    (throw (str "Expected a number, got " (type x)))))
+  (if (nil? x) nil
+    (if (number? x) x
+      (throw (str "Expected a number, got " (type x))))))
 
 (defn ffirst [x] (first (first x)))
 (defn fnext [x] (first (next x)))

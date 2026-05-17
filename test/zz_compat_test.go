@@ -45,7 +45,6 @@ var knownFailing = map[string]bool{
 	"int":            true, // int overflow bounds
 	"merge":          true, // merge with nil/meta
 	"minus":          true, // overflow not detected
-	"num":            true, // num edge cases
 	"plus":           true, // overflow not detected
 	"reduce":         true, // reduce interop edge cases
 	"short":          true, // short coercion

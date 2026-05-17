@@ -73,6 +73,9 @@
     (is (not (number? "42")))
     (is (not (number? :foo))))
 
+  (testing "num preserves nil"
+    (is (nil? (num nil))))
+
   (testing "float? predicate"
     (is (float? 3.14))
     (is (not (float? 42)))
