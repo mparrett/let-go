@@ -53,7 +53,13 @@
 (deftest coercion-functions
   (testing "float coercion"
     (is (= 42.0 (float 42)))
-    (is (float? (float 42))))
+    (is (float? (float 42)))
+    (is (= 0.0 (float 4.9E-324)))
+    (is (= 4.9E-324 (double 4.9E-324)))
+    (is (try
+          (float 1.7976931348623157E308)
+          false
+          (catch e true))))
 
   (testing "int coercion truncates"
     (is (= 3 (int 3.7)))

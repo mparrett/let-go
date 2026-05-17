@@ -2504,6 +2504,24 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("%s can't be coerced to float", vs[0])
 		}
+		if math.IsInf(f, 0) {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to float", vs[0])
+		}
+		f32 := float32(f)
+		if math.IsInf(float64(f32), 0) {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to float", vs[0])
+		}
+		return vm.Float(float64(f32)), nil
+	})
+
+	doublef, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		f, ok := vm.ToFloat(vs[0])
+		if !ok {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to double", vs[0])
+		}
 		return vm.Float(f), nil
 	})
 
@@ -4611,7 +4629,7 @@ func installLangNS() {
 	ns.Def("byte", intf)
 	ns.Def("short", intf)
 	ns.Def("float", floatf)
-	ns.Def("double", floatf)
+	ns.Def("double", doublef)
 	ns.Def("number?", isNumber)
 	ns.Def("float?", isFloat)
 	ns.Def("int?", isInt)
