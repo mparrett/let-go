@@ -64,7 +64,19 @@
   (testing "int coercion truncates"
     (is (= 3 (int 3.7)))
     (is (int? (int 3.7)))
-    (is (= 3 (int 3.2)))))
+    (is (= 3 (int 3.2))))
+
+  (testing "int coercion checks 32-bit bounds"
+    (is (= 2147483647 (int 2147483647)))
+    (is (= -2147483648 (int -2147483648)))
+    (is (try
+          (int 2147483648)
+          false
+          (catch e true)))
+    (is (try
+          (int -2147483649)
+          false
+          (catch e true)))))
 
 (deftest numeric-predicates
   (testing "number? recognizes both int and float"

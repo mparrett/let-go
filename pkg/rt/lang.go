@@ -2501,21 +2501,39 @@ func installLangNS() {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
+		const minInt32 = -2147483648
+		const maxInt32 = 2147483647
+		coerce := func(f float64) (vm.Value, error) {
+			if f < minInt32 || f > maxInt32 {
+				return vm.NIL, fmt.Errorf("%s can't be coerced to int", vs[0])
+			}
+			return vm.MakeInt(int(math.Trunc(f))), nil
+		}
 		switch v := vs[0].(type) {
 		case vm.Int:
+			if v < minInt32 || v > maxInt32 {
+				return vm.NIL, fmt.Errorf("%s can't be coerced to int", vs[0])
+			}
 			return v, nil
 		case vm.Float:
-			return vm.MakeInt(int(v)), nil
+			return coerce(float64(v))
 		case vm.Char:
 			return vm.Int(int(v)), nil
 		case *vm.BigInt:
-			return vm.MakeInt(int(v.Unbox().(*big.Int).Int64())), nil
+			if !v.Val().IsInt64() {
+				return vm.NIL, fmt.Errorf("%s can't be coerced to int", vs[0])
+			}
+			i := v.Val().Int64()
+			if i < minInt32 || i > maxInt32 {
+				return vm.NIL, fmt.Errorf("%s can't be coerced to int", vs[0])
+			}
+			return vm.MakeInt(int(i)), nil
 		case *vm.BigDecimal:
 			f, _ := v.Val().Float64()
-			return vm.MakeInt(int(f)), nil
+			return coerce(f)
 		case *vm.Ratio:
 			f, _ := v.Val().Float64()
-			return vm.MakeInt(int(f)), nil
+			return coerce(f)
 		case vm.Boolean:
 			if bool(v) {
 				return vm.MakeInt(1), nil

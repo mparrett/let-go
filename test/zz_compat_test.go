@@ -38,7 +38,6 @@ var knownFailing = map[string]bool{
 	"dec":            true, // dec overflow/type coercion
 	"double_qmark":   true, // no float32/float64 distinction
 	"inc":            true, // overflow untested assertion
-	"int":            true, // int overflow bounds
 	"minus":          true, // overflow not detected
 	"plus":           true, // overflow not detected
 	"reduce":         true, // reduce interop edge cases
