@@ -31,7 +31,6 @@ var knownFailing = map[string]bool{
 	"abs":            true, // :default reader branch expects min-int negation to succeed
 	"bigint":         true, // BigInt promotion at Long range boundary
 	"plus_squote":    true, // +' BigInt promotion at Long boundary
-	"realized_qmark": true, // realized? semantics mismatch
 	"star_squote":    true, // *' BigInt promotion at Long boundary
 	"with_precision": true, // with-precision is a no-op; results don't round
 	"case":           true, // case macro complex matching

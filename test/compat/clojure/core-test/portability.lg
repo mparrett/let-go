@@ -67,7 +67,7 @@
 (def shutdown-agents (fn [] nil))
 (def release-pending-sends (fn [] 0))
 (def get-validator clojure.core/get-validator)
-(def future-cancel (fn [_] false))
+(def future-cancel (fn [f] (deliver f nil) true))
 (def bound-fn* clojure.core/bound-fn*)
 (defmacro bound-fn [& body]
   (list 'clojure.core/bound-fn* (cons 'fn body)))

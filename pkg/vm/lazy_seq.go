@@ -10,15 +10,21 @@ import "sync"
 // LazySeq delays computation of a sequence until first/next is called.
 // This is the foundation for lazy operations like map, filter, etc.
 type LazySeq struct {
-	fn  Fn       // thunk that produces the seq when called
-	s   Seq      // cached realized seq
-	sv  Value    // intermediate value from fn
-	err error    // error from thunk realization (propagated on access)
+	fn  Fn    // thunk that produces the seq when called
+	s   Seq   // cached realized seq
+	sv  Value // intermediate value from fn
+	err error // error from thunk realization (propagated on access)
 	mu  sync.Mutex
 }
 
 func NewLazySeq(fn Fn) *LazySeq {
 	return &LazySeq{fn: fn}
+}
+
+func (l *LazySeq) IsRealized() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fn == nil
 }
 
 // sval realizes the thunk and returns the raw value without converting to seq.
@@ -175,4 +181,3 @@ func (l *LazySeq) ValueAtOr(key Value, notFound Value) Value {
 	}
 	return notFound
 }
-

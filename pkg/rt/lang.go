@@ -3949,10 +3949,10 @@ func installLangNS() {
 		return vm.Boolean(ok), nil
 	})
 
-	// realized? — test if a Delay, Promise, or Future has been realized
+	// realized? — test if a Delay, Promise, Future, or LazySeq has been realized
 	isRealized, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
-			return vm.FALSE, nil
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
 		if d, ok := vs[0].(*vm.Delay); ok {
 			return vm.Boolean(d.IsRealized()), nil
@@ -3960,7 +3960,10 @@ func installLangNS() {
 		if p, ok := vs[0].(*vm.Promise); ok {
 			return vm.Boolean(p.IsRealized()), nil
 		}
-		return vm.FALSE, nil
+		if s, ok := vs[0].(*vm.LazySeq); ok {
+			return vm.Boolean(s.IsRealized()), nil
+		}
+		return vm.NIL, fmt.Errorf("realized? expected delay, promise, future, or lazy seq")
 	})
 
 	// volatile! — create a volatile mutable box
