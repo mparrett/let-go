@@ -5119,7 +5119,8 @@ func installLangNS() {
 		return vm.NIL, fmt.Errorf("cannot coerce %s to bigint", vs[0].Type().Name())
 	})
 
-	// bigint? — test if value is BigInt
+	// bigint?/big-int? — test if value is BigInt. Clojure core does not expose
+	// a BigInt-specific predicate; big-int? is useful for compatibility suites.
 	isBigInt, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.FALSE, nil
@@ -5129,6 +5130,7 @@ func installLangNS() {
 
 	ns.Def("bigint", bigintf)
 	ns.Def("bigint?", isBigInt)
+	ns.Def("big-int?", isBigInt)
 
 	// ratio? — test if value is Ratio
 	isRatio, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -6175,6 +6177,71 @@ func installLangNS() {
 	CoreNS = ns
 
 	RegisterNS(ns)
+	installClojureCompatAliases(ns)
+}
+
+func installClojureCompatAliases(ns *vm.Namespace) {
+	ns.Def("java.lang.Byte", vm.IntType)
+	ns.Def("java.lang.Short", vm.IntType)
+	ns.Def("java.lang.Integer", vm.IntType)
+	ns.Def("java.lang.Long", vm.IntType)
+	ns.Def("java.lang.Float", vm.FloatType)
+	ns.Def("java.lang.Double", vm.FloatType)
+	ns.Def("java.lang.Boolean", vm.BooleanType)
+	ns.Def("java.lang.Object", vm.AnyType)
+	ns.Def("java.math.BigDecimal", vm.BigDecimalType)
+	ns.Def("java.util.UUID", vm.UUIDType)
+
+	ns.Def("clojure.lang.BigInt", vm.BigIntType)
+	ns.Def("clojure.lang.Ratio", vm.RatioType)
+	ns.Def("clojure.lang.BigDecimal", vm.BigDecimalType)
+	ns.Def("clojure.lang.Atom", vm.AtomType)
+	ns.Def("clojure.lang.PersistentHashSet", vm.SetType)
+	ns.Def("clojure.lang.IPending", vm.PromiseType)
+
+	for _, name := range []string{
+		"clojure.lang.Associative",
+		"clojure.lang.Counted",
+		"clojure.lang.Indexed",
+		"clojure.lang.Seqable",
+		"clojure.lang.IPersistentCollection",
+		"clojure.lang.IReduce",
+	} {
+		ns.Def(name, vm.Symbol(name))
+	}
+	ns.Def("IReduce", vm.Symbol("clojure.lang.IReduce"))
+	ns.Def("String", vm.StringType)
+	ns.Def("Boolean", vm.BooleanType)
+	ns.Def("Integer.", ns.Lookup("int").(*vm.Var).Deref())
+	ns.Def("->Integer", ns.Lookup("int").(*vm.Var).Deref())
+
+	longNS := DefNSBare("Long")
+	longNS.Def("MAX_VALUE", vm.Int(9223372036854775807))
+	longNS.Def("MIN_VALUE", vm.Int(-9223372036854775808))
+	longNS.Def("TYPE", vm.IntType)
+
+	doubleNS := DefNSBare("Double")
+	doubleNS.Def("MAX_VALUE", vm.Float(1.7976931348623157e308))
+	doubleNS.Def("MIN_VALUE", vm.Float(4.9e-324))
+	doubleNS.Def("TYPE", vm.FloatType)
+
+	integerNS := DefNSBare("Integer")
+	integerNS.Def("TYPE", vm.IntType)
+
+	booleanNS := DefNSBare("Boolean")
+	booleanNS.Def("TYPE", vm.BooleanType)
+
+	mapEntryNS := DefNSBare("clojure.lang.MapEntry")
+	create, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 2 {
+			return vm.NIL, fmt.Errorf("MapEntry/create expects 2 args")
+		}
+		return vm.MapEntry{Key: vs[0], Value: vs[1]}, nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	mapEntryNS.Def("create", create)
 }
 
 func strValue(v vm.Value) string {

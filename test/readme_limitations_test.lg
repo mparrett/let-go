@@ -7,20 +7,21 @@
     false
     (catch e true)))
 
-(deftest refs-and-stm-not-implemented
-  (testing "refs / STM vars are not part of core"
-    (is (unsupported? "(ref 0)"))
-    (is (unsupported? "(dosync 1)"))
-    (is (unsupported? "(commute (atom 0) inc)"))
-    (is (unsupported? "(ensure (atom 0))"))))
+(deftest refs-are-atom-backed-compatibility-aliases
+  (testing "refs / STM forms are present but not coordinated STM"
+    (let [r (ref 0)]
+      (is (= 1 (dosync (alter r inc))))
+      (is (= 2 (dosync (commute r inc))))
+      (is (= 2 (ensure r))))))
 
-(deftest agents-not-implemented
-  (testing "agent APIs are not part of core"
-    (is (unsupported? "(agent 0)"))
-    (is (unsupported? "(send (atom 0) inc)"))
-    (is (unsupported? "(send-off (atom 0) inc)"))
-    (is (unsupported? "(agent-error (atom 0))"))
-    (is (unsupported? "(restart-agent (atom 0) 0)"))))
+(deftest agents-are-synchronous-compatibility-aliases
+  (testing "agent APIs are present but atom-backed and synchronous"
+    (let [a (agent 0)]
+      (send a inc)
+      (is (= 1 @a))
+      (send-off a + 2)
+      (is (= 3 @a))
+      (is (nil? (agent-error a))))))
 
 (deftest chunked-seq-apis-not-implemented
   (testing "chunked sequence APIs are not exposed"

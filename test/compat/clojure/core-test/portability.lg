@@ -15,100 +15,27 @@
      (do ~@body false)
      (catch _# true)))
 
-;; Portability constants used by many test files
-(def max-int 9007199254740991)       ;; 2^53-1 (JS safe integer max, good enough)
-(def min-int -9007199254740991)
-(def max-double 1.7976931348623157E308)
-(def min-double 4.9E-324)
+;; Suite-local numeric bounds used by many test files. Clojure/JVM and bb
+;; expose the underlying host constants as Long/MAX_VALUE, Double/MAX_VALUE,
+;; etc.; let-go provides the same names natively for the :clj suite path.
+(def max-int Long/MAX_VALUE)
+(def min-int Long/MIN_VALUE)
+(def max-double Double/MAX_VALUE)
+(def min-double Double/MIN_VALUE)
 (def all-ones-int -1)
 
-;; big-int? — let-go doesn't have BigInteger, so always false for regular ints
-(defn big-int? [n]
-  (and (integer? n) (not (int? n))))
+;; Re-export let-go's native BigInt predicate under the suite-local helper name.
+(def big-int? clojure.core/big-int?)
 
-;; Java class name aliases used by upstream tests
-(def clojure.lang.BigInt (type 1N))
-(def clojure.lang.Ratio (type 1/2))
-(def clojure.lang.BigDecimal (type 1M))
+;; Most JVM/Clojure compatibility names used by the suite now live in core:
+;; java.lang.* aliases, clojure.lang.* aliases, Long/Double constants,
+;; definterface/new, with-precision, refs, and synchronous agent placeholders.
+;; Keep this shim focused on test-portability helpers that require clojure.test
+;; integration or upstream-suite local names.
 
-;; MapEntry/create constructs a [k v] pair — our PersistentMap already uses vectors
-;; for entries so a plain vector satisfies (instance? ...) via vector equality checks.
-(ns clojure.lang.MapEntry)
-(defn create [k v] (first {k v}))
-
-;; Best-effort stubs for Clojure APIs that let-go doesn't implement. These
-;; let more test files compile; tests that exercise real behavior will fail
-;; at runtime but that's tracked via knownFailing.
-(in-ns 'core)
-(defn ^:private _compat-unsupported [op] (fn [& _] (throw (str op " not supported in let-go"))))
-(def ref atom)                                  ; refs → atoms (no STM)
-;; agents: stubbed as atoms with synchronous `send`. No real concurrency,
-;; but watch/action errors are retained so agent-error/restart-agent flows work.
-(def ^:private *agent-errors* (atom {}))
-(def agent atom)
-(def send (fn [a f & args]
-            (try
-              (apply swap! a f args)
-              (catch e
-                (swap! *agent-errors* assoc a e)))
-            a))
-(def send-off send)
-(def await (fn [& _] nil))
-(def await-for (fn [_ & _] true))
-(def agent-error (fn [a] (get @*agent-errors* a)))
-(def restart-agent (fn [a v & _]
-                     (swap! *agent-errors* dissoc a)
-                     (reset! a v)
-                     a))
-(def set-error-handler! (fn [_ _] nil))
-(def set-error-mode! (fn [_ _] nil))
-(def error-handler (fn [_] nil))
-(def error-mode (fn [_] :continue))
-(def shutdown-agents (fn [] nil))
-(def release-pending-sends (fn [] 0))
-(def get-validator clojure.core/get-validator)
-(def future-cancel (fn [f] (deliver f nil) true))
-(def bound-fn* clojure.core/bound-fn*)
-(defmacro bound-fn [& body]
-  (list 'clojure.core/bound-fn* (cons 'fn body)))
-(defmacro with-precision [precision & body]
-  (let [rounding? (= :rounding (first body))
-        rounding (if rounding? (second body) :half-up)
-        forms (if rounding? (next (next body)) body)]
-    `(round-bigdec ~precision ~rounding (do ~@forms))))
-;; dosync — we don't have STM. Single-threaded evaluation of the body
-;; behaves atomically with respect to other let-go code.
-(defmacro dosync [& body] `(do ~@body))
-
-;; JVM compatibility aliases used by :clj branches in clojure-test-suite.
-(def java.lang.Byte (type 0))
-(def java.lang.Short (type 0))
-(def java.lang.Integer (type 0))
-(def java.lang.Long (type 0))
-(def java.lang.Float (type 0.0))
-(def java.lang.Double (type 0.0))
-(def java.lang.Boolean (type true))
-(def java.math.BigDecimal (type 0.0M))
-(def java.util.UUID (type (parse-uuid "00000000-0000-0000-0000-000000000000")))
-(def java.lang.Object Object)
-(def clojure.lang.Atom (type (atom nil)))
-(def clojure.lang.IReduce :clojure-lang-IReduce-stub)
-(def IReduce clojure.lang.IReduce)
-(def Boolean java.lang.Boolean)
-(def Integer. int)
-(defn ->Integer [x] (int x))
-(defn let-go-new [class & args]
-  (case class
-    Boolean false
-    Object nil
-    nil))
-(defmacro new [class & args]
-  `(let-go-new '~class ~@args))
-(defmacro definterface [name & sigs]
-  (let [method-names (distinct (map first sigs))
-        proto-sigs (map (fn [m] (list m '[this x])) method-names)]
-    (cons 'defprotocol (cons name proto-sigs))))
-
+;; FIXME: Clojure JVM's `num` boxes primitive long/double values. let-go does
+;; not have separate primitive-vs-boxed numeric host types, so this remains a
+;; suite-local compatibility shim for overload-dispatch characterization tests.
 (in-ns 'core)
 (deftype LetGoNumBox [value])
 (defn num [x]
@@ -117,43 +44,4 @@
     (not (number? x)) (throw (str "Expected a number, got " (type x)))
     (or (bigint? x) (decimal? x)) x
     :else (->LetGoNumBox x)))
-(in-ns 'clojure.core-test.portability)
-
-(create-ns 'Long)
-(intern 'Long 'MAX_VALUE 9223372036854775807)
-(intern 'Long 'MIN_VALUE -9223372036854775808)
-(intern 'Long 'TYPE java.lang.Long)
-(create-ns 'Double)
-(intern 'Double 'MAX_VALUE 1.7976931348623157E308)
-(intern 'Double 'MIN_VALUE 4.9E-324)
-(intern 'Double 'TYPE java.lang.Double)
-(create-ns 'Integer)
-(intern 'Integer 'TYPE java.lang.Integer)
-(create-ns 'Boolean)
-(intern 'Boolean 'TYPE java.lang.Boolean)
-
-;; ref operations — treat refs as atoms, no coordination
-(def ref-set (fn [r v] (reset! r v)))
-(def alter (fn [r f & args] (apply swap! r f args)))
-(def commute alter)
-(def ensure deref)
-;; tap>, add-tap, remove-tap are now built-in.
-;; Java class-name aliases used in hierarchy tests
-(def String (type ""))
-(def clojure.lang.PersistentHashSet (type #{}))
-(def clojure.lang.Associative 'clojure.lang.Associative)
-(def clojure.lang.Counted :clojure-lang-Counted-stub)
-(def clojure.lang.Indexed :clojure-lang-Indexed-stub)
-(def clojure.lang.Seqable :clojure-lang-Seqable-stub)
-(def clojure.lang.IPersistentCollection :clojure-lang-IPersistentCollection-stub)
-;; Rounding enum sentinels for with-precision (which is a no-op anyway)
-(def UP :up)
-(def DOWN :down)
-(def HALF_UP :half-up)
-(def HALF_DOWN :half-down)
-(def HALF_EVEN :half-even)
-(def CEILING :ceiling)
-(def FLOOR :floor)
-(def UNNECESSARY :unnecessary)
-(def clojure.lang.IPending (type (promise)))    ; let-go IPending ≡ Promise
 (in-ns 'clojure.core-test.portability)

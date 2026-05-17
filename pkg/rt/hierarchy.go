@@ -25,6 +25,15 @@ var (
 	hKeyDescendants = vm.Keyword("descendants")
 )
 
+var (
+	cljAssociative           = vm.Symbol("clojure.lang.Associative")
+	cljCounted               = vm.Symbol("clojure.lang.Counted")
+	cljIndexed               = vm.Symbol("clojure.lang.Indexed")
+	cljSeqable               = vm.Symbol("clojure.lang.Seqable")
+	cljIPersistentCollection = vm.Symbol("clojure.lang.IPersistentCollection")
+	cljIReduce               = vm.Symbol("clojure.lang.IReduce")
+)
+
 func emptyHierarchy() *vm.PersistentMap {
 	return vm.EmptyPersistentMap.
 		Assoc(hKeyParents, vm.EmptyPersistentMap).(*vm.PersistentMap).
@@ -435,17 +444,63 @@ func directTypeParents(tag vm.Value) *vm.PersistentSet {
 	result := registeredTypeParents[vt]
 	typeParentsMu.RUnlock()
 	switch vt {
-	case vm.StringType, vm.SetType:
+	case vm.StringType:
 		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljCounted)
+		result = setConj(result, cljIndexed)
+	case vm.ArrayVectorType, vm.PersistentVectorType:
+		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljAssociative)
+		result = setConj(result, cljCounted)
+		result = setConj(result, cljIndexed)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljIPersistentCollection)
+		result = setConj(result, cljIReduce)
+	case vm.MapType, vm.SortedMapType:
+		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljAssociative)
+		result = setConj(result, cljCounted)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljIPersistentCollection)
+		result = setConj(result, cljIReduce)
+	case vm.SetType, vm.SortedSetType:
+		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljCounted)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljIPersistentCollection)
+		result = setConj(result, cljIReduce)
+	case vm.ListType, vm.SequenceType:
+		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljCounted)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljIPersistentCollection)
+		result = setConj(result, cljIReduce)
+	case vm.RangeType, vm.RepeatType, vm.IterateType, vm.TypedArrayType:
+		result = setConj(result, vm.AnyType)
+		result = setConj(result, cljSeqable)
+		result = setConj(result, cljIReduce)
+	case vm.AtomType:
+		result = setConj(result, vm.AnyType)
+	case vm.PromiseType:
+		result = setConj(result, vm.AnyType)
+	default:
+		if _, ok := vt.(*vm.RecordType); ok {
+			result = setConj(result, vm.AnyType)
+			result = setConj(result, cljAssociative)
+			result = setConj(result, cljCounted)
+			result = setConj(result, cljSeqable)
+			result = setConj(result, cljIPersistentCollection)
+			result = setConj(result, cljIReduce)
+		} else if _, ok := vt.(*vm.DType); ok {
+			result = setConj(result, vm.AnyType)
+		}
 	}
 	return result
 }
 
 func directTypeAncestors(vt vm.ValueType) *vm.PersistentSet {
 	result := vm.EmptyPersistentSet
-	if _, ok := vt.(*vm.RecordType); ok {
-		result = setConj(result, vm.Symbol("clojure.lang.Associative"))
-	}
 	for _, p := range setValues(directTypeParents(vt)) {
 		result = setConj(result, p)
 		if pvt, ok := p.(vm.ValueType); ok {
