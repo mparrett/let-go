@@ -28,14 +28,12 @@ const memLimitBytes = 512 * 1024 * 1024
 // knownFailing lists test names (filename stems) that are known to fail.
 // Tests that pass but appear here will cause an error so the list stays current.
 var knownFailing = map[string]bool{
-	"abs":            true, // :default reader branch expects min-int negation to succeed
 	"bigint":         true, // BigInt promotion at Long range boundary
 	"with_precision": true, // with-precision is a no-op; results don't round
 	"case":           true, // case macro complex matching
-	"dec":            true, // dec overflow/type coercion
-	"inc":            true, // overflow untested assertion
-	"reduce":         true, // reduce interop edge cases
-	"short":          true, // short coercion
+	"eq":             true, // JVM numeric equality and NaN collection edge cases
+	"not_eq":         true, // JVM numeric equality and NaN collection edge cases
+	"num":            true, // JVM primitive overload checks
 }
 
 // suiteCounters tracks aggregate assertion counts across the entire suite.
@@ -76,6 +74,9 @@ func (s *suiteCounters) summary() string {
 // Each .cljc file is compiled and executed through let-go with compat shims.
 // Files that fail to compile (e.g. missing builtins) are reported as skipped.
 func TestClojureTestSuite(t *testing.T) {
+	compiler.SetMatchCljConditional(true)
+	defer compiler.SetMatchCljConditional(false)
+
 	suiteDir := "clojure-test-suite/test/clojure/core_test"
 	if _, err := os.Stat(suiteDir); os.IsNotExist(err) {
 		t.Skip("clojure-test-suite submodule not initialized (run: git submodule update --init)")

@@ -8,6 +8,7 @@ package vm
 import (
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 type theStringType struct {
@@ -59,6 +60,26 @@ func (l String) Type() ValueType { return StringType }
 // Unbox implements Unbox
 func (l String) Unbox() interface{} {
 	return string(l)
+}
+
+func (l String) InvokeMethod(name Symbol, args []Value) (Value, error) {
+	switch name {
+	case "replace":
+		if len(args) != 2 {
+			return NIL, fmt.Errorf("String.replace expected 2 arguments")
+		}
+		old, ok := args[0].(String)
+		if !ok {
+			return NIL, fmt.Errorf("String.replace expected String target")
+		}
+		repl, ok := args[1].(String)
+		if !ok {
+			return NIL, fmt.Errorf("String.replace expected String replacement")
+		}
+		return String(strings.ReplaceAll(string(l), string(old), string(repl))), nil
+	default:
+		return NIL, fmt.Errorf("method %s not found on String", name)
+	}
 }
 
 // First implements Seq

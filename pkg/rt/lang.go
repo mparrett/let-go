@@ -799,6 +799,42 @@ func fnComparator(comp vm.Fn) vm.Comparator {
 	}
 }
 
+func invokeMethodFallback(rec vm.Value, name vm.Symbol, args []vm.Value, originalErr error) (vm.Value, error) {
+	if name == "reduce" && len(args) == 1 {
+		if v := CoreNS.Lookup(vm.Symbol("reduce")); v != vm.NIL {
+			if methodVar, ok := v.(*vm.Var); ok {
+				if fn, ok := methodVar.Deref().(vm.Fn); ok {
+					return fn.Invoke([]vm.Value{args[0], rec})
+				}
+			}
+		}
+	}
+	if name == "reduce" && len(args) == 2 {
+		if v := CoreNS.Lookup(vm.Symbol("reduce")); v != vm.NIL {
+			if methodVar, ok := v.(*vm.Var); ok {
+				if fn, ok := methodVar.Deref().(vm.Fn); ok {
+					return fn.Invoke([]vm.Value{args[0], args[1], rec})
+				}
+			}
+		}
+	}
+	if v := CurrentNS.Deref().(*vm.Namespace).Lookup(name); v != vm.NIL {
+		if methodVar, ok := v.(*vm.Var); ok {
+			if fn, ok := methodVar.Deref().(vm.Fn); ok {
+				return fn.Invoke(append([]vm.Value{rec}, args...))
+			}
+		}
+	}
+	for _, ns := range nsRegistry {
+		if v := ns.LookupLocal(name); v != nil {
+			if fn, ok := v.Deref().(vm.Fn); ok {
+				return fn.Invoke(append([]vm.Value{rec}, args...))
+			}
+		}
+	}
+	return vm.NIL, originalErr
+}
+
 // nolint
 func installLangNS() {
 	plus, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -1581,6 +1617,9 @@ func installLangNS() {
 		if _, ok := vs[0].(*vm.InfiniteRange); ok {
 			return vm.EmptyList, nil
 		}
+		if _, ok := vs[0].(*vm.Record); ok {
+			return vm.NIL, fmt.Errorf("empty is not supported on records")
+		}
 		coll, ok := vs[0].(vm.Collection)
 		if !ok {
 			return vm.NIL, nil
@@ -2050,15 +2089,19 @@ func installLangNS() {
 		if len(vs) < 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		rec, ok := vs[0].(vm.Receiver)
-		if !ok {
-			return vm.NIL, fmt.Errorf("method-invoke expected Receiver")
-		}
 		name, ok := vs[1].(vm.Symbol)
 		if !ok {
 			return vm.NIL, fmt.Errorf("method-invoke expected Symbol")
 		}
-		return rec.InvokeMethod(name, vs[2:])
+		rec, ok := vs[0].(vm.Receiver)
+		if !ok {
+			return invokeMethodFallback(vs[0], name, vs[2:], fmt.Errorf("method-invoke expected Receiver"))
+		}
+		result, err := rec.InvokeMethod(name, vs[2:])
+		if err == nil {
+			return result, nil
+		}
+		return invokeMethodFallback(rec, name, vs[2:], err)
 	})
 
 	deref, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -2771,6 +2814,9 @@ func installLangNS() {
 		}
 		if len(vs) == 1 {
 			return vm.NewRepeat(vs[0], -1), nil
+		}
+		if _, ok := vs[0].(vm.Boolean); ok {
+			return vm.NIL, fmt.Errorf("repeat expected an Int")
 		}
 		ni, ok := vm.ToInt(vs[0])
 		if !ok {

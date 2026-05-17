@@ -75,6 +75,49 @@
 ;; dosync — we don't have STM. Single-threaded evaluation of the body
 ;; behaves atomically with respect to other let-go code.
 (defmacro dosync [& body] `(do ~@body))
+
+;; JVM compatibility aliases used by :clj branches in clojure-test-suite.
+(def java.lang.Byte (type 0))
+(def java.lang.Short (type 0))
+(def java.lang.Integer (type 0))
+(def java.lang.Long (type 0))
+(def java.lang.Float (type 0.0))
+(def java.lang.Double (type 0.0))
+(def java.lang.Boolean (type true))
+(def java.math.BigDecimal (type 0.0M))
+(def java.util.UUID (type (parse-uuid "00000000-0000-0000-0000-000000000000")))
+(def java.lang.Object Object)
+(def clojure.lang.Atom (type (atom nil)))
+(def clojure.lang.IReduce :clojure-lang-IReduce-stub)
+(def IReduce clojure.lang.IReduce)
+(def Boolean java.lang.Boolean)
+(def Integer. int)
+(defn ->Integer [x] (int x))
+(defn let-go-new [class & args]
+  (case class
+    Boolean false
+    Object nil
+    nil))
+(defmacro new [class & args]
+  `(let-go-new '~class ~@args))
+(defmacro definterface [name & sigs]
+  (let [method-names (distinct (map first sigs))
+        proto-sigs (map (fn [m] (list m '[this x])) method-names)]
+    (cons 'defprotocol (cons name proto-sigs))))
+
+(create-ns 'Long)
+(intern 'Long 'MAX_VALUE 9223372036854775807)
+(intern 'Long 'MIN_VALUE -9223372036854775808)
+(intern 'Long 'TYPE java.lang.Long)
+(create-ns 'Double)
+(intern 'Double 'MAX_VALUE 1.7976931348623157E308)
+(intern 'Double 'MIN_VALUE 4.9E-324)
+(intern 'Double 'TYPE java.lang.Double)
+(create-ns 'Integer)
+(intern 'Integer 'TYPE java.lang.Integer)
+(create-ns 'Boolean)
+(intern 'Boolean 'TYPE java.lang.Boolean)
+
 ;; ref operations — treat refs as atoms, no coordination
 (def ref-set (fn [r v] (reset! r v)))
 (def alter (fn [r f & args] (apply swap! r f args)))

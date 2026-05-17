@@ -341,8 +341,20 @@
   (testing "parse-uuid normalizes case for equality"
     (is (= (parse-uuid "550e8400-e29b-41d4-a716-446655440000")
            (parse-uuid "550E8400-E29B-41D4-A716-446655440000"))))
+  (testing "parse-uuid accepts Java UUID shorthand groups"
+    (is (= #uuid "00000000-0000-0000-0000-000000000000"
+           (parse-uuid "0-0-0-0-0")))
+    (is (= #uuid "00000012-0034-0056-0078-000000000009"
+           (parse-uuid "12-34-56-78-9")))
+    (is (= #uuid "00000005-0004-0003-0002-009000000001"
+           (parse-uuid "5-4-3-DEADBEEF0002-9000000001"))))
   (testing "#uuid reader literal produces a UUID"
     (is (uuid? #uuid "550e8400-e29b-41d4-a716-446655440000"))))
+
+(deftest repeat-boolean-count-test
+  (testing "repeat count rejects booleans"
+    (is (= :caught (try (repeat true :a) (catch e :caught))))
+    (is (= :caught (try (repeat false :a) (catch e :caught))))))
 
 ;; --- reader tagged literals: #inst, unknown tags ---
 
