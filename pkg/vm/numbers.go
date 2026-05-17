@@ -192,6 +192,18 @@ func NumMul(a, b Value) (Value, error) {
 
 // NumDiv divides a by b. Int/Int returns Float when not exact.
 func NumDiv(a, b Value) (Value, error) {
+	if _, ok := a.(*BigDecimal); ok {
+		if bf, ok := ToFloat(b); ok && (math.IsNaN(bf) || math.IsInf(bf, 0)) {
+			af, _ := ToFloat(a)
+			return Float(floatDiv(af, bf)), nil
+		}
+	}
+	if _, ok := b.(*BigDecimal); ok {
+		if af, ok := ToFloat(a); ok && (math.IsNaN(af) || math.IsInf(af, 0)) {
+			bf, _ := ToFloat(b)
+			return Float(floatDiv(af, bf)), nil
+		}
+	}
 	switch av := a.(type) {
 	case Int:
 		switch bv := b.(type) {

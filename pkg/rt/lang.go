@@ -851,6 +851,9 @@ func installLangNS() {
 		if len(vs) < 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
+		if len(vs) == 1 {
+			return vm.NumDiv(vm.MakeInt(1), vs[0])
+		}
 		acc := vs[0]
 		for i := 1; i < len(vs); i++ {
 			var err error

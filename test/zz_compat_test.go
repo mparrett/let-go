@@ -37,7 +37,6 @@ var knownFailing = map[string]bool{
 	"inc":            true, // overflow untested assertion
 	"reduce":         true, // reduce interop edge cases
 	"short":          true, // short coercion
-	"slash":          true, // division edge cases
 }
 
 // suiteCounters tracks aggregate assertion counts across the entire suite.
