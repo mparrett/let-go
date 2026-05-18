@@ -21,6 +21,12 @@ builds:
     goarch:
       - amd64
       - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: arm
   # Plan 9 / 9front. Go's plan9 port supports 386, amd64, and arm (32-bit).
   # No arm64 target exists upstream.
   - id: plan9
@@ -51,7 +57,21 @@ changelog:
       - '^test:'
       - '^chore:'
 
-# brews:
-#   Disabled for now — branch protection blocks direct push,
-#   and PR mode needs a PAT. Formula is maintained manually
-#   in HomebrewFormula/let-go.rb
+brews:
+  - directory: HomebrewFormula
+    repository:
+      owner: nooga
+      name: let-go
+      token: "{{ .Env.GORELEASER_PAT }}"
+      branch: "goreleaser-brew-{{ .Version }}"
+      pull_request:
+        enabled: true
+        base:
+          branch: main
+    homepage: https://github.com/nooga/let-go
+    description: A Clojure dialect implemented as a bytecode VM in Go
+    license: MIT
+    install: |
+      bin.install "lg"
+    test: |
+      system bin/"lg", "-e", "(+ 1 1)"

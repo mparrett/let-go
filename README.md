@@ -10,14 +10,15 @@
 Greetings loafers! _(λ-gophers haha, get it?)_
 
 let-go is a Clojure dialect with a bytecode compiler and stack VM, written in Go.
-A single ~10.7MB binary, ~7ms cold start, no JVM. It passes the vendored
-`:clj` lens of the [jank-lang test suite](https://github.com/jank-lang/clojure-test-suite).
+A single ~10.7MB binary, ~7ms cold start, no JVM. It passes the
+[jank-lang test suite](https://github.com/jank-lang/clojure-test-suite).
 
 I started this in 2021 as an elaborate joke: an excuse to write Clojure while
 pretending to write Go. It turned out useful. I use it for CLIs, scripts, and
 web servers, and I built [a daemonless container runtime](https://github.com/nooga/lgcr)
 on top of it. You can compile let-go programs to standalone binaries or
-self-contained WASM web pages. [It even runs on Plan 9](https://x.com/MGasperowicz/status/2052428420592599507?s=20).
+self-contained WASM web pages. [It even runs on Plan 9](https://x.com/MGasperowicz/status/2052428420592599507?s=20),
+and ReMarkable 2.
 
 It is not a drop-in replacement for Clojure JVM. It does not load JARs and
 does not aim to. Most idiomatic Clojure code runs unmodified, but a real
