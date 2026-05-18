@@ -178,6 +178,16 @@ const term = new Terminal({
 const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
 
+// Public hook for the shell: change font size and refit so cols/rows
+// recompute. xterm fires onResize internally, which propagates the new
+// size into the SAB; the game-loop picks it up on its next iteration.
+// Use this to bump character size on portrait mobile.
+window._lgSetFontSize = function(n) {
+  if (typeof n !== 'number' || n < 6 || n > 64) return;
+  term.options.fontSize = n;
+  try { fitAddon.fit(); } catch(_) {}
+};
+
 function showTerminal() {
   status.style.display = 'none';
   termEl.style.display = 'block';
