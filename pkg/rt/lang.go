@@ -99,6 +99,7 @@ func init() {
 	installPodsNS()
 	installMathNS()
 	installTermNS()
+	installJSNS()
 	installSyscallNS()
 	installUnixNS()
 	installSystemNS()
