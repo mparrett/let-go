@@ -177,6 +177,13 @@ const term = new Terminal({
 });
 const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
+// Diagnostic affordances for headless probes: read term.cols/rows or call
+// fitAddon.fit() without digging through xterm's private DOM. The xterm
+// accessibility tree includes invisible buffer cells past term.cols, so
+// "is text X visible?" needs a slice to t.cols rather than a textContent
+// substring match — these exports make that slice possible.
+window._lgTerm = term;
+window._lgFit = fitAddon;
 
 // Public hook for the shell: change font size and refit so cols/rows
 // recompute. xterm fires onResize internally, which propagates the new
