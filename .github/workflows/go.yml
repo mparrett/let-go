@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -34,4 +36,7 @@ jobs:
         run: go build -v ./...
 
       - name: Test
-        run: go test -v -timeout 60s ./...
+        run: go test -v -timeout 60s ./... -skip TestClojureTestSuite
+
+      - name: Clojure compatibility test suite
+        run: go test ./test/ -count=1 -run TestClojureTestSuite -v
