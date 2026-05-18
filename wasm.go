@@ -186,6 +186,7 @@ window._lgSetFontSize = function(n) {
   if (typeof n !== 'number' || n < 6 || n > 64) return;
   term.options.fontSize = n;
   try { fitAddon.fit(); } catch(_) {}
+  if (window._lgWake) window._lgWake();
 };
 
 function showTerminal() {
@@ -218,7 +219,10 @@ async function loadShell() {
   } catch (_) { /* no shell, fine */ }
 }
 
-window.addEventListener('resize', () => fitAddon.fit());
+window.addEventListener('resize', () => {
+  try { fitAddon.fit(); } catch(_) {}
+  if (window._lgWake) window._lgWake();
+});
 
 // --- Worker mode (interactive, needs cross-origin isolation) ---
 function startWorkerMode() {
@@ -254,6 +258,14 @@ function startWorkerMode() {
   // Public input hook for the shell. Same contract as a keystroke: pass
   // the bytes you'd want from the keyboard (e.g. 'h', '\x1b[A', '\r').
   window._lgKey = sendKey;
+
+  // Wake the worker from a blocking read-key without sending real input.
+  // Used when the terminal resizes or the font size changes — the game's
+  // input loop is parked in Atomics.wait, so without a poke it won't
+  // notice and won't re-render. BEL (0x07) is non-printable and not
+  // bound to any xsofy action, so parse-key returns :unknown and the
+  // world goes through update-world unchanged.
+  window._lgWake = () => sendKey('\x07');
 
   // Build worker code: fs shim + wasm_exec.js + bootstrap
   const workerCode = ` + "`" + `
@@ -383,7 +395,8 @@ async function startMainThreadMode() {
   // No input path in main-thread mode (no SAB, no blocking read). Shell
   // buttons fire but the worker isn't there to receive — log so it's
   // obvious in devtools instead of silently dropping.
-  window._lgKey = function(){ console.warn('_lgKey: no input in main-thread mode (needs cross-origin isolation)'); };
+  window._lgKey  = function(){ console.warn('_lgKey: no input in main-thread mode (needs cross-origin isolation)'); };
+  window._lgWake = function(){};
 
   // Load wasm_exec.js
   eval(WASM_EXEC_JS);
