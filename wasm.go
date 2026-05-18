@@ -232,6 +232,11 @@ function startWorkerMode() {
     globalThis._lgFlush = function() {
       if (outputBuf.length > 0) { postMessage({t:'out', d:outputBuf}); outputBuf = ''; }
     };
+    // Worker side of the js/emit bridge — forward to main thread, which
+    // dispatches the CustomEvent against window (workers have no DOM).
+    globalThis._lgEmit = function(name, dataJson) {
+      postMessage({ t: 'emit', name, data: dataJson });
+    };
     onmessage = async (e) => {
       if (e.data.t !== 'init') return;
       const { sab, wasmGzB64, wasmExecJS } = e.data;
@@ -264,6 +269,11 @@ function startWorkerMode() {
   worker.onmessage = (e) => {
     if (e.data.t === 'out') term.write(e.data.d);
     if (e.data.t === 'exit') term.write('\r\n\x1b[90m[program exited]\x1b[0m\r\n');
+    if (e.data.t === 'emit') {
+      try {
+        window.dispatchEvent(new CustomEvent(e.data.name, { detail: JSON.parse(e.data.data) }));
+      } catch (err) { console.error('lg emit relay:', err); }
+    }
   };
 
   worker.postMessage({ t: 'init', sab, wasmGzB64: WASM_GZ_B64, wasmExecJS: WASM_EXEC_JS });
@@ -309,6 +319,12 @@ async function startMainThreadMode() {
     unlink(p,cb){cb(null);}, utimes(p,a,m,cb){cb(null);},
   };
   globalThis._lgFlush = function(){};
+  // Main-thread side of the js/emit bridge — dispatch directly on window.
+  globalThis._lgEmit = function(name, dataJson) {
+    try {
+      window.dispatchEvent(new CustomEvent(name, { detail: JSON.parse(dataJson) }));
+    } catch (err) { console.error('lg emit:', err); }
+  };
 
   // Load wasm_exec.js
   eval(WASM_EXEC_JS);
