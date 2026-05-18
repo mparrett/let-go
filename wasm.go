@@ -100,7 +100,20 @@ const wasmHTMLTemplate = `<!doctype html>
     *{margin:0;padding:0;box-sizing:border-box}
     html,body{height:100%%;background:#0c0c0c;color:#e8e6df;overflow:hidden}
     body{display:flex;flex-direction:column}
-    #terminal{flex:1}
+    /* Shell slots — host pages populate via shell.html (fetched on boot).
+       Empty slots collapse so the terminal owns the full viewport. */
+    #shell-top:empty,#shell-bottom:empty{display:none}
+    #shell-top,#shell-bottom{flex:0 0 auto}
+    #terminal{flex:1;min-height:0}
+    /* Portrait: constrain the terminal to a wide aspect so the chars stay
+       legible, and let #shell-bottom absorb the remaining vertical space.
+       Default ratio matches xsofy's 100:36 panel layout; host pages can
+       override #terminal{height:...} from shell.html if a different ratio
+       suits them. */
+    @media (orientation: portrait) {
+      #terminal{flex:0 0 auto;height:calc(100vw * 36 / 100);width:100%%}
+      #shell-bottom{flex:1;min-height:0;overflow:auto}
+    }
     #status{color:#5a584f;font-family:monospace;font-size:13px;padding:1rem;position:absolute;
             top:50%%;left:50%%;transform:translate(-50%%,-50%%)}
     .xterm{height:100%%}
@@ -108,7 +121,9 @@ const wasmHTMLTemplate = `<!doctype html>
 </head>
 <body>
   <div id="status">loading...</div>
+  <div id="shell-top"></div>
   <div id="terminal" style="display:none"></div>
+  <div id="shell-bottom"></div>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
   <script>
@@ -171,6 +186,28 @@ function showTerminal() {
   term.focus();
 }
 
+// Host pages can populate the shell slots by shipping shell.html alongside
+// the bundle. Fetch it on boot; silently skip on 404 so the bundle still
+// works standalone. We inject the fragment into #shell-bottom by default;
+// the fragment can itself relocate parts into #shell-top via script.
+async function loadShell() {
+  try {
+    const r = await fetch('shell.html', { cache: 'no-cache' });
+    if (!r.ok) return;
+    const html = await r.text();
+    document.getElementById('shell-bottom').innerHTML = html;
+    // Re-execute any inline <script> tags (innerHTML doesn't run them).
+    document.getElementById('shell-bottom').querySelectorAll('script').forEach(old => {
+      const s = document.createElement('script');
+      for (const a of old.attributes) s.setAttribute(a.name, a.value);
+      s.textContent = old.textContent;
+      old.replaceWith(s);
+    });
+    // FitAddon needs to recompute after the layout shifts.
+    setTimeout(() => { try { fitAddon.fit(); } catch(_) {} }, 0);
+  } catch (_) { /* no shell, fine */ }
+}
+
 window.addEventListener('resize', () => fitAddon.fit());
 
 // --- Worker mode (interactive, needs cross-origin isolation) ---
@@ -180,6 +217,7 @@ function startWorkerMode() {
   const keyUint8 = new Uint8Array(sab, 8, 16);
 
   showTerminal();
+  loadShell();
 
   // Store terminal size in SAB
   Atomics.store(keyInt32, 6, term.cols);
@@ -189,17 +227,23 @@ function startWorkerMode() {
     Atomics.store(keyInt32, 7, rows);
   });
 
-  // Send keystrokes to worker via SAB
-  term.onData(data => {
+  // sendKey: write UTF-8 bytes into the SAB key slot the worker is waiting
+  // on. Shared by term.onData (keyboard) and window._lgKey (host page
+  // buttons / synthetic input). Spin-waits briefly if a prior key is still
+  // pending — fine for human-rate input, including tap-mashing.
+  function sendKey(data) {
     const bytes = new TextEncoder().encode(data);
-    if (bytes.length > 16) return;
-    // Spin-wait if previous key hasn't been consumed yet
+    if (bytes.length === 0 || bytes.length > 16) return;
     while (Atomics.load(keyInt32, 0) !== 0) { /* busy wait */ }
     keyUint8.set(bytes);
     Atomics.store(keyInt32, 1, bytes.length);
     Atomics.store(keyInt32, 0, 1);
     Atomics.notify(keyInt32, 0);
-  });
+  }
+  term.onData(sendKey);
+  // Public input hook for the shell. Same contract as a keystroke: pass
+  // the bytes you'd want from the keyboard (e.g. 'h', '\x1b[A', '\r').
+  window._lgKey = sendKey;
 
   // Build worker code: fs shim + wasm_exec.js + bootstrap
   const workerCode = ` + "`" + `
@@ -282,6 +326,7 @@ function startWorkerMode() {
 // --- Main-thread mode (output only, no input) ---
 async function startMainThreadMode() {
   showTerminal();
+  loadShell();
   if (location.protocol === 'file:') {
     term.write('\x1b[33mInteractive input requires a local server. Run:\x1b[0m\r\n');
     term.write('\x1b[33m  python3 -m http.server\x1b[0m\r\n');
@@ -325,6 +370,10 @@ async function startMainThreadMode() {
       window.dispatchEvent(new CustomEvent(name, { detail: JSON.parse(dataJson) }));
     } catch (err) { console.error('lg emit:', err); }
   };
+  // No input path in main-thread mode (no SAB, no blocking read). Shell
+  // buttons fire but the worker isn't there to receive — log so it's
+  // obvious in devtools instead of silently dropping.
+  window._lgKey = function(){ console.warn('_lgKey: no input in main-thread mode (needs cross-origin isolation)'); };
 
   // Load wasm_exec.js
   eval(WASM_EXEC_JS);
