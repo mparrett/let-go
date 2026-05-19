@@ -14,6 +14,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -334,6 +336,8 @@ var bundleOutput string
 var bundleBase string
 var wasmOutput string
 var sourcePaths string
+var cpuProfile string
+var memProfile string
 
 func init() {
 	flag.BoolVar(&runREPL, "r", false, "attach REPL after running given files")
@@ -350,6 +354,45 @@ func init() {
 	flag.StringVar(&sourcePaths, "source-paths", "",
 		"additional namespace search paths separated by the OS path-list separator "+
 			"(':' on Unix, ';' on Windows). Falls back to LG_SOURCE_PATHS if unset.")
+	flag.StringVar(&cpuProfile, "cpuprofile", "", "write Go CPU profile to file (sampled around script/REPL run; bundled-binary path not profiled)")
+	flag.StringVar(&memProfile, "memprofile", "", "write Go heap profile to file at exit")
+}
+
+// startProfiling begins CPU profiling if -cpuprofile is set, and returns a
+// stop function that writes the memory profile (if -memprofile is set) and
+// stops the CPU profile. Safe to call unconditionally — returns a no-op when
+// neither flag was provided.
+func startProfiling() func() {
+	stop := func() {}
+	if cpuProfile != "" {
+		f, err := os.Create(cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+		} else if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+			_ = f.Close()
+		} else {
+			prev := stop
+			stop = func() { prev(); pprof.StopCPUProfile(); _ = f.Close() }
+		}
+	}
+	if memProfile != "" {
+		prev := stop
+		stop = func() {
+			prev()
+			f, err := os.Create(memProfile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+				return
+			}
+			runtime.GC()
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+			}
+			_ = f.Close()
+		}
+	}
+	return stop
 }
 
 // buildSearchPaths resolves the resolver's path list from the -source-paths
@@ -442,6 +485,12 @@ func main() {
 		fmt.Printf("lg %s\n", versionString())
 		os.Exit(0)
 	}
+
+	// Profiling (CPU + optional heap). No-op when flags unset.
+	// Uses defer so any os.Exit below stops the profile cleanly via runtime
+	// exit hooks — pprof.StopCPUProfile must run for the file to be valid.
+	stopProfiling := startProfiling()
+	defer stopProfiling()
 
 	files := flag.Args()
 
