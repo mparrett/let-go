@@ -234,9 +234,31 @@ window.addEventListener('resize', () => {
 
 // --- Worker mode (interactive, needs cross-origin isolation) ---
 function startWorkerMode() {
-  const sab = new SharedArrayBuffer(64);
+  // SPSC ring buffer between main thread (producer) and worker (consumer).
+  // Layout MUST stay in sync with pkg/rt/term_wasm.go — the constants below
+  // mirror the Go consts. Producer never blocks the main thread: when the
+  // buffer is full, sendKey returns false and the caller decides what to do
+  // (held-repeat callers ignore the return; future call sites can layer JS
+  // queuing on top for guaranteed delivery).
+  //
+  // Int32Array view (used cells):
+  //   [0]  readIdx       — consumer increments after reading a slot
+  //   [1]  writeIdx      — producer increments after writing a slot
+  //   [6]  terminal cols — xterm.onResize writes
+  //   [7]  terminal rows — xterm.onResize writes
+  // Uint8Array view (slot region):
+  //   bytes 64..71   slot lengths (1 byte per slot)
+  //   bytes 72..199  slot keys    (16 bytes per slot, 8 slots)
+  const CAPACITY = 8;
+  const MAX_KEY_LEN = 16;
+  const LEN_OFFSET = 64;
+  const KEY_OFFSET = 72;
+  const READ_IDX = 0;
+  const WRITE_IDX = 1;
+
+  const sab = new SharedArrayBuffer(256);
   const keyInt32 = new Int32Array(sab);
-  const keyUint8 = new Uint8Array(sab, 8, 16);
+  const keyUint8 = new Uint8Array(sab);
 
   showTerminal();
   loadShell();
@@ -249,22 +271,32 @@ function startWorkerMode() {
     Atomics.store(keyInt32, 7, rows);
   });
 
-  // sendKey: write UTF-8 bytes into the SAB key slot the worker is waiting
-  // on. Shared by term.onData (keyboard) and window._lgKey (host page
-  // buttons / synthetic input). Spin-waits briefly if a prior key is still
-  // pending — fine for human-rate input, including tap-mashing.
+  // sendKey: write UTF-8 bytes into the next ring-buffer slot and notify
+  // the worker. Returns true if accepted, false if the buffer is full
+  // (caller decides whether to drop, retry, or ignore). Single-producer:
+  // only one main-thread context writes, so no CAS is needed. Slot writes
+  // happen-before the writeIdx publication because Atomics.store is
+  // sequentially consistent — the worker never sees an advanced writeIdx
+  // with an unwritten slot.
   function sendKey(data) {
     const bytes = new TextEncoder().encode(data);
-    if (bytes.length === 0 || bytes.length > 16) return;
-    while (Atomics.load(keyInt32, 0) !== 0) { /* busy wait */ }
-    keyUint8.set(bytes);
-    Atomics.store(keyInt32, 1, bytes.length);
-    Atomics.store(keyInt32, 0, 1);
-    Atomics.notify(keyInt32, 0);
+    if (bytes.length === 0 || bytes.length > MAX_KEY_LEN) return false;
+    const w = Atomics.load(keyInt32, WRITE_IDX);
+    const r = Atomics.load(keyInt32, READ_IDX);
+    if (w - r >= CAPACITY) return false;          // full → drop
+    const slot = w %% CAPACITY;
+    keyUint8[LEN_OFFSET + slot] = bytes.length;
+    keyUint8.set(bytes, KEY_OFFSET + slot * MAX_KEY_LEN);
+    Atomics.store(keyInt32, WRITE_IDX, w + 1);    // publish
+    Atomics.notify(keyInt32, WRITE_IDX, 1);       // wake one waiter
+    return true;
   }
   term.onData(sendKey);
   // Public input hook for the shell. Same contract as a keystroke: pass
   // the bytes you'd want from the keyboard (e.g. 'h', '\x1b[A', '\r').
+  // Returns true if accepted, false if the buffer was full — held-repeat
+  // callers can ignore the return; the buffer has 8 slots which is plenty
+  // for any human-paced or auto-repeat-paced producer.
   window._lgKey = sendKey;
 
   // Wake the worker from a blocking read-key without sending real input.
@@ -315,7 +347,7 @@ function startWorkerMode() {
       if (e.data.t !== 'init') return;
       const { sab, wasmGzB64, wasmExecJS } = e.data;
       globalThis._lgKeyInt32 = new Int32Array(sab);
-      globalThis._lgKeyUint8 = new Uint8Array(sab, 8, 16);
+      globalThis._lgKeyUint8 = new Uint8Array(sab);
       // Load wasm_exec.js in worker scope
       eval(wasmExecJS);
       // Decompress WASM

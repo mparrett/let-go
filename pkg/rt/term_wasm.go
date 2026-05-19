@@ -15,12 +15,30 @@ import (
 	"github.com/nooga/let-go/pkg/vm"
 )
 
-// SharedArrayBuffer layout (Int32Array indices):
-//   [0] key ready flag (Atomics.wait/notify target)
-//   [1] key byte count
-//   [6] terminal cols
-//   [7] terminal rows
-// Uint8Array view at byte offset 8, length 16: raw key bytes
+// SharedArrayBuffer protocol — SPSC ring buffer between main thread (producer)
+// and worker (consumer). Layout MUST stay in sync with wasm.go's sendKey;
+// constants below mirror the JS side. The main thread writes to slot
+// [writeIdx % CAPACITY] then advances writeIdx; the worker waits on writeIdx,
+// reads slot [readIdx % CAPACITY], then advances readIdx. Producer never
+// blocks the main thread; if the buffer is full, the producer drops.
+//
+// Int32Array view (used cells):
+//   [0]  readIdx       — consumer increments after reading a slot
+//   [1]  writeIdx      — producer increments after writing a slot
+//   [6]  terminal cols — xterm.onResize writes
+//   [7]  terminal rows — xterm.onResize writes
+//
+// Uint8Array view (slot region):
+//   bytes 64..71   slot lengths (1 byte per slot)
+//   bytes 72..199  slot keys    (16 bytes per slot, 8 slots)
+const (
+	keyCapacity  = 8  // ring slots
+	keyMaxLen    = 16 // bytes per key
+	keyLenOffset = 64 // byte offset of lengths region
+	keyOffset    = 72 // byte offset of keys region
+	readIdxCell  = 0  // Int32 index of read pointer
+	writeIdxCell = 1  // Int32 index of write pointer
+)
 
 func installTermNS() {
 	// Set *in-wasm* so user code can detect WASM environment
@@ -41,7 +59,9 @@ func installTermNS() {
 	})
 	ns.Def("restore-mode!", restoreMode)
 
-	// read-key — blocks via Atomics.wait on SharedArrayBuffer
+	// read-key — consume the next key from the ring buffer; block via
+	// Atomics.wait on writeIdx if buffer is empty. See protocol comment
+	// at the top of this file.
 	readKey, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		atomics := js.Global().Get("Atomics")
 		keyInt32 := js.Global().Get("_lgKeyInt32")
@@ -54,24 +74,35 @@ func installTermNS() {
 		// Flush output before blocking
 		js.Global().Call("_lgFlush")
 
-		// Block until a key is ready
-		atomics.Call("wait", keyInt32, 0, 0)
+		// Block while buffer is empty (writeIdx == readIdx). Atomics.wait
+		// returns "ok" / "timed-out" / "not-equal"; in all three cases we
+		// re-check the predicate, so spurious wakes just loop and re-wait.
+		r := atomics.Call("load", keyInt32, readIdxCell).Int()
+		for {
+			w := atomics.Call("load", keyInt32, writeIdxCell).Int()
+			if w != r {
+				break
+			}
+			// Pass observed `w` as the expected value: if the producer
+			// already advanced before we hit wait, this returns immediately
+			// with "not-equal" and we loop to re-read.
+			atomics.Call("wait", keyInt32, writeIdxCell, w)
+		}
 
-		// Read key length and bytes
-		keyLen := atomics.Call("load", keyInt32, 1).Int()
-		if keyLen <= 0 || keyLen > 16 {
-			atomics.Call("store", keyInt32, 0, 0)
+		slot := r % keyCapacity
+		keyLen := int(byte(keyUint8.Index(keyLenOffset + slot).Int()))
+		// Advance readIdx unconditionally — even on a corrupt slot we
+		// don't want to re-read it forever.
+		atomics.Call("store", keyInt32, readIdxCell, r+1)
+
+		if keyLen <= 0 || keyLen > keyMaxLen {
 			return vm.NIL, nil
 		}
-
 		keyBytes := make([]byte, keyLen)
+		keyBase := keyOffset + slot*keyMaxLen
 		for i := 0; i < keyLen; i++ {
-			keyBytes[i] = byte(keyUint8.Index(i).Int())
+			keyBytes[i] = byte(keyUint8.Index(keyBase + i).Int())
 		}
-
-		// Reset flag for next key
-		atomics.Call("store", keyInt32, 0, 0)
-
 		return vm.String(keyBytes), nil
 	})
 	ns.Def("read-key", readKey)
