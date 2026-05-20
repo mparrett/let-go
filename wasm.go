@@ -246,6 +246,9 @@ function startWorkerMode() {
   //   [1]  writeIdx      — producer increments after writing a slot
   //   [6]  terminal cols — xterm.onResize writes
   //   [7]  terminal rows — xterm.onResize writes
+  //   [50..57]  slot inject timestamps — producer writes Date.now() &
+  //             0x7FFFFFFF before publishing writeIdx so the consumer
+  //             can compute input-pipeline lag.
   // Uint8Array view (slot region):
   //   bytes 64..71   slot lengths (1 byte per slot)
   //   bytes 72..199  slot keys    (16 bytes per slot, 8 slots)
@@ -253,6 +256,7 @@ function startWorkerMode() {
   const MAX_KEY_LEN = 16;
   const LEN_OFFSET = 64;
   const KEY_OFFSET = 72;
+  const TS_BASE = 50;
   const READ_IDX = 0;
   const WRITE_IDX = 1;
 
@@ -287,6 +291,10 @@ function startWorkerMode() {
     const slot = w %% CAPACITY;
     keyUint8[LEN_OFFSET + slot] = bytes.length;
     keyUint8.set(bytes, KEY_OFFSET + slot * MAX_KEY_LEN);
+    // Write inject timestamp before publishing writeIdx. Low 31 bits
+    // of Date.now() — same modulo the Go consumer uses; deltas of
+    // hundreds of ms can't wrap meaningfully.
+    Atomics.store(keyInt32, TS_BASE + slot, Date.now() & 0x7FFFFFFF);
     Atomics.store(keyInt32, WRITE_IDX, w + 1);    // publish
     Atomics.notify(keyInt32, WRITE_IDX, 1);       // wake one waiter
     return true;

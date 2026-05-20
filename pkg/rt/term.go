@@ -125,6 +125,14 @@ func installTermNS() {
 	})
 	ns.Def("read-key", readKey)
 
+	// last-input-lag-ms — no-op on native (no async input pipeline to
+	// measure). Defined here so the WASM-side primitive is safe to call
+	// from cross-platform user code without an (if *in-wasm* ...) guard.
+	inputLagFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.MakeInt(0), nil
+	})
+	ns.Def("last-input-lag-ms", inputLagFn)
+
 	// size — returns [cols rows] or nil if not a TTY
 	//   (term/size)         → stdout winsize
 	//   (term/size handle)  → arbitrary fd winsize

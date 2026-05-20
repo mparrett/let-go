@@ -10,6 +10,7 @@ package rt
 import (
 	"fmt"
 	"syscall/js"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -31,14 +32,26 @@ import (
 // Uint8Array view (slot region):
 //   bytes 64..71   slot lengths (1 byte per slot)
 //   bytes 72..199  slot keys    (16 bytes per slot, 8 slots)
+//
+// Per-slot timestamp region (Int32):
+//   indices [50..57]   bytes 200..231 — producer writes Date.now() &
+//                      0x7FFFFFFF before publishing writeIdx; consumer
+//                      reads it after reading the slot to compute
+//                      input-pipeline lag (JS-call → Go-receive).
 const (
 	keyCapacity  = 8  // ring slots
 	keyMaxLen    = 16 // bytes per key
 	keyLenOffset = 64 // byte offset of lengths region
 	keyOffset    = 72 // byte offset of keys region
+	keyTsBase    = 50 // Int32 index of slot timestamp region (byte 200)
 	readIdxCell  = 0  // Int32 index of read pointer
 	writeIdxCell = 1  // Int32 index of write pointer
 )
+
+// lastInputLagMs holds the most recent (now - inject-ts) measurement
+// from readKey, in ms. Single-threaded WASM Go runtime — no atomicity
+// needed. Exposed to user code via (term/last-input-lag-ms).
+var lastInputLagMs int32
 
 func installTermNS() {
 	// Set *in-wasm* so user code can detect WASM environment
@@ -91,6 +104,15 @@ func installTermNS() {
 
 		slot := r % keyCapacity
 		keyLen := int(byte(keyUint8.Index(keyLenOffset + slot).Int()))
+
+		// Compute input-pipeline lag: time between JS sendKey writing
+		// this slot and now. Both sides use Date.now()/UnixMilli low
+		// 31 bits; signed-int delta handles ordering, modular if it
+		// wraps (~25 days, never).
+		storedTs := int32(atomics.Call("load", keyInt32, keyTsBase+slot).Int())
+		nowMs := int32(time.Now().UnixMilli() & 0x7FFFFFFF)
+		lastInputLagMs = nowMs - storedTs
+
 		// Advance readIdx unconditionally — even on a corrupt slot we
 		// don't want to re-read it forever.
 		atomics.Call("store", keyInt32, readIdxCell, r+1)
@@ -106,6 +128,15 @@ func installTermNS() {
 		return vm.String(keyBytes), nil
 	})
 	ns.Def("read-key", readKey)
+
+	// last-input-lag-ms — returns the most recent input-pipeline lag
+	// (ms between JS _lgKey call and Go read-key returning that key).
+	// Updated only when a real key is consumed; stale-but-cheap across
+	// auto-action turns where read-key isn't called.
+	inputLagFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.MakeInt(int(lastInputLagMs)), nil
+	})
+	ns.Def("last-input-lag-ms", inputLagFn)
 
 	// size — read from SharedArrayBuffer
 	sizeFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
