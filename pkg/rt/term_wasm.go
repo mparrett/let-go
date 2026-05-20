@@ -138,6 +138,26 @@ func installTermNS() {
 	})
 	ns.Def("last-input-lag-ms", inputLagFn)
 
+	// key-pending? — true if the ring buffer has at least one key
+	// waiting to be consumed. Non-blocking peek; doesn't advance readIdx.
+	// Used by the title screen and other animation loops to break out
+	// early on user input without committing to a read-key (which would
+	// block if the user hasn't actually pressed anything yet).
+	keyPendingFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		keyInt32 := js.Global().Get("_lgKeyInt32")
+		if keyInt32.IsUndefined() {
+			return vm.FALSE, nil
+		}
+		atomics := js.Global().Get("Atomics")
+		r := atomics.Call("load", keyInt32, readIdxCell).Int()
+		w := atomics.Call("load", keyInt32, writeIdxCell).Int()
+		if w > r {
+			return vm.TRUE, nil
+		}
+		return vm.FALSE, nil
+	})
+	ns.Def("key-pending?", keyPendingFn)
+
 	// size — read from SharedArrayBuffer
 	sizeFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		keyInt32 := js.Global().Get("_lgKeyInt32")

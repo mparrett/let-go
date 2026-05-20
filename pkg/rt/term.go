@@ -133,6 +133,16 @@ func installTermNS() {
 	})
 	ns.Def("last-input-lag-ms", inputLagFn)
 
+	// key-pending? — native: always false. Mirrors the WASM-side
+	// primitive so cross-platform animation loops can poll for early
+	// exit without a runtime branch. Native callers that want to peek
+	// at stdin without blocking should use a different mechanism
+	// (select/non-blocking read) — outside the scope of this primitive.
+	keyPendingFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.FALSE, nil
+	})
+	ns.Def("key-pending?", keyPendingFn)
+
 	// size — returns [cols rows] or nil if not a TTY
 	//   (term/size)         → stdout winsize
 	//   (term/size handle)  → arbitrary fd winsize
