@@ -108,23 +108,76 @@ func installTermNS() {
 		// Compute input-pipeline lag: time between JS sendKey writing
 		// this slot and now. Both sides use Date.now()/UnixMilli low
 		// 31 bits; signed-int delta handles ordering, modular if it
-		// wraps (~25 days, never).
-		storedTs := int32(atomics.Call("load", keyInt32, keyTsBase+slot).Int())
+		// wraps (~25 days, never). lastInputLagMs may be updated again
+		// below if we coalesce adjacent identical slots — we want the
+		// reported lag to reflect the freshest press the player made,
+		// not the oldest one in the run.
 		nowMs := int32(time.Now().UnixMilli() & 0x7FFFFFFF)
+		storedTs := int32(atomics.Call("load", keyInt32, keyTsBase+slot).Int())
 		lastInputLagMs = nowMs - storedTs
 
-		// Advance readIdx unconditionally — even on a corrupt slot we
-		// don't want to re-read it forever.
-		atomics.Call("store", keyInt32, readIdxCell, r+1)
-
 		if keyLen <= 0 || keyLen > keyMaxLen {
+			// Corrupt slot — advance past it and bail without coalescing.
+			atomics.Call("store", keyInt32, readIdxCell, r+1)
 			return vm.NIL, nil
 		}
+
+		// Read the consumed slot's bytes BEFORE advancing readIdx so the
+		// producer can't overwrite slot[r % CAP] mid-read on a full buffer.
+		// (The pre-Tier-1 code advanced first and read second, which was
+		// a theoretical race — fixed as a side effect of this refactor.)
 		keyBytes := make([]byte, keyLen)
 		keyBase := keyOffset + slot*keyMaxLen
 		for i := 0; i < keyLen; i++ {
 			keyBytes[i] = byte(keyUint8.Index(keyBase + i).Int())
 		}
+
+		// Tier 1: lazy consumer-side coalesce. After consuming slot r,
+		// peek slot r+1 — if its bytes match, advance past it too. Loop
+		// until the next slot differs in length, differs in bytes, or
+		// the queue is empty. This collapses OS auto-repeat and held-
+		// touch bursts (where N identical keys queued because the engine
+		// couldn't keep up) into a single return value. Distinct intents
+		// stay intact because legitimate human tap rates (5-10Hz) are
+		// slower than engine processing (~20Hz on busy state), so
+		// non-repeat sequences never queue more than depth 1.
+		//
+		// On each coalesce, update lastInputLagMs to the consumed slot's
+		// timestamp — by the end of the loop the reported lag reflects
+		// the most recently injected matching press, which is what a
+		// player thinking 'I'm holding right' would expect to see.
+		finalR := r
+		for {
+			nextR := finalR + 1
+			w := atomics.Call("load", keyInt32, writeIdxCell).Int()
+			if nextR >= w {
+				break
+			}
+			nextSlot := nextR % keyCapacity
+			nextLen := int(byte(keyUint8.Index(keyLenOffset + nextSlot).Int()))
+			if nextLen != keyLen {
+				break
+			}
+			matches := true
+			nextBase := keyOffset + nextSlot*keyMaxLen
+			for i := 0; i < keyLen; i++ {
+				if byte(keyUint8.Index(nextBase + i).Int()) != keyBytes[i] {
+					matches = false
+					break
+				}
+			}
+			if !matches {
+				break
+			}
+			nextTs := int32(atomics.Call("load", keyInt32, keyTsBase+nextSlot).Int())
+			lastInputLagMs = nowMs - nextTs
+			finalR = nextR
+		}
+
+		// Single store advances readIdx past the consumed slot plus all
+		// coalesced ones — atomically published to the producer.
+		atomics.Call("store", keyInt32, readIdxCell, finalR+1)
+
 		return vm.String(keyBytes), nil
 	})
 	ns.Def("read-key", readKey)
