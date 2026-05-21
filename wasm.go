@@ -137,18 +137,27 @@ const wasmHTMLTemplate = `<!doctype html>
 if (crossOriginIsolated && 'serviceWorker' in navigator) {
   navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(()=>{});
 }
-// No isolation? Register the SW shim — but rate-limit retries. A failed
-// activation (Safari rejects credentialless, registration races, etc.)
-// must not infinite-reload, but a single transient miss shouldn't pin
-// the tab in an error state for the rest of the session either. So:
-// timestamp the last attempt and only retry if it's been >30s, which
-// blocks loops (sub-second cadence) while letting the user recover by
-// reloading 30 seconds later. Previously this was a one-shot boolean
-// which made transient failures sticky until the tab was closed.
+// No isolation? Register the SW shim — but rate-limit retries and
+// wait for the SW to be activated+controlling before reloading.
+//
+// Rate limit: timestamp the last attempt and only retry if >30s have
+// passed. Blocks infinite loops (sub-second cadence) while letting a
+// user recover by reloading 30+ seconds later. Previously a one-shot
+// boolean which made transient failures sticky until tab close.
+//
+// Wait for .ready: navigator.serviceWorker.register() resolves the
+// moment the SW is registered, not when it's controlling the page.
+// Reloading immediately after register often lands on a request the
+// SW hasn't yet intercepted, leaving the page un-isolated again.
+// navigator.serviceWorker.ready resolves only after the SW is
+// activated and ready to control. Chained, this eliminates the race.
 if (!crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigator
     && Date.now() - (parseInt(sessionStorage.getItem('_lgCoiTriedAt')) || 0) > 30000) {
   sessionStorage.setItem('_lgCoiTriedAt', String(Date.now()));
-  navigator.serviceWorker.register('coi-serviceworker.js').then(() => location.reload()).catch(()=>{});
+  navigator.serviceWorker.register('coi-serviceworker.js')
+    .then(() => navigator.serviceWorker.ready)
+    .then(() => location.reload())
+    .catch(()=>{});
 }
 
 // --- Inline wasm_exec.js and WASM data ---
