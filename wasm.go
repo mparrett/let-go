@@ -137,12 +137,17 @@ const wasmHTMLTemplate = `<!doctype html>
 if (crossOriginIsolated && 'serviceWorker' in navigator) {
   navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(()=>{});
 }
-// No isolation? Register the SW shim — but only once per tab. Without a
-// loop guard, a SW that fails to provide isolation (Safari rejects
-// credentialless, or activation races a tab close) reloads forever.
+// No isolation? Register the SW shim — but rate-limit retries. A failed
+// activation (Safari rejects credentialless, registration races, etc.)
+// must not infinite-reload, but a single transient miss shouldn't pin
+// the tab in an error state for the rest of the session either. So:
+// timestamp the last attempt and only retry if it's been >30s, which
+// blocks loops (sub-second cadence) while letting the user recover by
+// reloading 30 seconds later. Previously this was a one-shot boolean
+// which made transient failures sticky until the tab was closed.
 if (!crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigator
-    && !sessionStorage.getItem('_lgCoiTried')) {
-  sessionStorage.setItem('_lgCoiTried', '1');
+    && Date.now() - (parseInt(sessionStorage.getItem('_lgCoiTriedAt')) || 0) > 30000) {
+  sessionStorage.setItem('_lgCoiTriedAt', String(Date.now()));
   navigator.serviceWorker.register('coi-serviceworker.js').then(() => location.reload()).catch(()=>{});
 }
 
