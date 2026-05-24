@@ -117,14 +117,25 @@ func buildWasm(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ou
 	}
 
 	// 6. Build WASM binary to temp dir
-	fmt.Println("building wasm...")
+	useTinyGo := os.Getenv("LETGO_USE_TINYGO") == "1"
 	wasmPath := filepath.Join(tmpDir, "app.wasm")
-	build := exec.Command("go", "build", "-o", wasmPath, ".")
-	build.Dir = tmpDir
-	build.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	var build *exec.Cmd
+	if useTinyGo {
+		fmt.Println("building wasm with tinygo...")
+		build = exec.Command("tinygo", "build",
+			"-target=wasm", "-no-debug", "-opt=z", "-panic=trap",
+			"-o", wasmPath, ".")
+		build.Dir = tmpDir
+		build.Env = os.Environ()
+	} else {
+		fmt.Println("building wasm...")
+		build = exec.Command("go", "build", "-o", wasmPath, ".")
+		build.Dir = tmpDir
+		build.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	}
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
-		return fmt.Errorf("go build wasm: %w", err)
+		return fmt.Errorf("wasm build: %w", err)
 	}
 
 	// 7. Read the WASM binary. Inline mode gzip+base64s it into the page;
@@ -241,6 +252,19 @@ func mustGetwd() string {
 }
 
 func readWasmExecJS() ([]byte, error) {
+	if os.Getenv("LETGO_USE_TINYGO") == "1" {
+		out, err := exec.Command("tinygo", "env", "TINYGOROOT").Output()
+		if err != nil {
+			return nil, fmt.Errorf("cannot find TINYGOROOT: %w", err)
+		}
+		root := strings.TrimSpace(string(out))
+		src := filepath.Join(root, "targets", "wasm_exec.js")
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return nil, fmt.Errorf("tinygo wasm_exec.js not found at %s: %w", src, err)
+		}
+		return data, nil
+	}
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
 		out, err := exec.Command("go", "env", "GOROOT").Output()
