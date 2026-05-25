@@ -8,7 +8,6 @@ package rt
 import (
 	"fmt"
 	"math"
-	"math/rand"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
@@ -431,7 +430,7 @@ func installMathNS() {
 		if len(vs) != 0 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		return vm.Float(rand.Float64()), nil
+		return vm.Float(rng.Float64()), nil
 	})
 	ns.Def("random", randomf)
 

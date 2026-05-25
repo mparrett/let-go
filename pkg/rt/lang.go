@@ -24,6 +24,13 @@ import (
 
 var nsRegistry map[string]*vm.Namespace
 
+// rng backs the rand / rand-int / rand-nth / shuffle primitives. We don't
+// use math/rand's package-level functions because the global Source in Go
+// 1.20+ is auto-seeded with ChaCha8 and rand.Seed is a no-op against it,
+// which breaks set-rand-seed's reproducibility contract. A local *rand.Rand
+// honors Seed because we hold its Source.
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 var (
 	tapsMu sync.Mutex
 	taps   []vm.Fn
@@ -3493,14 +3500,14 @@ func installLangNS() {
 	// or between 0 and n
 	randf, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) == 0 {
-			return vm.Float(rand.Float64()), nil
+			return vm.Float(rng.Float64()), nil
 		}
 		if len(vs) == 1 {
 			if n, ok := vs[0].(vm.Int); ok {
-				return vm.Float(rand.Float64() * float64(n)), nil
+				return vm.Float(rng.Float64() * float64(n)), nil
 			}
 			if n, ok := vs[0].(vm.Float); ok {
-				return vm.Float(rand.Float64() * float64(n)), nil
+				return vm.Float(rng.Float64() * float64(n)), nil
 			}
 			return vm.NIL, fmt.Errorf("rand expected number")
 		}
@@ -3519,7 +3526,23 @@ func installLangNS() {
 		if int(n) <= 0 {
 			return vm.MakeInt(0), nil
 		}
-		return vm.MakeInt(rand.Intn(int(n))), nil
+		return vm.MakeInt(rng.Intn(int(n))), nil
+	})
+
+	// set-rand-seed: seed the global rand source for reproducible test/bench
+	// runs. Returns nil. Default process startup auto-seeds non-deterministically;
+	// call this once before any rand-int/rand-nth/shuffle to force a specific
+	// sequence.
+	setRandSeed, err := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		n, ok := vs[0].(vm.Int)
+		if !ok {
+			return vm.NIL, fmt.Errorf("set-rand-seed expected Int")
+		}
+		rng = rand.New(rand.NewSource(int64(n)))
+		return vm.NIL, nil
 	})
 
 	// random-uuid: generate a random UUID v4
@@ -3552,7 +3575,7 @@ func installLangNS() {
 		if n == 0 {
 			return vm.NIL, fmt.Errorf("rand-nth called on empty collection")
 		}
-		idx := rand.Intn(n)
+		idx := rng.Intn(n)
 		if l, ok := vs[0].(vm.Lookup); ok {
 			return l.ValueAt(vm.Int(idx)), nil
 		}
@@ -3589,7 +3612,7 @@ func installLangNS() {
 			s = s.Next()
 		}
 		// Fisher-Yates shuffle
-		rand.Shuffle(len(vals), func(i, j int) {
+		rng.Shuffle(len(vals), func(i, j int) {
 			vals[i], vals[j] = vals[j], vals[i]
 		})
 		return vm.NewArrayVector(vals), nil
@@ -5322,6 +5345,7 @@ func installLangNS() {
 	ns.Def("random-uuid", randomUUID)
 	ns.Def("rand-int", randInt)
 	ns.Def("rand-nth", randNth)
+	ns.Def("set-rand-seed", setRandSeed)
 	ns.Def("shuffle", shuffle)
 	ns.Def("transient", transientf)
 	ns.Def("persistent!", persistentf)
