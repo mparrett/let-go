@@ -54,3 +54,31 @@
       (is (= m (meta (empty (with-meta [1] m)))))
       (is (= m (meta (empty (with-meta #{1} m)))))
       (is (= m (meta (empty (with-meta '(1) m))))))))
+
+(def ^:dynamic meta-doc-def "def doc" 1)
+(defn meta-doc-fn "defn doc" {:added "1.0"} [x] x)
+(defn- meta-private-doc-fn "private defn doc" [] :ok)
+(defmacro meta-doc-macro "defmacro doc" {:added "3.0"} [x] x)
+(defmulti meta-doc-multi "defmulti doc" {:added "2.0"} type)
+(defprotocol MetaDocProtocol "protocol doc"
+  (meta-doc-op [this] "method doc"))
+
+(deftest var-meta-on-def-forms
+  (testing "def attaches doc and reader metadata to the var"
+    (is (= "def doc" (:doc (meta (var meta-doc-def)))))
+    (is (= true (:dynamic (meta (var meta-doc-def))))))
+  (testing "defn attaches doc and attr-map metadata to the var"
+    (is (= "defn doc" (:doc (meta (var meta-doc-fn)))))
+    (is (= "1.0" (:added (meta (var meta-doc-fn))))))
+  (testing "defn- keeps private metadata while adding doc metadata"
+    (is (= "private defn doc" (:doc (meta (var meta-private-doc-fn)))))
+    (is (= true (:private (meta (var meta-private-doc-fn))))))
+  (testing "defmacro attaches doc and attr-map metadata to the var"
+    (is (= "defmacro doc" (:doc (meta (var meta-doc-macro)))))
+    (is (= "3.0" (:added (meta (var meta-doc-macro))))))
+  (testing "defmulti attaches doc and attr-map metadata to the var"
+    (is (= "defmulti doc" (:doc (meta (var meta-doc-multi)))))
+    (is (= "2.0" (:added (meta (var meta-doc-multi))))))
+  (testing "defprotocol attaches protocol and method doc metadata"
+    (is (= "protocol doc" (:doc (meta (var MetaDocProtocol)))))
+    (is (= "method doc" (:doc (meta (var meta-doc-op)))))))

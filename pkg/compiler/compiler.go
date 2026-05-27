@@ -1562,6 +1562,32 @@ func doCompiler(c *Context, form vm.Value) error {
 	return nil
 }
 
+func assocMeta(meta vm.Value, key vm.Value, val vm.Value) vm.Value {
+	if meta == nil || meta == vm.NIL {
+		return vm.NewPersistentMap([]vm.Value{key, val})
+	}
+	if m, ok := meta.(*vm.PersistentMap); ok {
+		return m.Assoc(key, val).(vm.Value)
+	}
+	if m, ok := meta.(vm.Map); ok {
+		return m.Assoc(key, val).(vm.Value)
+	}
+	return vm.NewPersistentMap([]vm.Value{key, val})
+}
+
+func metaValueAt(meta vm.Value, key vm.Value) vm.Value {
+	if meta == nil || meta == vm.NIL {
+		return vm.NIL
+	}
+	if m, ok := meta.(*vm.PersistentMap); ok {
+		return m.ValueAt(key)
+	}
+	if m, ok := meta.(vm.Map); ok {
+		return m.ValueAt(key)
+	}
+	return vm.NIL
+}
+
 func defCompiler(c *Context, form vm.Value) error {
 	tc := c.tailPosition
 	c.tailPosition = false
@@ -1570,10 +1596,10 @@ func defCompiler(c *Context, form vm.Value) error {
 	if l < 1 || l > 3 {
 		return NewCompileError(fmt.Sprintf("def: wrong number of forms (%d), need 1, 2 or 3", l))
 	}
-	// 3-arg form: (def name "docstring" value) — drop the docstring for now.
-	// TODO: when var metadata lands, attach as :doc on the var.
+	var doc vm.Value = vm.NIL
 	if l == 3 {
-		if _, ok := args[1].(vm.String); ok {
+		if docString, ok := args[1].(vm.String); ok {
+			doc = docString
 			args = []vm.Value{args[0], args[2]}
 			l = 2
 		} else {
@@ -1598,23 +1624,19 @@ func defCompiler(c *Context, form vm.Value) error {
 	if sym.Type() != vm.SymbolType {
 		return NewCompileError(fmt.Sprintf("def: first argument must be a symbol, got (%v)", sym))
 	}
+	if doc != vm.NIL {
+		meta = assocMeta(meta, vm.Keyword("doc"), doc)
+	}
 	c.defName = sym.String()
 	varr := c.CurrentNS().LookupOrAdd(sym.(vm.Symbol))
 	if meta != vm.NIL {
-		if m, ok := meta.(*vm.PersistentMap); ok {
-			if vm.IsTruthy(m.ValueAt(vm.Keyword("dynamic"))) {
-				varr.(*vm.Var).SetDynamic()
-			}
-			if vm.IsTruthy(m.ValueAt(vm.Keyword("private"))) {
-				varr.(*vm.Var).SetPrivate()
-			}
-		} else if m, ok := meta.(vm.Map); ok {
-			if m[vm.Keyword("dynamic")] == vm.TRUE {
-				varr.(*vm.Var).SetDynamic()
-			}
-			if m[vm.Keyword("private")] == vm.TRUE {
-				varr.(*vm.Var).SetPrivate()
-			}
+		v := varr.(*vm.Var)
+		v.SetMeta(meta)
+		if vm.IsTruthy(metaValueAt(meta, vm.Keyword("dynamic"))) {
+			v.SetDynamic()
+		}
+		if vm.IsTruthy(metaValueAt(meta, vm.Keyword("private"))) {
+			v.SetPrivate()
 		}
 	}
 	c.emitWithArg(vm.OP_LOAD_CONST, c.constant(varr))

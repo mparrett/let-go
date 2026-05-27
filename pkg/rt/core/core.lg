@@ -672,6 +672,32 @@
       `(loop* ~bs (let* ~nbs ~@body))
       `(loop* ~bindings ~@body))))
 
+(defn ^:private merge-def-meta [base extra]
+  (if (nil? extra)
+    base
+    (reduce-kv (fn [m k v] (assoc m k v))
+               (if (nil? base) {} base)
+               extra)))
+
+(defn ^:private def-meta-name [name doc attr]
+  (let [wrapped? (and (seq? name) (= 'with-meta (first name)))
+        sym      (if wrapped? (first (next name)) name)
+        base     (if wrapped? (first (next (next name))) nil)
+        meta     (merge-def-meta base attr)
+        meta     (if (string? doc)
+                   (assoc (if (nil? meta) {} meta) :doc doc)
+                   meta)]
+    (if (nil? meta)
+      name
+      (list 'with-meta sym meta))))
+
+(defmacro defn- [name & forms]
+  (let [doc   (if (string? (first forms)) (first forms) nil)
+        forms (if (string? (first forms)) (next forms) forms)
+        attr  (if (map? (first forms)) (first forms) nil)
+        forms (if (map? (first forms)) (next forms) forms)
+        attr  (assoc (if (nil? attr) {} attr) :private true)]
+    `(def ~(def-meta-name name doc attr) (fn ~@forms))))
 
 (defn ^:private fn-expand [bindings body]
   (let [amp-idx (loop [i 0 bs (seq bindings)]
@@ -747,7 +773,11 @@
 (def ^:dynamic *ir-compile* false)
 
 (defmacro defn [name & forms]
-  (let [forms     (if (string? (first forms)) (next forms) forms)
+  (let [doc        (if (string? (first forms)) (first forms) nil)
+        forms      (if (string? (first forms)) (next forms) forms)
+        attr       (if (map? (first forms)) (first forms) nil)
+        forms      (if (map? (first forms)) (next forms) forms)
+        def-name   (def-meta-name name doc attr)
         first-form (first forms)
         single?    (vector? first-form)
         args       (when single? first-form)
@@ -768,10 +798,23 @@
         (if single?
           ;; Single-arity: result is a lowered chunk
           (let [fn-val (chunk->fn arity variadic? result)]
-            (list 'def name fn-val))
+            (list 'def def-name fn-val))
           ;; Multi-arity: result is the raw *MultiArityFn value
-          (list 'def name result)))
-      `(def ~name (fn ~@forms)))))
+          (list 'def def-name result)))
+      `(def ~def-name (fn ~@forms)))))
+
+(defmacro defmacro [name & forms]
+  (let [doc   (if (string? (first forms)) (first forms) nil)
+        forms (if (string? (first forms)) (next forms) forms)
+        attr  (if (map? (first forms)) (first forms) nil)
+        forms (if (map? (first forms)) (next forms) forms)
+        args  (first forms)
+        body  (next forms)]
+    (list 'do
+          (cons 'defn (cons name (concat (if (string? doc) (list doc) nil)
+                                         (if (nil? attr) nil (list attr))
+                                         (cons args body))))
+          (list 'set-macro! (list 'var name)))))
 
 (defmacro while [test & body]
   `(loop* [] (when ~test ~@body (recur))))
@@ -1759,18 +1802,18 @@
 ;;   (method2 [this arg]))
 ;; Defines a protocol and creates vars for each method.
 (defmacro defprotocol [name & sigs]
-  (let [;; Optional leading docstring. Currently discarded — see defmulti
-        ;; comment; let-go doesn't yet thread :doc meta through def-forms.
+  (let [doc          (if (string? (first sigs)) (first sigs) nil)
         sigs         (if (string? (first sigs)) (next sigs) sigs)
         method-names (map first sigs)
         ;; Quote method names so they don't get resolved as vars
         quoted-names (map (fn [m] (list 'quote m)) method-names)
-        proto-def    (list 'def name
+        proto-def    (list 'def (def-meta-name name doc nil)
                            (cons 'defprotocol* (cons (str name) quoted-names)))
         ;; For each method, create a protocol-dispatching fn var
         method-defs  (map (fn [sig]
-                            (let [mname (first sig)]
-                              (list 'def mname
+                            (let [mname (first sig)
+                                  mdoc  (first (next (next sig)))]
+                              (list 'def (def-meta-name mname (if (string? mdoc) mdoc nil) nil)
                                     (list 'make-protocol-fn name (list 'quote mname)))))
                           sigs)
         ;; Also bind a class-name alias <munged-ns>.<name> so Clojure code
@@ -2103,12 +2146,12 @@
 ;; (defmulti name docstring? attr-map? dispatch-fn & options)
 ;;   where options ∈ {:default <val> :hierarchy <val>}
 ;;
-;; Docstring/attr-map are accepted but currently discarded — let-go does
-;; not yet thread :doc/etc. meta through any def-form (defn drops them
-;; too). :hierarchy is accepted for source compatibility but not wired
-;; into dispatch (defmulti* only honors :default).
+;; :hierarchy is accepted for source compatibility but not wired into
+;; dispatch (defmulti* only honors :default).
 (defmacro defmulti [name & args]
-  (let [args (if (string? (first args)) (next args) args)
+  (let [doc (if (string? (first args)) (first args) nil)
+        args (if (string? (first args)) (next args) args)
+        attr (if (map? (first args)) (first args) nil)
         args (if (map? (first args)) (next args) args)
         dispatch-fn (first args)
         opts-list (next args)
@@ -2118,7 +2161,7 @@
                         "Example: (defmulti name dispatch-fn :default dispatch-value)")))
         options (apply hash-map opts-list)
         default-val (get options :default :default)]
-    `(def ~name (defmulti* ~(str name) ~dispatch-fn ~default-val))))
+    `(def ~(def-meta-name name doc attr) (defmulti* ~(str name) ~dispatch-fn ~default-val))))
 
 ;; (defmethod name dispatch-val [args] body)
 (defmacro defmethod [name dispatch-val & fn-tail]

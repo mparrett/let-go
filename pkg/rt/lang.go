@@ -4406,7 +4406,7 @@ func installLangNS() {
 		if vs[0] == vm.NIL {
 			return vm.NIL, nil
 		}
-		m, ok := vs[0].(vm.IMeta)
+		m, ok := vs[0].(interface{ Meta() vm.Value })
 		if !ok {
 			return vm.NIL, nil
 		}
@@ -5066,15 +5066,18 @@ func installLangNS() {
 		if len(vs) < 2 {
 			return vm.NIL, fmt.Errorf("alter-meta! expects at least 2 args")
 		}
-		a, ok := vs[0].(*vm.Atom)
-		if !ok {
-			return vm.NIL, fmt.Errorf("alter-meta! expected Atom")
-		}
 		fn, ok := vs[1].(vm.Fn)
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-meta! expected Fn")
 		}
-		return a.AlterMeta(fn, vs[2:])
+		switch ref := vs[0].(type) {
+		case *vm.Atom:
+			return ref.AlterMeta(fn, vs[2:])
+		case *vm.Var:
+			return ref.AlterMeta(fn, vs[2:])
+		default:
+			return vm.NIL, fmt.Errorf("alter-meta! expected Atom or Var")
+		}
 	})
 
 	getValidator, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {

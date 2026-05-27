@@ -17,6 +17,7 @@ type Var struct {
 	nsref     *Namespace
 	ns        string
 	name      string
+	meta      Value
 	isMacro   bool
 	isDynamic bool
 	isPrivate bool
@@ -241,6 +242,37 @@ func (v *Var) IsDynamic() bool {
 
 func (v *Var) IsPrivate() bool {
 	return v.isPrivate
+}
+
+func (v *Var) Meta() Value {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.meta == nil {
+		return NIL
+	}
+	return v.meta
+}
+
+func (v *Var) SetMeta(meta Value) {
+	v.mu.Lock()
+	v.meta = meta
+	v.mu.Unlock()
+}
+
+func (v *Var) AlterMeta(fn Fn, args []Value) (Value, error) {
+	v.mu.Lock()
+	meta := v.meta
+	if meta == nil {
+		meta = NIL
+	}
+	v.mu.Unlock()
+
+	newMeta, err := fn.Invoke(append([]Value{meta}, args...))
+	if err != nil {
+		return NIL, err
+	}
+	v.SetMeta(newMeta)
+	return newMeta, nil
 }
 
 // NS returns the namespace name.
