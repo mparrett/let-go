@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# gogen-parity.sh — parity benchmark for the gogen_ir bootstrap.
+#
+# Runs end-to-end correctness + perf checks under both the untagged build
+# (bytecode-replayed Lisp IR stack) and `-tags gogen_ir` (native Go IR
+# stack from pkg/rt/core_go_lowered). Prints a side-by-side summary;
+# returns non-zero if any suite diverges.
+#
+# Three suites cover different reach:
+#   1. clojure-test-suite (jank)  → end-user-observable clojure.core semantics
+#   2. ir-stress lower-go         → AOT lowering of IR → Go correctness
+#   3. ir-stress ir-compile       → eval-mode IR compile → bytecode correctness
+#
+# Usage:
+#   scripts/gogen-parity.sh             # default: jank + lower-go (~3 min)
+#   scripts/gogen-parity.sh --quick     # jank only (~2 sec, smoke check)
+#   scripts/gogen-parity.sh --full      # all three suites (~5 min)
+#   scripts/gogen-parity.sh --jank-only # just the jank suite
+#
+# Exit codes:
+#   0  all suites parity-identical (counts + buckets)
+#   1  semantic divergence detected (counts or buckets differ)
+#   2  setup error (missing submodule, no go binary, etc.)
+#
+# The wall-time delta is reported but not enforced (single-run noise is
+# typically ±2%; treat as informational unless consistently >10%).
+
+set -euo pipefail
+
+MODE="${1:-default}"
+case "$MODE" in
+    --quick)     RUN_JANK=1; RUN_LOWERGO=0; RUN_IRCOMPILE=0 ;;
+    --jank-only) RUN_JANK=1; RUN_LOWERGO=0; RUN_IRCOMPILE=0 ;;
+    --full)      RUN_JANK=1; RUN_LOWERGO=1; RUN_IRCOMPILE=1 ;;
+    default)     RUN_JANK=1; RUN_LOWERGO=1; RUN_IRCOMPILE=0 ;;
+    -h|--help)
+        sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+        exit 0
+        ;;
+    *)
+        echo "unknown mode: $MODE (try --help)" >&2
+        exit 2
+        ;;
+esac
+
+# IR corpus used by ir-stress. Order matters (data.lg must load first).
+IR_CORPUS=(
+    data.lg build.lg lower.lg lower_go.lg dump.lg
+    dominance.lg validate.lg zipper.lg passes.lg
+)
+IR_DIR=pkg/rt/core/ir
+
+LOG_DIR="${TMPDIR:-/tmp}/gogen-parity-$$"
+mkdir -p "$LOG_DIR"
+trap 'rc=$?; [ $rc -eq 0 ] && rm -rf "$LOG_DIR" || echo "logs preserved at $LOG_DIR"' EXIT
+
+# Preflight ---------------------------------------------------------------
+
+command -v go >/dev/null 2>&1 || { echo "go binary not on PATH" >&2; exit 2; }
+
+if [ "$RUN_JANK" -eq 1 ]; then
+    if [ ! -d test/clojure-test-suite/test/clojure/core_test ]; then
+        echo "clojure-test-suite submodule not initialized in this worktree." >&2
+        echo "In a jj worktree the submodule data isn't auto-populated. Either:" >&2
+        echo "  git submodule update --init                      # in a git worktree" >&2
+        echo "  ln -s <other-worktree>/test/clojure-test-suite \\" >&2
+        echo "        test/clojure-test-suite                    # in a jj worktree" >&2
+        exit 2
+    fi
+fi
+
+# Helpers -----------------------------------------------------------------
+
+# Run a command, capture stdout+stderr to $1, append wall time to log. The
+# stdout of the function itself is the recorded wall time in seconds.
+time_run() {
+    local logfile="$1"; shift
+    local start end
+    start=$(date +%s.%N)
+    "$@" >"$logfile" 2>&1
+    end=$(date +%s.%N)
+    awk -v s="$start" -v e="$end" 'BEGIN{printf "%.2f\n", e-s}'
+}
+
+# Extract the TOTALS line from a jank-suite -v log.
+jank_totals() { grep -m1 -E "TOTALS: " "$1" | sed 's/.*TOTALS: //'; }
+
+# Extract the Passed/Failed line + bucket distribution from an ir-stress log.
+ir_summary()  { grep -E "^Total fixtures:|^Passed:|^Failed:" "$1"; }
+ir_buckets()  {
+    # Scrub process-specific noise (pointer addresses in printed fn/closure
+    # values) so the bucket hash captures semantic equivalence, not memory
+    # layout. Without this, an error string containing `<fn foo 0xabc123>`
+    # produces a different md5 every run for purely cosmetic reasons.
+    awk '/^=== Failure Buckets ===/{p=1; next} p && /^=== /{exit} p' "$1" |
+        sed -E 's/0x[0-9a-fA-F]{6,}/0xXXX/g'
+}
+
+# Suites ------------------------------------------------------------------
+
+run_jank() {
+    local tag_label="$1" tag_flag="$2"
+    local log="$LOG_DIR/jank-${tag_label}.log"
+    local wall
+    wall=$(time_run "$log" go test $tag_flag ./test/ -run '^TestClojureTestSuite$' -count=1 -v -timeout 120s)
+    printf "%-10s %-50s %ss\n" "$tag_label" "$(jank_totals "$log")" "$wall"
+    echo "$wall:$(jank_totals "$log")" >"$LOG_DIR/jank-${tag_label}.summary"
+}
+
+run_ir_stress() {
+    local mode="$1" tag_label="$2" tag_flag="$3"
+    local log="$LOG_DIR/${mode}-${tag_label}.log"
+    local wall
+    wall=$(time_run "$log" go run $tag_flag . scripts/ir-stress.lg "$mode" "$IR_DIR" "${IR_CORPUS[@]}")
+    local pass fail buckets
+    pass=$(grep -m1 "^Passed:" "$log" | awk '{print $2}')
+    fail=$(grep -m1 "^Failed:" "$log" | awk '{print $2}')
+    buckets=$(ir_buckets "$log" | md5sum | cut -c1-8)
+    printf "%-10s pass=%s fail=%s buckets=%s  %ss\n" "$tag_label" "$pass" "$fail" "$buckets" "$wall"
+    echo "$wall:$pass:$fail:$buckets" >"$LOG_DIR/${mode}-${tag_label}.summary"
+}
+
+compare_summaries() {
+    local label="$1" untagged_file="$2" tagged_file="$3"
+    local u t
+    u=$(cat "$untagged_file"); t=$(cat "$tagged_file")
+    # Strip leading wall time; compare the rest.
+    local u_body t_body
+    u_body=${u#*:}; t_body=${t#*:}
+    if [ "$u_body" = "$t_body" ]; then
+        echo "  $label: PARITY"
+        return 0
+    else
+        echo "  $label: DIVERGED"
+        echo "    untagged: $u"
+        echo "    gogen_ir: $t"
+        return 1
+    fi
+}
+
+# Run --------------------------------------------------------------------
+
+divergence=0
+
+if [ "$RUN_JANK" -eq 1 ]; then
+    echo "=== clojure-test-suite (jank) ==="
+    run_jank untagged ""
+    run_jank gogen_ir "-tags gogen_ir"
+    echo
+fi
+
+if [ "$RUN_LOWERGO" -eq 1 ]; then
+    echo "=== ir-stress lower-go (IR corpus: ${#IR_CORPUS[@]} files) ==="
+    run_ir_stress lower-go untagged ""
+    run_ir_stress lower-go gogen_ir "-tags gogen_ir"
+    echo
+fi
+
+if [ "$RUN_IRCOMPILE" -eq 1 ]; then
+    echo "=== ir-stress ir-compile (IR corpus: ${#IR_CORPUS[@]} files) ==="
+    run_ir_stress ir-compile untagged ""
+    run_ir_stress ir-compile gogen_ir "-tags gogen_ir"
+    echo
+fi
+
+echo "=== Parity check ==="
+check() {
+    local label="$1" untagged="$2" tagged="$3"
+    if ! compare_summaries "$label" "$untagged" "$tagged"; then
+        divergence=$((divergence+1))
+    fi
+}
+[ "$RUN_JANK"      -eq 1 ] && check jank       "$LOG_DIR/jank-untagged.summary"       "$LOG_DIR/jank-gogen_ir.summary"
+[ "$RUN_LOWERGO"   -eq 1 ] && check lower-go   "$LOG_DIR/lower-go-untagged.summary"   "$LOG_DIR/lower-go-gogen_ir.summary"
+[ "$RUN_IRCOMPILE" -eq 1 ] && check ir-compile "$LOG_DIR/ir-compile-untagged.summary" "$LOG_DIR/ir-compile-gogen_ir.summary"
+
+if [ "$divergence" -ne 0 ]; then
+    echo "FAIL: $divergence suite(s) diverged. Logs at $LOG_DIR." >&2
+    trap - EXIT
+    exit 1
+fi
+
+echo "OK: all suites parity-identical."

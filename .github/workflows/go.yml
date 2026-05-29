@@ -49,3 +49,29 @@ jobs:
 
       - name: Clojure compatibility test suite with source stdlib bootstrap
         run: go test -tags bootstrap ./test/ -count=1 -run TestClojureTestSuite -v
+
+  bundle-fresh:
+    name: bundle-fresh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Loud check — pkg/rt/core_compiled.lgb in lockstep with .lg sources
+        # Policy: docs/contribution-policy.md §3 (stale bundle is a hard gate).
+        # Fast (~1 s) — fails immediately when any pkg/rt/core/**/*.lg is
+        # newer than the committed bundle.
+        run: make check-bundle-fresh
+
+      - name: Loud check — pkg/rt/core_go_lowered/ in lockstep with .lg sources
+        # Policy: docs/contribution-policy.md §3 — sibling gate for the
+        # -tags gogen_ir build path. parity-full's bucket hashes
+        # silently diverge if the lgb is fresh but the lowered Go isn't.
+        run: make check-lowered-fresh
+
+  # Bootstrap-parity gate (deferred — runs as 'make parity-full' locally).
+  #
+  # Wiring 'make parity-full' as a CI job requires 'lgbgen --target=go' to
+  # produce pkg/rt/core_go_lowered/ cleanly from current main. That gen
+  # path errors today on a reader EOF — fixes land in a follow-up. Until
+  # then, parity-full is a local-only target; the staleness gates
+  # (check-bundle-fresh, check-lowered-fresh) protect the artifacts
+  # parity-full depends on.
