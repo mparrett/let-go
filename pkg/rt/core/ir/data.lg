@@ -51,6 +51,31 @@
 ;; below so existing callers keep working with the bare `ir/op` etc.
 (ns ir.data)
 
+;; --- file ordering invariant -----------------------------------------
+;;
+;; let-go's compiler resolves names top-to-bottom within a file. Each
+;; defn must come AFTER its callees. Sections are arranged in
+;; dependency order; when you add a defn, put it in the section it
+;; belongs to, not the one your editor's cursor happens to be in.
+;;
+;;   1. construction primitives    (new-fn, new-branch-target, …)
+;;   2. read accessors             (fn-name, op, refs, blocks, …)
+;;   3. bitset shim                (bs-empty, bs-add, bs-remove, …)
+;;   4. uses cache invalidation    (invalidate-uses-state!, invalidate-uses!)
+;;   5. construction-time mutators (add-block, add-inst, …)
+;;   6. pass-time mutators         (replace-op!, set-refs!, remove-inst!,
+;;                                  clone-inst, …)
+;;   7. uses cache build           (accumulate-uses-*!, compute-uses, uses,
+;;                                  uses-empty?, uses-for-each, uses-contains?)
+;;   8. consults-uses mutators     (replace-all-uses! — needs both the cache
+;;                                  reader AND the bitset shim)
+;;   9. export into `ir`           (interns into the live ir namespace)
+;;
+;; Section 6 mutators must call into invalidate from section 4 OR patch
+;; the cache directly (which requires section 3); Section 8 needs
+;; the read API from section 7. If a future toposort tool ever lands,
+;; it should re-emit the file in this order.
+
 ;; --- construction ----------------------------------------------------
 
 (defn new-fn [name arity variadic?]
@@ -111,10 +136,97 @@
 (defn block-insts  [bid f] (:insts  (nth (:blocks @f) bid)))
 (defn block-term   [bid f] (:term   (nth (:blocks @f) bid)))
 
+(defn fn-load-arg [f i]
+  "Find the :load-arg inst-id for argument index i in the function's
+   entry block. Returns nil if no such inst exists (variadic rest, etc.)."
+  (let [entry-bid (entry-block f)
+        insts     (block-insts entry-bid f)]
+    (loop [remaining insts]
+      (cond
+        (empty? remaining) nil
+        (let [nid (first remaining)]
+          (and (= :load-arg (op nid f))
+               (= i (aux nid f))))
+          (first remaining)
+        :else (recur (rest remaining))))))
+
+(defn fn-load-arg-type [f i]
+  "Type-of the load-arg inst for argument index i, or :unknown when no
+   load-arg exists for that index. Used by lower-go's params-for to
+   pick native types when a backward-inference pass has narrowed them."
+  (let [nid (fn-load-arg f i)]
+    (if nid (type-of nid f) :unknown)))
+
 (defn branch-target-target [bt] (:target bt))
 (defn branch-target-args   [bt] (:args bt))
 (defn cond-target-true     [ct] (:true-target ct))
 (defn cond-target-false    [ct] (:false-target ct))
+
+;; --- bitset shim (Phase B) ------------------------------------------
+;;
+;; A bitset is a vector of int64 words. Bit k (0-indexed) lives in
+;; word (k >> 6), at bit position (k & 63). Used as the set-of-users
+;; representation in the uses cache: uses[def-id] is a bitset whose
+;; bits are the user-ids referencing def-id.
+;;
+;; Rationale: most defs have 0-2 users, but a few popular defs (loop
+;; vars, common consts) can have many. Persistent-vec-per-set burned
+;; allocation on both extremes; word-packing collapses the small-set
+;; case (one int64 covers 64 inst-ids) and the large-set case
+;; (linear in word count, cache-friendly).
+;;
+;; The bit-shift-left of 1 to position 63 wraps to the sign bit of
+;; int64 in let-go; that's fine — bitwise ops don't care about sign.
+
+(defn- bs-word-count [n]
+  (bit-shift-right (+ n 63) 6))
+
+(defn- bs-empty [n-bits]
+  (vec (repeat (bs-word-count n-bits) 0)))
+
+(defn- bs-add [bs i]
+  (let [wi (bit-shift-right i 6)
+        bm (bit-shift-left 1 (bit-and i 63))]
+    (assoc bs wi (bit-or (nth bs wi) bm))))
+
+(defn- bs-add! [bs i]
+  (let [wi (bit-shift-right i 6)
+        bm (bit-shift-left 1 (bit-and i 63))]
+    (assoc! bs wi (bit-or (nth bs wi) bm))))
+
+(defn- bs-remove [bs i]
+  (let [wi (bit-shift-right i 6)
+        bm (bit-shift-left 1 (bit-and i 63))]
+    (assoc bs wi (bit-and (nth bs wi) (bit-not bm)))))
+
+(defn- bs-contains? [bs i]
+  (let [wi (bit-shift-right i 6)
+        bm (bit-shift-left 1 (bit-and i 63))]
+    (not= 0 (bit-and (nth bs wi) bm))))
+
+(defn- bs-empty? [bs]
+  (every? zero? bs))
+
+(defn- bs-union [bs1 bs2]
+  ;; Pairwise bit-or. Both inputs assumed same word count.
+  (vec (map bit-or bs1 bs2)))
+
+;; Iterate set bits and call (f bit-index). Word-at-a-time scan
+;; using low-bit isolation: lowest set bit is (bit-and w (- w)).
+(defn- bs-for-each [bs f]
+  (loop [wi 0]
+    (when (< wi (count bs))
+      (loop [w (nth bs wi)]
+        (when (not= w 0)
+          (let [lo  (bit-and w (- w))
+                ;; bit position of lo within the word: trailing zeros.
+                ;; let-go has no native ctz, so use a small loop.
+                ;; (Most words have 0-2 bits, so this is short.)
+                pos (loop [p 0 v lo]
+                      (if (= 1 (bit-and v 1)) p (recur (inc p) (bit-shift-right v 1))))]
+            (f (+ (bit-shift-left wi 6) pos))
+            (recur (bit-xor w lo)))))
+      (recur (inc wi)))))
 
 ;; --- uses cache management -------------------------------------------
 
@@ -200,11 +312,35 @@
 (defn remove-inst! [f bid nid]
   "Drop nid from block bid's :insts vector. Marks the Inst's op
    as :invalid so any stale iterator skips it. Caller must not use
-   nid afterwards."
-  (swap! f update-in [:blocks bid :insts]
-         (fn [insts] (vec (remove (fn [x] (= x nid)) insts))))
-  (swap! f assoc-in [:insts nid 0] :invalid)
-  (invalidate-uses-state! f))
+   nid afterwards.
+
+   Phase 1: if the uses cache is live (not dirty), incrementally
+   clear bit nid from uses[r] for each r in this inst's refs and
+   branch-target args. Avoids the O(N) recompute on the next read."
+  (let [inst (nth (:insts @f) nid)
+        refs (nth inst 1)
+        op   (nth inst 0)
+        aux  (nth inst 2)
+        ;; Collect aux-side refs (branch/branch-if targets) so we
+        ;; can clear those entries too.
+        aux-refs (case op
+                   :branch    (:args aux)
+                   :branch-if (concat (:args (:true-target aux))
+                                      (:args (:false-target aux)))
+                   nil)]
+    (swap! f update-in [:blocks bid :insts]
+           (fn [insts] (vec (remove (fn [x] (= x nid)) insts))))
+    (swap! f assoc-in [:insts nid 0] :invalid)
+    (if (:uses-dirty? @f)
+      nil  ;; cache already invalid, no point patching
+      (swap! f update :uses-cache
+             (fn [u]
+               (let [u' (reduce (fn [a r] (assoc a r (bs-remove (nth a r) nid)))
+                                u refs)]
+                 (if aux-refs
+                   (reduce (fn [a r] (assoc a r (bs-remove (nth a r) nid)))
+                           u' aux-refs)
+                   u')))))))
 
 (defn- rewrite-refs [refs old new]
   (vec (map (fn [r] (if (= r old) new r)) refs)))
@@ -223,43 +359,80 @@
 
 ;; --- def→use index ---------------------------------------------------
 
-(defn- accumulate-uses-from-refs [acc user-id refs]
-  (reduce (fn [a r] (assoc a r (conj (nth a r) user-id))) acc refs))
+;; --- uses-cache build ------------------------------------------------
 
-(defn- accumulate-uses-from-aux [acc user-id inst]
-  ;; case dispatch + threading. Eliminates `cond` + `nth ... 0` repetition.
+(defn- accumulate-uses-from-refs! [acc user-id refs]
+  ;; Transient outer; inner uses[r] is a persistent bitset vec.
+  (reduce (fn [a r] (assoc! a r (bs-add (nth a r) user-id))) acc refs))
+
+(defn- accumulate-uses-from-aux! [acc user-id inst]
   (let [op  (nth inst 0)
         aux (nth inst 2)]
     (case op
-      :branch    (accumulate-uses-from-refs acc user-id (:args aux))
+      :branch    (accumulate-uses-from-refs! acc user-id (:args aux))
       :branch-if (-> acc
-                     (accumulate-uses-from-refs user-id (:args (:true-target  aux)))
-                     (accumulate-uses-from-refs user-id (:args (:false-target aux))))
+                     (accumulate-uses-from-refs! user-id (:args (:true-target  aux)))
+                     (accumulate-uses-from-refs! user-id (:args (:false-target aux))))
       acc)))
 
 (defn- compute-uses [f]
+  ;; Phase A: transient outer vector.
+  ;; Phase B: inner uses[r] is a bitset (vec of int64 words) instead of
+  ;; vec of user-ids. Each Inst gets one bitset of size ⌈N/64⌉ words.
   (let [insts (:insts @f)
-        seed  (vec (repeat (count insts) []))]
-    (reduce-kv
-      (fn [acc i inst]
-        ;; Skip :invalid insts (those marked for removal).
-        (if (= :invalid (nth inst 0))
-          acc
-          (-> acc
-              (accumulate-uses-from-refs i (nth inst 1))
-              (accumulate-uses-from-aux i inst))))
-      seed
-      insts)))
+        n     (count insts)
+        empty (bs-empty n)
+        seed  (transient (vec (repeat n empty)))]
+    (persistent!
+      (reduce-kv
+        (fn [acc i inst]
+          (if (= :invalid (nth inst 0))
+            acc
+            (-> acc
+                (accumulate-uses-from-refs! i (nth inst 1))
+                (accumulate-uses-from-aux! i inst))))
+        seed
+        insts))))
 
 (defn uses [f]
-  "Return the def→use index: a vector where uses[nid] is the vector
-   of InstIds whose :refs (or branch-target args) include nid. Cached
-   between mutations; invalidated automatically by any mutator that
-   could change the graph."
+  "Return the def→use index: a vector where uses[nid] is a bitset
+   (vec of int64 words) whose set bits are the InstIds that
+   reference nid via :refs or branch-target args. Cached between
+   mutations; invalidated automatically by any mutator that could
+   change the graph.
+
+   Use `uses-empty?`, `uses-for-each`, and `uses-contains?` to
+   query a slot; do not depend on the bitset's internal shape."
   (when (:uses-dirty? @f)
     (let [u (compute-uses f)]
       (swap! f assoc :uses-cache u :uses-dirty? false)))
   (:uses-cache @f))
+
+(defn uses-empty? [bs]
+  "True if the uses bitset bs has no set bits (zero users)."
+  (bs-empty? bs))
+
+(defn uses-for-each [bs f]
+  "Call (f user-id) for each user-id in the uses bitset bs."
+  (bs-for-each bs f))
+
+(defn uses-contains? [bs uid]
+  "True if user-id uid is in the uses bitset bs."
+  (bs-contains? bs uid))
+
+(defn uses-count [bs]
+  "Number of set bits in the uses bitset bs (popcount)."
+  (let [n (atom 0)]
+    (bs-for-each bs (fn [_] (swap! n inc)))
+    @n))
+
+(defn uses-first [bs]
+  "Return the smallest user-id in the uses bitset, or nil if empty.
+   Faster than collecting all ids when caller only needs one."
+  (let [found (atom nil)]
+    (bs-for-each bs (fn [id]
+                      (when (nil? @found) (reset! found id))))
+    @found))
 
 (defn replace-all-uses! [f old-id new-id]
   "Rewrite every Inst whose :refs (or whose Branch/BranchIf Aux carries
@@ -269,7 +442,18 @@
    instead of the O(n) full-array walk the previous implementation did.
    Single swap! per consumer; the uses cache is invalidated once at the
    end."
-  (let [consumer-ids (nth (uses f) old-id)]
+  (let [consumer-bs (nth (uses f) old-id)
+        ;; Materialize consumer-ids as a vec so we can iterate twice
+        ;; (once below for the doseq) and so the `seq` test on it is cheap.
+        consumer-ids (let [acc (atom [])]
+                       (bs-for-each consumer-bs #(swap! acc conj %))
+                       @acc)
+        old-sis      (source-infos old-id f)]
+    (when (seq old-sis)
+      (swap! f update-in [:insts new-id 4]
+             (fn [new-sis]
+               (let [nsis (if (nil? new-sis) [] new-sis)]
+                 (vec (distinct (concat nsis old-sis)))))))
     (doseq [cid consumer-ids]
       (swap! f update-in [:insts cid]
              (fn [i]
@@ -286,8 +470,19 @@
                        (-> aux
                            (assoc :true-target  (rewrite-branch-target-args (:true-target  aux) old-id new-id))
                            (assoc :false-target (rewrite-branch-target-args (:false-target aux) old-id new-id))))
-                   i))))))
-  (invalidate-uses-state! f))
+                   i))))) ;; close: case, let, fn, swap!, doseq
+    ;; Phase 1: incremental uses-cache update.
+    ;; After rewrite, every consumer's old-id ref is now new-id, so
+    ;; uses[new-id] gains exactly consumer-bs's bits and uses[old-id]
+    ;; becomes empty. Skip if cache is already dirty.
+    (when (not (:uses-dirty? @f))
+      (swap! f update :uses-cache
+             (fn [u]
+               (let [new-bs   (bs-union (nth u new-id) consumer-bs)
+                     empty-bs (bs-empty (count (:insts @f)))]
+                 (-> u
+                     (assoc new-id new-bs)
+                     (assoc old-id empty-bs))))))))
 
 ;; --- export into the `ir` namespace ----------------------------------
 ;;
@@ -302,6 +497,7 @@
                inst-count blocks
                op refs aux block-of type-of source-infos
                block-params block-preds block-insts block-term
+               fn-load-arg fn-load-arg-type
                branch-target-target branch-target-args
                cond-target-true cond-target-false
                add-block add-inst add-terminator!
@@ -310,6 +506,8 @@
                replace-op! set-refs! set-aux! set-type!
                cond-target-set-true! cond-target-set-false!
                remove-inst! replace-all-uses! clone-inst
-               uses invalidate-uses!]]
+               uses invalidate-uses!
+               uses-empty? uses-for-each uses-contains?
+               uses-count uses-first]]
   (doseq [sym syms]
     (intern target sym (deref (resolve (symbol "ir.data" (str sym)))))))

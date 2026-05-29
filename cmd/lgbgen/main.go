@@ -54,9 +54,12 @@ var embeddedNS = []struct {
 	{"ir.validate", &rt.IRValidateSrc},
 	{"ir.passes.dce", &rt.IRPassDCESrc},
 	{"ir.passes.constfold", &rt.IRPassConstFoldSrc},
+	{"ir.passes.mutability", &rt.IRPassMutabilitySrc},
 	{"ir.passes.cse", &rt.IRPassCSESrc},
 	{"ir.passes.typeinfer", &rt.IRPassTypeInferSrc},
 	{"ir.passes.licm", &rt.IRPassLICMSrc},
+	{"ir.passes.infer-arg-types", &rt.IRPassInferArgTypesSrc},
+	{"graph", &rt.GraphSrc},
 	{"ir.build", &rt.IRBuildSrc},
 	{"ir.passes.pipeline", &rt.IRPassPipelineSrc},
 	{"ir.dump", &rt.IRDumpSrc},
@@ -279,5 +282,5 @@ func isDefnOnly(form vm.Value) bool {
 	if !ok {
 		return false
 	}
-	return string(sym) == "defn"
+	return string(sym) == "defn" || string(sym) == "defn-"
 }
