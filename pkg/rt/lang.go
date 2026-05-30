@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -548,11 +549,13 @@ const NameCoreNS = "core"
 var CoreNS *vm.Namespace
 var CurrentNS *vm.Var
 
-var gensymID = 0
+// gensymID backs gensym. Atomic so concurrent gensym calls (e.g. lowering
+// namespaces' defns in parallel) don't race the counter. Single-threaded
+// the sequence is unchanged.
+var gensymID atomic.Int64
 
 func nextID() int {
-	gensymID++
-	return gensymID
+	return int(gensymID.Add(1))
 }
 
 // mapLike is any map type with Lookup + Counted + Sequable
@@ -5837,6 +5840,8 @@ func installLangNS() {
 
 	ns.Def("map*", mapf)
 	ns.Def("mapv", mapv)
+	parMapV, _ := vm.NativeFnType.Wrap(parallelMapV)
+	ns.Def("pmapv", parMapV)
 	ns.Def("chunk-first", chunkFirst)
 	ns.Def("chunk-rest", chunkRest)
 	ns.Def("chunk-next", chunkNext)
