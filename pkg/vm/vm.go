@@ -550,7 +550,7 @@ func (f *Frame) Run() (Value, error) {
 				if err != nil {
 					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
 				}
-				fn, ok := fraw.(Fn)
+				fn, ok := AsFn(fraw)
 				if !ok {
 					return NIL, NewTypeError(fraw, "is not a function", nil)
 				}
@@ -581,7 +581,7 @@ func (f *Frame) Run() (Value, error) {
 				if err != nil {
 					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
 				}
-				fn, ok := fraw.(Fn)
+				fn, ok := AsFn(fraw)
 				if !ok {
 					return NIL, NewTypeError(fraw, "is not a function", nil)
 				}
@@ -614,7 +614,7 @@ func (f *Frame) Run() (Value, error) {
 				if err != nil {
 					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
 				}
-				fn, ok := fraw.(Fn)
+				fn, ok := AsFn(fraw)
 				if !ok {
 					return NIL, NewTypeError(fraw, "is not a function", nil)
 				}
@@ -679,7 +679,7 @@ func (f *Frame) Run() (Value, error) {
 				if err != nil {
 					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
 				}
-				fn, ok := fraw.(Fn)
+				fn, ok := AsFn(fraw)
 				if !ok {
 					return NIL, NewTypeError(fraw, "is not a function", nil)
 				}

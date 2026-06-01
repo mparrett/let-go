@@ -2010,7 +2010,7 @@ func installLangNS() {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		f, ok := vs[0].(vm.Fn)
+		f, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("complement expected Fn")
 		}
@@ -2079,7 +2079,7 @@ func installLangNS() {
 		if len(vs) < 1 {
 			return vm.NIL, fmt.Errorf("sorted-map-by requires a comparator")
 		}
-		comp, ok := vs[0].(vm.Fn)
+		comp, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("sorted-map-by first arg must be a function")
 		}
@@ -2094,7 +2094,7 @@ func installLangNS() {
 		if len(vs) < 1 {
 			return vm.NIL, fmt.Errorf("sorted-set-by requires a comparator")
 		}
-		comp, ok := vs[0].(vm.Fn)
+		comp, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("sorted-set-by first arg must be a function")
 		}
@@ -2430,7 +2430,7 @@ func installLangNS() {
 			return vm.NIL, fmt.Errorf("update expected Lookup")
 		}
 		key := vs[1]
-		fn, ok := vs[2].(vm.Fn)
+		fn, ok := vm.AsFn(vs[2])
 		if !ok {
 			return vm.NIL, fmt.Errorf("update expected Fn")
 		}
@@ -2852,7 +2852,7 @@ func installLangNS() {
 		if len(vs) < 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		mfn, ok := vs[0].(vm.Fn)
+		mfn, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("map expected Fn")
 		}
@@ -2899,7 +2899,7 @@ func installLangNS() {
 		if len(vs) == 3 && vs[2] == vm.NIL {
 			return vs[1], nil
 		}
-		mfn, ok := vs[0].(vm.Fn)
+		mfn, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("reduce expected Fn")
 		}
@@ -2989,7 +2989,7 @@ func installLangNS() {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		f, ok := vs[0].(vm.Fn)
+		f, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("some expected Fn")
 		}
@@ -3053,7 +3053,7 @@ func installLangNS() {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		f, ok := vs[0].(vm.Fn)
+		f, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("apply expected Fn")
 		}
@@ -3213,7 +3213,7 @@ func installLangNS() {
 	deref, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		switch len(vs) {
 		case 1:
-			ref, ok := vs[0].(vm.Reference)
+			ref, ok := vm.AsRef(vs[0])
 			if !ok {
 				return vm.NIL, fmt.Errorf("deref expected Reference")
 			}
@@ -3342,7 +3342,7 @@ func installLangNS() {
 					validator = nil
 					continue
 				}
-				fn, ok := vs[i+1].(vm.Fn)
+				fn, ok := vm.AsFn(vs[i+1])
 				if !ok {
 					return vm.NIL, fmt.Errorf("atom :validator must be nil or function")
 				}
@@ -3361,7 +3361,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("swap expected Atom")
 		}
-		fn, ok := vs[1].(vm.Fn)
+		fn, ok := vm.AsFn(vs[1])
 		if !ok {
 			return vm.NIL, fmt.Errorf("swap expected Fn")
 		}
@@ -3408,7 +3408,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("swap-vals! expected Atom")
 		}
-		fn, ok := vs[1].(vm.Fn)
+		fn, ok := vm.AsFn(vs[1])
 		if !ok {
 			return vm.NIL, fmt.Errorf("swap-vals! expected Fn")
 		}
@@ -3660,7 +3660,7 @@ func installLangNS() {
 		var coll vm.Collection
 		var ok bool
 		if len(vs) == 2 {
-			compFn, ok := vs[0].(vm.Fn)
+			compFn, ok := vm.AsFn(vs[0])
 			if !ok {
 				return vm.NIL, fmt.Errorf("sort expected a comparator function")
 			}
@@ -4013,7 +4013,7 @@ func installLangNS() {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		f, ok := vs[0].(vm.Fn)
+		f, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("iterate expected a function")
 		}
@@ -4673,6 +4673,46 @@ func installLangNS() {
 		return vm.NewProtocolFn(protocol, methodName), nil
 	})
 
+	// -set-invokable-protocol!: wire the VM's "invokable value" support to the
+	// IFn protocol + its -invoke fn (called once from core after defining IFn).
+	// Thereafter any value whose type satisfies IFn can be called like a fn.
+	setInvokableProtocol, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 2 {
+			return vm.NIL, fmt.Errorf("-set-invokable-protocol! expects 2 args")
+		}
+		protocol, ok := vs[0].(*vm.Protocol)
+		if !ok {
+			return vm.NIL, fmt.Errorf("-set-invokable-protocol! expected a Protocol")
+		}
+		invokeFn, ok := vs[1].(vm.Fn)
+		if !ok {
+			return vm.NIL, fmt.Errorf("-set-invokable-protocol! expected the -invoke fn")
+		}
+		vm.IFnProtocol = protocol
+		vm.IFnInvoke = invokeFn
+		return vm.NIL, nil
+	})
+
+	// -set-deref-protocol!: wire the VM's "derefable value" support to the
+	// IDeref protocol + its -deref fn (called once from core after defining
+	// IDeref). Thereafter any value whose type satisfies IDeref works with @/deref.
+	setDerefProtocol, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 2 {
+			return vm.NIL, fmt.Errorf("-set-deref-protocol! expects 2 args")
+		}
+		protocol, ok := vs[0].(*vm.Protocol)
+		if !ok {
+			return vm.NIL, fmt.Errorf("-set-deref-protocol! expected a Protocol")
+		}
+		derefFn, ok := vs[1].(vm.Fn)
+		if !ok {
+			return vm.NIL, fmt.Errorf("-set-deref-protocol! expected the -deref fn")
+		}
+		vm.IDerefProtocol = protocol
+		vm.IDerefDeref = derefFn
+		return vm.NIL, nil
+	})
+
 	// satisfies?: check if a value's type implements a protocol
 	satisfies, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 2 {
@@ -5179,7 +5219,7 @@ func installLangNS() {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("transformer-seq* expects 2 args")
 		}
-		xformFn, ok := vs[0].(vm.Fn)
+		xformFn, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("transformer-seq* expected xform Fn")
 		}
@@ -5357,7 +5397,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("vswap! expected Volatile")
 		}
-		fn, ok := vs[1].(vm.Fn)
+		fn, ok := vm.AsFn(vs[1])
 		if !ok {
 			return vm.NIL, fmt.Errorf("vswap! expected Fn")
 		}
@@ -5678,7 +5718,7 @@ func installLangNS() {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("add-tap expects 1 arg")
 		}
-		fn, ok := vs[0].(vm.Fn)
+		fn, ok := vm.AsFn(vs[0])
 		if !ok {
 			return vm.NIL, fmt.Errorf("add-tap expected Fn")
 		}
@@ -5722,7 +5762,7 @@ func installLangNS() {
 		if len(vs) != 3 {
 			return vm.NIL, fmt.Errorf("add-watch expects 3 args")
 		}
-		fn, ok := vs[2].(vm.Fn)
+		fn, ok := vm.AsFn(vs[2])
 		if !ok {
 			return vm.NIL, fmt.Errorf("add-watch expected Fn")
 		}
@@ -5758,7 +5798,7 @@ func installLangNS() {
 		if len(vs) < 2 {
 			return vm.NIL, fmt.Errorf("alter-meta! expects at least 2 args")
 		}
-		fn, ok := vs[1].(vm.Fn)
+		fn, ok := vm.AsFn(vs[1])
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-meta! expected Fn")
 		}
@@ -6150,6 +6190,8 @@ func installLangNS() {
 	ns.Def("make-deftype-instance", makeDTypeInstance)
 	ns.Def("set-field!", setField)
 	ns.Def("defprotocol*", defProtocol)
+	ns.Def("-set-invokable-protocol!", setInvokableProtocol)
+	ns.Def("-set-deref-protocol!", setDerefProtocol)
 	installHierarchyBuiltins(ns)
 	ns.Def("make-protocol-fn", makeProtocolFn)
 	ns.Def("extend-type*", extendType)
@@ -7076,7 +7118,7 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-var-root expects a Var")
 		}
-		fn, ok := vs[1].(vm.Fn)
+		fn, ok := vm.AsFn(vs[1])
 		if !ok {
 			return vm.NIL, fmt.Errorf("alter-var-root expects a function")
 		}
