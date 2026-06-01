@@ -1301,7 +1301,47 @@ func fnComparator(comp vm.Fn) vm.Comparator {
 	}
 }
 
+// hostMethods backs the pluggable host-method-dispatch seam: a (type, method)
+// registry consulted by the `.`-form when a value has no native method of that
+// name. Mirrors the pluggable NSLoader — core ships the seam; callers (e.g. a
+// library-compat module) register the specific method names they need, rather
+// than baking a general reflective bridge into core.
+var (
+	hostMethodsMu sync.RWMutex
+	hostMethods   = map[vm.ValueType]map[vm.Symbol]vm.Fn{}
+)
+
+// RegisterHostMethod registers fn as the handler for `.name` on values whose
+// type is t. The handler is invoked with the receiver as its first argument.
+func RegisterHostMethod(t vm.ValueType, name vm.Symbol, fn vm.Fn) {
+	hostMethodsMu.Lock()
+	defer hostMethodsMu.Unlock()
+	m := hostMethods[t]
+	if m == nil {
+		m = map[vm.Symbol]vm.Fn{}
+		hostMethods[t] = m
+	}
+	m[name] = fn
+}
+
+func lookupHostMethod(t vm.ValueType, name vm.Symbol) (vm.Fn, bool) {
+	hostMethodsMu.RLock()
+	defer hostMethodsMu.RUnlock()
+	if m := hostMethods[t]; m != nil {
+		fn, ok := m[name]
+		return fn, ok
+	}
+	return nil, false
+}
+
 func invokeMethodFallback(rec vm.Value, name vm.Symbol, args []vm.Value, originalErr error) (vm.Value, error) {
+	// Explicit host-method registrations win over the generic name→fn fallbacks
+	// below (so e.g. a registered `.pop` is not shadowed by core `pop`).
+	if rec != nil {
+		if fn, ok := lookupHostMethod(rec.Type(), name); ok {
+			return fn.Invoke(append([]vm.Value{rec}, args...))
+		}
+	}
 	if isCompatChecker(rec) && len(args) == 1 {
 		switch name {
 		case "isLong":
@@ -3146,6 +3186,28 @@ func installLangNS() {
 			return result, nil
 		}
 		return invokeMethodFallback(rec, name, vs[2:], err)
+	})
+
+	// (register-host-method! Type 'name (fn [rec & args] ...)) — register a
+	// handler for `.name` dot-forms on values of Type (the host-method seam).
+	registerHostMethod, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 3 {
+			return vm.NIL, fmt.Errorf("register-host-method! expected 3 arguments, got %d", len(vs))
+		}
+		t, ok := vs[0].(vm.ValueType)
+		if !ok {
+			return vm.NIL, fmt.Errorf("register-host-method! expected a type, got %s", vs[0].Type().Name())
+		}
+		name, ok := vs[1].(vm.Symbol)
+		if !ok {
+			return vm.NIL, fmt.Errorf("register-host-method! expected a Symbol method name")
+		}
+		fn, ok := vs[2].(vm.Fn)
+		if !ok {
+			return vm.NIL, fmt.Errorf("register-host-method! expected a fn")
+		}
+		RegisterHostMethod(t, name, fn)
+		return vm.NIL, nil
 	})
 
 	deref, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -5980,6 +6042,7 @@ func installLangNS() {
 
 	ns.Def("apply*", apply)
 	ns.Def("deref", deref)
+	ns.Def("register-host-method!", registerHostMethod)
 
 	ns.Def("atom", atom)
 	ns.Def("reset!", reset)
