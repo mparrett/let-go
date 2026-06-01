@@ -58,23 +58,15 @@ pkg/rt/core_compiled.lgb: $(CORE-LG-FILES) $(LGBGEN-SOURCES)
 pkg/rt/core_go_lowered/ir_lower_go/ir_lower_go.go: $(CORE-LG-FILES) $(LGBGEN-SOURCES)
 	go run -tags bootstrap ./cmd/lgbgen --target=go
 
-generate: $(GO) generate-ir-ops generate-ir-bridge generate-ir-data pkg/rt/core_compiled.lgb pkg/rt/core_go_lowered/ir_lower_go/ir_lower_go.go
-
-# Regenerate pkg/ir/op_generated.go from examples/go-gen/ir_ops.lg.
-# Requires ./lg to exist (built by `make build`).
-generate-ir-ops: build
-	./scripts/generate-ir-ops.sh
-
-# Regenerate pkg/rt/ir_bridge_generated.go from examples/go-gen/ir_bridge.lg.
-# Requires ./lg to exist (built by `make build`).
-generate-ir-bridge: build
-	./scripts/generate-ir-bridge.sh
-
-# Regenerate pkg/rt/core/ir/data/generated.lg from examples/go-gen/ir_data.lg.
-# Lisp output (mechanical accessor surface for the IR data types).
-# Requires ./lg to exist (built by `make build`).
-generate-ir-data: build
-	./scripts/generate-ir-data.sh
+# Regenerate every committed code-gen artifact via the let-go orchestrator
+# scripts/generate.lg: the three Go-gen files (op_generated.go,
+# ir_bridge_generated.go, ir/data/generated.lg), the core_compiled.lgb bundle,
+# and the lowered-Go tree. Requires ./lg, so it builds first. The orchestrator
+# uses os/sh + os/exec* to run ./lg on the examples/go-gen sources and to run
+# `go run -tags bootstrap ./cmd/lgbgen [--target=go]` for the bundle/lowered
+# tree. (Replaces the former generate-ir-{ops,bridge,data}.sh shell scripts.)
+generate: build
+	./lg scripts/generate.lg --go "$$(command -v go)" --lg ./lg --source-paths examples/go-gen
 
 $(LG): $(GO) lg.go pkg/**/* pkg/rt/core_compiled.lgb
 	which go
