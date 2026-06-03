@@ -1,0 +1,41 @@
+(ns test.print-method-test
+  (:require
+   [test :refer :all]))
+
+(deftest leaves-through-printer
+  (testing "scalars route through print-method"
+    (is (= "42"    (pr-str 42)))
+    (is (= ":a"    (pr-str :a)))
+    (is (= "\"x\"" (pr-str "x")))
+    (is (= "nil"   (pr-str nil)))
+    (is (= "x"     (print-str "x"))))  ; human form: no quotes
+  (testing "readable vs human form"
+    (is (= "\\newline" (pr-str \newline)))  ; readable: escaped char
+    (is (= "\n"        (print-str \newline)))))
+
+(deftest collections-byte-identical
+  (testing "collections print as before, recursing through print-method"
+    (is (= "[]"         (pr-str [])))
+    (is (= "[1 2 3]"    (pr-str [1 2 3])))
+    (is (= "()"         (pr-str (list))))
+    (is (= "(1 2 3)"    (pr-str (list 1 2 3))))
+    (is (= "#{1}"       (pr-str #{1})))
+    (is (= "[1 [2 \"x\"]]" (pr-str [1 [2 "x"]])))
+    (is (= "[x]"        (print-str ["x"])))   ; human form propagates into vector
+    (is (= "[\"x\"]"    (pr-str ["x"])))))    ; readable form propagates
+
+(deftest map-printing
+  (testing "maps print key/val via print-method"
+    (is (= "{}"        (pr-str {})))
+    (is (= "{:a 1}"    (pr-str {:a 1})))))
+
+(deftype Money [cents])
+
+(defmethod print-method (type (->Money 0)) [m w]
+  (.WriteString w (str "$" (.-cents m))))
+
+(deftest custom-and-nested
+  (testing "custom print-method applies, even nested in a collection"
+    (is (= "$150" (pr-str (->Money 150))))
+    (is (= "[$150 :x]" (pr-str [(->Money 150) :x])))
+    (is (= "($150 $200)" (pr-str (list (->Money 150) (->Money 200)))))))

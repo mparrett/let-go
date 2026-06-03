@@ -2577,6 +2577,50 @@
 (defmacro defmethod [name dispatch-val & fn-tail]
   (list 'set! name (list 'defmethod* name dispatch-val (cons 'fn fn-tail))))
 
+;; print-method: customizable printing. Dispatch on (type obj). The :default
+;; method is the native leaf renderer (-print-method-default), installed
+;; directly as an IFn (no .lg frame) for fast dispatch. Collection types get
+;; .lg methods (added in a later task) that recurse via pr-on.
+(defmulti print-method (fn [obj writer] (type obj)) :default :default)
+(set! print-method (defmethod* print-method :default -print-method-default))
+
+;; pr-on: route one value through print-method. *print-dup* is a standard
+;; clojure.core var whose faithful impl (a separate print-dup multimethod + #=
+;; reader forms) is deferred (tracked in issue #176); rather than silently
+;; ignore it, error clearly if it is set true.
+(defn pr-on [obj writer]
+  (when *print-dup*
+    (throw "print-dup is not supported yet (see issue #176); bind *print-dup* to false"))
+  (print-method obj writer))
+
+;; print-method collection methods: recurse through pr-on to honor custom
+;; element printing.
+(defn- pr-sequential [items open close w]
+  (.WriteString w open)
+  (loop [xs (seq items) first? true]
+    (when xs
+      (when-not first? (.WriteString w " "))
+      (pr-on (first xs) w)
+      (recur (next xs) false)))
+  (.WriteString w close))
+
+(defmethod print-method (type [])  [v w] (pr-sequential v "[" "]" w))
+(defmethod print-method (type (list)) [v w] (pr-sequential v "(" ")" w))
+(defmethod print-method (type #{}) [v w] (pr-sequential v "#{" "}" w))
+(defmethod print-method (type (range 0)) [v w] (pr-sequential v "(" ")" w))
+
+(defmethod print-method (type {}) [m w]
+  (.WriteString w "{")
+  (loop [es (seq m) first? true]
+    (when es
+      (when-not first? (.WriteString w ", "))
+      (let [e (first es)]
+        (pr-on (key e) w)
+        (.WriteString w " ")
+        (pr-on (val e) w))
+      (recur (next es) false)))
+  (.WriteString w "}"))
+
 ;; --- Array macros ---
 
 ;; (amap a idx ret expr) — map over array, returning new array of same type

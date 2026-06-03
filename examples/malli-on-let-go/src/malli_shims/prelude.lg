@@ -17,8 +17,10 @@
 (register-host-method! (type 0.0) 'longValue (fn [n] n))
 (register-host-method! (type 0.0) 'doubleValue (fn [n] n))
 (def class type) (register-host-method! (type (type {})) 'isArray (fn [_] false))
-(defmulti print-method (fn [v w] :default))
-;; unchecked-{inc,dec,add,multiply}-int now ship in core (dropped here).
+;; print-method now ships in core as a real multimethod that pr/prn dispatch
+;; through — do NOT redefine it here (it would clobber core's and break all
+;; printing). malli's own (defmethod print-method ::schema ...) registers on
+;; core's multimethod. unchecked-{inc,dec,add,multiply}-int also ship in core.
 (defn indexed? [c] (or (vector? c) (string? c)))
 ;; uri? has no host type on let-go (no java.net.URI); stubbed false so the :uri
 ;; schema exists but never matches. (bytes?, ns-resolve, *unchecked-math*,

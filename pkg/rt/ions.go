@@ -60,9 +60,10 @@ func (r *LGReader) String() string {
 
 // LGWriter wraps any io.Writer with optional buffering and close.
 type LGWriter struct {
-	raw    io.Writer
-	bw     *bufio.Writer
-	closer io.Closer
+	raw      io.Writer
+	bw       *bufio.Writer
+	closer   io.Closer
+	readably bool
 }
 
 func newLGWriter(w io.Writer, closer io.Closer) *LGWriter {
@@ -78,6 +79,12 @@ func (w *LGWriter) Buffered() *bufio.Writer {
 
 func (w *LGWriter) Write(p []byte) (int, error) {
 	return w.raw.Write(p)
+}
+
+// WriteString writes s to the underlying writer. Gives .lg callers a
+// string-typed write (Go's Write takes []byte); used by print-method methods.
+func (w *LGWriter) WriteString(s string) (int, error) {
+	return w.raw.Write([]byte(s))
 }
 
 func (w *LGWriter) Flush() error {
