@@ -18,24 +18,20 @@
 (register-host-method! (type 0.0) 'doubleValue (fn [n] n))
 (def class type) (register-host-method! (type (type {})) 'isArray (fn [_] false))
 (defmulti print-method (fn [v w] :default))
-(def unchecked-inc-int inc) (def unchecked-dec-int dec) (def unchecked-add-int +) (def unchecked-multiply-int *)
+;; unchecked-{inc,dec,add,multiply}-int now ship in core (dropped here).
 (defn indexed? [c] (or (vector? c) (string? c)))
-;; Predicates malli registers that have no host type on let-go (no java.net.URI,
-;; no byte[]); stubbed false so the :uri / bytes? schemas exist but never match.
+;; uri? has no host type on let-go (no java.net.URI); stubbed false so the :uri
+;; schema exists but never matches. (bytes?, ns-resolve, *unchecked-math*,
+;; eduction, every-pred, ->MapEntry all now ship in core — dropped here.)
 (defn uri? [x] false)
-(defn bytes? [x] false)
-;; ns-resolve: malli only calls it as (ns-resolve 'cljs.analyzer.api 'resolve)
-;; on the cljs path, which is absent here — nil is the correct answer.
-(defn ns-resolve [& _] nil)
-;; Compiler-knob dynamic vars malli toggles via set!; no-ops on let-go.
-(def ^:dynamic *unchecked-math* false)
-;; clojure.core hash mixing used by malli.impl.regex's custom cache.
+;; hash-combine: KEEP this override. core's hash-combine is the faithful
+;; clojure.core one — [x y] mixing two hash codes; it does NOT hash its args.
+;; But malli.impl.regex's :bb path calls (hash-combine acc raw-value) relying on
+;; hash-combine hashing its 2nd argument (see the comment in its source), so
+;; malli needs this internal-hashing variant. Intentionally shadows core's.
 (defn hash-combine [seed x]
   (bit-and 0x7fffffff
            (bit-xor seed (+ (hash x) 0x9e3779b9 (bit-shift-left seed 6) (bit-shift-right seed 2)))))
-(defn eduction [& xs] (sequence (apply comp (butlast xs)) (last xs)))
-(defn every-pred [& ps] (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
-(defn ->MapEntry ([k v] (first (hash-map k v))) ([k v _] (first (hash-map k v))))
 ;; java.util.ArrayDeque used as a mutable stack by malli.impl.regex's parser drivers.
 (deftype LGArrayDeque [^:mutable items])
 (defn ->ArrayDeque [] (->LGArrayDeque (list)))
@@ -98,14 +94,4 @@
 (in-ns 'Instant) (defn from [x] x) (defn ofEpochMilli [x] x)
 (in-ns 'Date) (defn from [x] x)
 (in-ns 'core)
-;; clojure.string/replace-first — missing from let-go's string ns. malli.error
-;; uses it only with literal-string matches (e.g. "should" -> "should not"), so
-;; a string-match implementation suffices: replace the first occurrence, or
-;; return s unchanged when absent.
-(in-ns 'string)
-(defn replace-first [s match replacement]
-  (let [i (index-of s match)]
-    (if (nil? i)
-      s
-      (str (core/subs s 0 i) replacement (core/subs s (+ i (count match)))))))
-(in-ns 'core)
+;; clojure.string/replace-first now ships in let-go's string ns (dropped here).

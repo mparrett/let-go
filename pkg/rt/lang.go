@@ -7217,6 +7217,18 @@ func installLangNS() {
 	})
 	ns.Def("array?", isArrayf)
 
+	// bytes?: true iff the value is a byte-kind TypedArray (backing []byte).
+	// array? doesn't distinguish element kind, and a TypedArray's Kind() is
+	// not reachable from .lg, so this lives in Go alongside array?.
+	bytesP, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.FALSE, nil
+		}
+		a, ok := vs[0].(*vm.TypedArray)
+		return vm.Boolean(ok && a.Kind() == vm.ArrayByte), nil
+	})
+	ns.Def("bytes?", bytesP)
+
 	// alter-var-root — alter a var's root binding via (f root & args).
 	// Reads/writes the root, bypassing any current dynamic binding.
 	// TODO: the read/apply/write is not atomic. let-go evaluates synchronously

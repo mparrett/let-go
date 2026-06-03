@@ -1,0 +1,85 @@
+;; Tests for the clojure.core fns upstreamed from the malli-on-let-go shim.
+;; See docs/superpowers/specs/2026-06-02-malli-shim-core-additions-design.md
+(ns test.malli-core-additions-test
+  (:require
+   [test :refer :all]))
+
+;; --- unchecked int variants ---------------------------------------------
+;; let-go is int64, so the -int variants compose on the same native
+;; unchecked-* ops the existing unchecked-inc / unchecked-dec use.
+(deftest unchecked-int-variants
+  (testing "unchecked *-int behave like their base ops on int64"
+    (is (= 6 (unchecked-inc-int 5)))
+    (is (= 4 (unchecked-dec-int 5)))
+    (is (= 7 (unchecked-add-int 3 4)))
+    (is (= 12 (unchecked-multiply-int 3 4)))))
+
+;; --- every-pred ----------------------------------------------------------
+(deftest every-pred-basics
+  (testing "every-pred: every pred holds for every arg"
+    (is (true?  ((every-pred even?) 2 4 6)))
+    (is (false? ((every-pred even?) 2 3)))
+    (is (true?  ((every-pred even? pos?) 2 4)))
+    (is (false? ((every-pred even? pos?) 2 -4)))
+    (is (true?  ((every-pred even?))))))      ; no args -> vacuously true
+
+;; --- eduction ------------------------------------------------------------
+(deftest eduction-basics
+  (testing "eduction applies composed xforms over the trailing coll"
+    (is (= [2 4] (vec (eduction (map inc) (filter even?) [1 2 3]))))
+    (is (= 9 (reduce + 0 (eduction (map inc) [1 2 3]))))
+    (is (= [2 3 4] (vec (eduction (map inc) [1 2 3]))))))
+
+;; --- hash-combine --------------------------------------------------------
+;; Faithful clojure.core/hash-combine: mixes two hash codes (ints), like
+;; clojure.lang.Util/hashCombine. Asserts the contract, not exact numbers.
+(deftest hash-combine-contract
+  (testing "hash-combine mixes two hash codes, deterministic + order-sensitive"
+    (is (= (hash-combine 7 11) (hash-combine 7 11)))
+    (is (not= (hash-combine 7 11) (hash-combine 7 12)))   ; 2nd arg matters
+    (is (not= (hash-combine 7 11) (hash-combine 8 11)))   ; 1st arg matters
+    (is (not= (hash-combine 7 11) (hash-combine 11 7)))   ; order-sensitive
+    (is (integer? (hash-combine 17 42)))))
+
+;; --- ->MapEntry ----------------------------------------------------------
+(deftest mapentry-ctor
+  (testing "->MapEntry builds a real first-class MapEntry"
+    (let [e (->MapEntry :k 1)]
+      (is (map-entry? e))
+      (is (= :k (key e)))
+      (is (= 1 (val e)))
+      (is (= [:k 1] (vec e))))
+    (testing "3-arg arity (malli passes a 3rd value) ignores the extra"
+      (is (= :k (key (->MapEntry :k 1 :ignored)))))))
+
+;; --- *unchecked-math* ----------------------------------------------------
+(deftest unchecked-math-var
+  (testing "*unchecked-math* is a dynamic var defaulting to false"
+    (is (false? *unchecked-math*))
+    (is (= true (binding [*unchecked-math* true] *unchecked-math*)))))
+
+;; --- bytes? (native) -----------------------------------------------------
+(deftest bytes-pred
+  (testing "bytes? is true only for byte arrays"
+    (is (true?  (bytes? (byte-array 3))))
+    (is (false? (bytes? (object-array 1))))
+    (is (false? (bytes? "x")))
+    (is (false? (bytes? [1 2 3])))
+    (is (false? (bytes? nil)))))
+
+;; --- ns-resolve (real) ---------------------------------------------------
+(deftest ns-resolve-real
+  (testing "ns-resolve finds a var in a named ns, nil when absent"
+    (is (= #'string/join (ns-resolve 'string 'join)))
+    (is (nil? (ns-resolve 'string 'no-such-var-here)))
+    (is (nil? (ns-resolve 'no.such.ns 'whatever))))   ; lenient: nil, not throw
+  (testing "3-arg arity: a sym shadowed by env resolves to nil"
+    (is (nil? (ns-resolve 'string {'join true} 'join)))
+    (is (= #'string/join (ns-resolve 'string {} 'join)))))
+
+;; --- inst-ms (real, Go time) ---------------------------------------------
+(deftest inst-ms-real
+  (testing "inst-ms returns epoch millis of a let-go time value"
+    (let [ms (inst-ms (now))]
+      (is (integer? ms))
+      (is (pos? ms)))))

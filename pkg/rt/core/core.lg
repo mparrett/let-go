@@ -200,6 +200,25 @@
 (defn unchecked-inc [x] (unchecked-add x 1))
 (defn unchecked-dec [x] (unchecked-subtract x 1))
 
+;; *-int variants: on the JVM these select 32-bit int overflow semantics.
+;; let-go has no 32-bit int (all ints are int64), so they collapse to the
+;; same native unchecked-* ops, just like unchecked-inc / unchecked-dec.
+(defn unchecked-inc-int [x] (unchecked-add x 1))
+(defn unchecked-dec-int [x] (unchecked-subtract x 1))
+(defn unchecked-add-int [x y] (unchecked-add x y))
+(defn unchecked-multiply-int [x y] (unchecked-multiply x y))
+
+;; *unchecked-math*: a JVM compiler knob toggling unchecked arithmetic for
+;; the +/-/* family. let-go has no such compile mode, so this is an honest
+;; no-op dynamic var (default false), present so code that `set!`s it loads.
+(def ^:dynamic *unchecked-math* false)
+
+;; hash-combine: mixes two hash codes into one, order-sensitive. The faithful
+;; clojure.core/hash-combine (clojure.lang.Util/hashCombine) — takes two ints,
+;; does not hash its arguments.
+(defn hash-combine [x y]
+  (bit-xor x (+ y 0x9e3779b9 (bit-shift-left x 6) (bit-shift-right x 2))))
+
 (defn num [x]
   (if (nil? x) nil
     (if (number? x) x
@@ -1260,6 +1279,15 @@
   ([xform coll]
    (transformer-seq* xform coll)))
 
+;; eduction: (eduction xform* coll) — compose the leading transducers and
+;; apply them to the trailing coll. The JVM returns a reusable reducible
+;; Eduction (re-runs the xform on every reduce, resetting stateful xforms);
+;; let-go has no reducible type, so this returns the seqable/reducible
+;; transformer-seq from `sequence`. Correct for single-pass use (seq/reduce
+;; once), which covers all current callers.
+(defn eduction [& xforms]
+  (sequence (apply comp (butlast xforms)) (last xforms)))
+
 ;; rseq is a native builtin (supports vectors, sorted-map, sorted-set)
 
 ;; some-fn: complement of every-pred — returns first truthy result or false
@@ -1271,6 +1299,11 @@
    (fn [& args]
      (or (some p1 args) (some p2 args) (some p3 args)
          (some (fn [p] (some p args)) ps) false))))
+
+;; every-pred: complement of some-fn — the returned fn is true iff EVERY
+;; predicate holds for EVERY argument.
+(defn every-pred [& ps]
+  (fn [& args] (every? (fn [p] (every? p args)) ps)))
 
 (defn merge
   ([] nil)
@@ -1359,6 +1392,30 @@
     ;; not satisfy that protocol — (key [:a 1]) must throw — so build a real
     ;; MapEntry here, matching every other entry-yielding path (first/seq/reduce).
     (clojure.lang.MapEntry/create key (get m key))))
+
+;; ->MapEntry: constructor for let-go's first-class MapEntry type (already
+;; mapped to a 2-element [k v] everywhere via MapEntryKV). Also what
+;; (MapEntry. k v) lowers to via let-go-new. The 3-arg arity exists for
+;; host-compat callers that pass a trailing value; the extra is ignored.
+(defn ->MapEntry
+  ([k v] (clojure.lang.MapEntry/create k v))
+  ([k v _] (clojure.lang.MapEntry/create k v)))
+
+;; ns-resolve: resolve a symbol as if from another namespace. Built on the
+;; native resolve/ns-name — a fully-qualified symbol resolves through the
+;; global namespace registry and yields nil for an absent ns or var (so this
+;; is lenient where the JVM's the-ns would throw). The 3-arg arity takes a
+;; &env-style map; a symbol shadowed by env resolves to nil (matches Clojure).
+(defn ns-resolve
+  ([ns sym] (ns-resolve ns nil sym))
+  ([ns env sym]
+   (when-not (and env (contains? env sym))
+     (resolve (symbol (str (if (symbol? ns) ns (ns-name ns)) "/" (name sym)))))))
+
+;; inst-ms: epoch-millisecond value of a let-go time value (e.g. (now), a
+;; boxed Go time.Time). Real, backed by Go time rather than a stub.
+(defn inst-ms [inst]
+  (.UnixMilli inst))
 
 (defn select-keys
   [map keyseq]
