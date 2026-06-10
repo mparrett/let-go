@@ -6,21 +6,28 @@
 
 package vm
 
+import "context"
+
 // ExecContext is the single object that resolves an execution's dynamic state —
-// dynamic-var bindings now, the structured-concurrency Scope later (see
-// docs/design/exec-context-threading.md). It is the *implementer* of
-// invocation and of binding resolution: the eval loop, builtins, and goroutine
-// spawn all go through an ExecContext rather than looking state up by goroutine
-// id.
+// both the dynamic-var binding stack and the structured-concurrency Scope (see
+// docs/design/exec-context-threading.md). It is the *implementer* of invocation
+// and of dynamic resolution: the eval loop, builtins, and goroutine spawn all
+// go through an ExecContext rather than looking state up by goroutine id.
 //
 // There is always an ExecContext in play. RootExecContext is the process
-// default — its binding stack is the shared global one, so code that never asks
-// for isolation behaves exactly as it always has. Per-goroutine isolation is
-// opt-in: a spawn hands the child a fresh ExecContext seeded from a snapshot of
-// the parent's (ec.Child()), so the two cannot interleave each other's
-// bindings, with no goroutine-id lookup and no reuse hazard.
+// default — its binding stack is the shared global one and its scope is the
+// root Goroutines scope, so code that never asks for isolation behaves exactly
+// as it always has. Per-goroutine isolation is explicit: a spawn hands the
+// child a fresh ExecContext seeded from a snapshot of the parent's
+// (ec.Child()) — carrying the parent's bindings and scope — so goroutines
+// cannot interleave each other's dynamic state, with no goroutine-id lookup and
+// no reuse hazard.
 type ExecContext struct {
 	bindings *bindingStack
+	// scope is the structured-concurrency scope this execution runs under
+	// (cancellation tree + tracked goroutines). nil means the root Goroutines
+	// scope; Scope() normalises that.
+	scope *Scope
 }
 
 // globalBindingStack backs RootExecContext (and the package-level Var binding
@@ -47,6 +54,43 @@ func (ec *ExecContext) Child() *ExecContext {
 	}
 	c := NewExecContext()
 	c.bindings.installSnapshot(src.bindings.snapshot())
+	c.scope = src.scope
+	return c
+}
+
+// Scope returns the structured-concurrency scope this context runs under,
+// normalising the nil (root) context to the process-wide Goroutines scope.
+// A nil receiver also resolves to the root.
+func (ec *ExecContext) Scope() *Scope {
+	if ec == nil || ec.scope == nil {
+		return Goroutines
+	}
+	return ec.scope
+}
+
+// Context returns the cancellation context blocking native ops (channel
+// take/put, alts!) select on — the scope's context.
+func (ec *ExecContext) Context() context.Context {
+	return ec.Scope().Context()
+}
+
+// SetScope installs s as this context's scope. Used by with-scope to open a
+// child scope for a dynamic extent and to restore the previous one on close.
+func (ec *ExecContext) SetScope(s *Scope) {
+	ec.scope = s
+}
+
+// OpenChildEC opens a child of ec's current scope and installs it on ec for a
+// synchronous dynamic extent (the with-scope body, which runs in the same
+// frame, hence the same ec). It returns the child; pair with CloseScoped, which
+// runs the restore that reinstates the previous scope. This is the
+// explicit-context replacement for the old goroutine-id-keyed OpenChild.
+func OpenChildEC(ec *ExecContext) *Scope {
+	ec = ec.orRoot()
+	prev := ec.scope
+	c := ec.Scope().Child()
+	c.closeRestore = func() { ec.scope = prev }
+	ec.SetScope(c)
 	return c
 }
 
@@ -107,11 +151,23 @@ func (ec *ExecContext) hasBinding(v *Var) bool {
 	return ec.orRoot().bindings.hasBinding(v)
 }
 
+// setBinding mutates v's top dynamic binding in this context (Clojure's
+// thread-local set!), returning false if v has no active binding here. Callers
+// fall back to mutating the root for the no-binding case.
+func (ec *ExecContext) setBinding(v *Var, val Value) bool {
+	return ec.orRoot().bindings.setCurrent(v, val)
+}
+
 // Exported entry points for runtime builtins (pkg/rt) that resolve dynamic
 // vars against an ExecContext handed to them by ec.Invoke.
 func (ec *ExecContext) PushBinding(v *Var, val Value) { ec.pushBinding(v, val) }
 func (ec *ExecContext) PopBinding(v *Var)             { ec.popBinding(v) }
 func (ec *ExecContext) Deref(v *Var) Value            { return ec.deref(v) }
+
+// SetBinding mutates v's top dynamic binding in this context (thread-local
+// set!), returning false if v has no active binding here so the caller can fall
+// back to the root. Exported for runtime builtins like in-ns.
+func (ec *ExecContext) SetBinding(v *Var, val Value) bool { return ec.setBinding(v, val) }
 
 // --- invocation (ec is the implementer) -------------------------------------
 
@@ -132,6 +188,10 @@ func (ec *ExecContext) Invoke(fn Fn, args []Value) (Value, error) {
 			return f.invokeCtx(ec, args)
 		}
 		return f.Invoke(args)
+	case *ProtocolFn:
+		return f.invokeIn(ec, args)
+	case *MultiFn:
+		return f.invokeIn(ec, args)
 	default:
 		return fn.Invoke(args)
 	}

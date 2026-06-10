@@ -420,7 +420,7 @@ func installAsyncNS() {
 	// alts! — select on multiple channel operations
 	// (alts! [ch1 ch2 [ch3 val]]) → [val port]
 	// Each entry is either a channel (take) or [channel value] (put).
-	altsf, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	altsf := vm.NewCtxNativeFn("alts!", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("alts! expects 1 arg (vector of ports)")
 		}
@@ -479,7 +479,7 @@ func installAsyncNS() {
 		cancelIdx := len(cases)
 		cases = append(cases, reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(vm.CurrentContext().Done()),
+			Chan: reflect.ValueOf(ec.Context().Done()),
 		})
 
 		chosen, value, ok := reflect.Select(cases)

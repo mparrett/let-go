@@ -795,7 +795,16 @@ func (f *Frame) Run() (Value, error) {
 			if !ok {
 				return NIL, NewExecutionError("SET_VAR invalid Var").Wrap(err)
 			}
-			varrd.SetRoot(val)
+			// (set! *v* val) mutates the current execution's top dynamic
+			// binding (thread-local, matching Clojure) when one is active.
+			// PERMISSIVE DEVIATION: with no binding in scope let-go falls
+			// through to mutating the root, whereas Clojure throws
+			// "Can't set!: ... from non-binding thread". This leniency is
+			// load-bearing — core test.lg's run-tests set!s *report-counters*
+			// etc. at the root with no surrounding binding.
+			if !f.ec.setBinding(varrd, val) {
+				varrd.SetRoot(val)
+			}
 			err = f.push(varr)
 			if err != nil {
 				return NIL, NewExecutionError("SET_VAR push var failed").Wrap(err)

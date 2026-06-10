@@ -3085,7 +3085,7 @@ func installLangNS() {
 		return f.Invoke(args)
 	})
 
-	inNs, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	inNs := vm.NewCtxNativeFn("in-ns", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
@@ -3094,7 +3094,14 @@ func installLangNS() {
 			return vm.NIL, fmt.Errorf("in-ns expected Symbol")
 		}
 		nns := LookupOrRegisterNSNoLoad(string(sym.(vm.Symbol)))
-		CurrentNS.SetRoot(nns)
+		// Switch the current namespace thread-locally when *ns* is dynamically
+		// bound on this context (a load/eval frame or a future), matching
+		// Clojure's (set! *ns* ...) — so concurrent threads don't stomp each
+		// other's *ns*. Only at the top level (no binding) does it fall through
+		// to the global root.
+		if !ec.SetBinding(CurrentNS, nns) {
+			CurrentNS.SetRoot(nns)
+		}
 		return nns, nil
 	})
 
@@ -3457,7 +3464,7 @@ func installLangNS() {
 		return vm.ArrayVector{old, vs[1]}, nil
 	})
 
-	gof, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	gof := vm.NewCtxNativeFn("go*", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
@@ -3466,13 +3473,16 @@ func installLangNS() {
 			return vm.NIL, fmt.Errorf("go expected Fn")
 		}
 		ret := make(vm.Chan)
-		vm.CurrentScope().Go(func(ctx context.Context) {
-			v, err := at.Invoke(nil)
+		// The block runs in a tracked goroutine of this execution's scope,
+		// under a child context seeded from the spawner's bindings + scope.
+		childEc := ec.Child()
+		ec.Scope().Go(func(ctx context.Context) {
+			v, err := childEc.Invoke(at, nil)
 			if err != nil {
 				// Async (go ...) error — route to *err*. Previously
 				// fmt.Println, which targets stdout despite being error
 				// output: double-wrong.
-				_ = WriteToErr(nil, fmt.Sprintln(err))
+				_ = WriteToErr(childEc, fmt.Sprintln(err))
 			}
 			// The result send is cancellable via the registry. (Channel
 			// ops <!/>! INSIDE the block are still synchronous and not yet
@@ -3496,11 +3506,13 @@ func installLangNS() {
 		return make(vm.Chan), nil
 	})
 
-	scopeOpen, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	scopeOpen := vm.NewCtxNativeFn("scope-open", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 0 {
 			return vm.NIL, fmt.Errorf("scope-open expects 0 arguments")
 		}
-		return vm.OpenChild(), nil
+		// Open a child of this execution's scope and install it on ec for the
+		// with-scope body's dynamic extent; scope-close! restores the prior one.
+		return vm.OpenChildEC(ec), nil
 	})
 
 	scopeClose, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -3540,7 +3552,7 @@ func installLangNS() {
 		return vm.FALSE, nil
 	})
 
-	chanput, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	chanput := vm.NewCtxNativeFn(">!", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 2 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
@@ -3562,17 +3574,17 @@ func installLangNS() {
 		select {
 		case ch <- vs[1]:
 			return vm.TRUE, nil
-		case <-vm.CurrentContext().Done():
+		case <-ec.Context().Done():
 			return vm.NIL, nil
 		}
 	})
 
-	changet, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	changet := vm.NewCtxNativeFn("<!", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
 		if pc, ok := asPromiseChan(vs[0]); ok {
-			return pc.take(vm.CurrentContext()), nil
+			return pc.take(ec.Context()), nil
 		}
 		ch, ok := vs[0].(vm.Chan)
 		if !ok {
@@ -3588,7 +3600,7 @@ func installLangNS() {
 				return vm.NIL, nil // closed — not an error
 			}
 			return v, nil
-		case <-vm.CurrentContext().Done():
+		case <-ec.Context().Done():
 			return vm.NIL, nil
 		}
 	})
@@ -5730,7 +5742,7 @@ func installLangNS() {
 		// clobber each other's, since each gets an independent child stack.
 		child := ec.Child()
 		p := vm.NewPromise()
-		vm.CurrentScope().Go(func(ctx context.Context) {
+		ec.Scope().Go(func(ctx context.Context) {
 			v, err := child.Invoke(fn, nil)
 			if err != nil {
 				p.Deliver(vm.NIL)
@@ -7366,7 +7378,7 @@ func installLangNS() {
 	ns.Def("make-multi-arity", makeMultiArityFn)
 
 	// sleep — sleep for n milliseconds
-	sleepf, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+	sleepf := vm.NewCtxNativeFn("sleep", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("sleep expects 1 arg")
 		}
@@ -7388,7 +7400,7 @@ func installLangNS() {
 		defer t.Stop()
 		select {
 		case <-t.C:
-		case <-vm.CurrentContext().Done():
+		case <-ec.Context().Done():
 		}
 		return vm.NIL, nil
 	})
@@ -7467,14 +7479,15 @@ func installLangNS() {
 	// backed IOHandle for the thunk's scope; restores via defer so a
 	// panicking thunk doesn't leak the binding.
 	//
-	// Concurrency caveat: vm.Var holds a single process-global binding
-	// stack guarded by bindingsMu (pkg/vm/var.go:38). Concurrent
-	// with-out-str calls on the same *out* DO NOT isolate captures from
-	// each other — their push/pop interleavings can cause one goroutine's
-	// println to land in another's buffer. This is no worse than the
-	// previous os.Stdout swap (which had the same global-state race),
-	// but it's also not better. Real isolation would require either
-	// goroutine-local binding stacks in vm.Var or external serialization.
+	// Concurrency caveat: with-out-str* is a non-context native — it rebinds
+	// *out* via outVar.PushBinding (which targets RootExecContext) and runs
+	// the thunk through plain Invoke, so it operates on the ROOT binding stack
+	// regardless of the calling goroutine. Concurrent with-out-str calls on
+	// different goroutines therefore DO NOT isolate captures from each other —
+	// their push/pop interleavings can route one goroutine's println into
+	// another's buffer. This is no worse than the previous os.Stdout swap (same
+	// global-state race), but no better. Real isolation would require making
+	// with-out-str* a CtxNativeFn that pushes *out* on the caller's child ec.
 	withOutStrf, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("with-out-str* expects 1 arg (a thunk)")

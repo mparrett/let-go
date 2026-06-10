@@ -13,21 +13,17 @@ import (
 )
 
 type Var struct {
-	// root and curr are atomic so Deref — by far the hottest var
-	// operation — is lock-free. Previously every Deref (even of a var
-	// with no dynamic binding) took the global bindingsMu just to check
-	// the binding stack, serializing all var reads across goroutines.
-	// curr holds the current dynamic top binding (nil = use root); it is
-	// kept in sync with the bindings stack by push/pop/RunWithBindings
-	// under bindingsMu (the cold path).
-	root     atomic.Pointer[Value] // root binding (lock-free read)
-	curr     atomic.Pointer[Value] // current dynamic top binding; nil = use root
-	bindings []Value               // full dynamic binding stack (guarded by bindingsMu)
-	nsref    *Namespace
-	ns       string
-	name     string
-	meta     Value
-	isMacro  bool
+	// root is atomic so Deref — by far the hottest var operation — is
+	// lock-free. Dynamic (thread-local) bindings no longer live on the Var;
+	// they are held by the ExecContext binding stack and resolved via
+	// RootExecContext.deref / ec.deref. Only the process-wide root binding
+	// remains here.
+	root    atomic.Pointer[Value] // root binding (lock-free read)
+	nsref   *Namespace
+	ns      string
+	name    string
+	meta    Value
+	isMacro bool
 	// isDynamic is atomic: push-binding/deref of a var can happen on different
 	// goroutines concurrently (e.g. two futures both `(binding [*v* ...] ...)`),
 	// so the dynamic flag is read on the hot deref path while being set by a
@@ -38,23 +34,8 @@ type Var struct {
 	watches   map[Value]Fn
 }
 
-var (
-	bindingsMu sync.Mutex
-	activeVars = map[*Var]struct{}{}
-)
-
 // valPtr boxes a Value for storage in an atomic.Pointer[Value].
 func valPtr(v Value) *Value { return &v }
-
-// syncCurrLocked refreshes the atomic current-binding pointer from the
-// bindings stack. Must be called while holding bindingsMu.
-func (v *Var) syncCurrLocked() {
-	if len(v.bindings) == 0 {
-		v.curr.Store(nil)
-	} else {
-		v.curr.Store(valPtr(v.bindings[len(v.bindings)-1]))
-	}
-}
 
 type BindingSnapshot map[*Var][]Value
 

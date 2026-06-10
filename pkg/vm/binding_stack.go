@@ -51,6 +51,22 @@ func (b *bindingStack) current(v *Var) (Value, bool) {
 	return nil, false
 }
 
+// setCurrent replaces the value of v's top dynamic binding in place, returning
+// true if a binding existed. This is the (set! *v* val) primitive: it mutates
+// only THIS context's top frame (thread-local in Clojure terms) and never the
+// root. A child context's frame is its own copy (Child snapshots it), so the
+// mutation stays isolated to this execution and does not leak to siblings or
+// the parent.
+func (b *bindingStack) setCurrent(v *Var, val Value) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if stack := b.bindings[v]; len(stack) > 0 {
+		stack[len(stack)-1] = val
+		return true
+	}
+	return false
+}
+
 func (b *bindingStack) hasBinding(v *Var) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()

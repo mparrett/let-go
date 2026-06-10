@@ -11,6 +11,46 @@ import (
 	"testing"
 )
 
+// TestExecContextSetBinding covers (set! *v* val) semantics at the context
+// level: it mutates the top binding frame of THIS context only (thread-local),
+// is visible to a subsequent deref, does not leak to a sibling context or the
+// root, and reports false (so callers can fall back to the root) when no
+// binding is active.
+func TestExecContextSetBinding(t *testing.T) {
+	v := NewVar(nil, "test", "m")
+	v.SetRoot(MakeInt(0))
+
+	c1 := RootExecContext.Child()
+	c2 := RootExecContext.Child()
+	c1.PushBinding(v, MakeInt(1))
+	c2.PushBinding(v, MakeInt(2))
+
+	// set! in c1 mutates c1's frame, visible to c1's deref...
+	if ok := c1.setBinding(v, MakeInt(11)); !ok {
+		t.Fatal("setBinding should report true when a binding is active")
+	}
+	if got := c1.deref(v).Unbox(); got != 11 {
+		t.Fatalf("c1 deref = %v, want 11 (set! must be visible within the binding)", got)
+	}
+	// ...but not c2's frame, nor the root.
+	if got := c2.deref(v).Unbox(); got != 2 {
+		t.Fatalf("c2 deref = %v, want 2 (sibling must not see c1's set!)", got)
+	}
+	if got := RootExecContext.deref(v).Unbox(); got != 0 {
+		t.Fatalf("root deref = %v, want 0 (set! must not leak to root)", got)
+	}
+
+	// No active binding for w: setBinding reports false (caller would root-set).
+	w := NewVar(nil, "test", "n")
+	w.SetRoot(MakeInt(7))
+	if ok := RootExecContext.setBinding(w, MakeInt(9)); ok {
+		t.Fatal("setBinding should report false when no binding is active")
+	}
+	if got := RootExecContext.deref(w).Unbox(); got != 7 {
+		t.Fatalf("root deref = %v, want 7 (setBinding must not create a binding)", got)
+	}
+}
+
 // TestExecContextChildIsolation proves two child contexts hold INDEPENDENT
 // dynamic bindings of the same var (distinct values), and that neither child's
 // push leaks back to the root. Distinct values are what make this a real

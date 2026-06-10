@@ -1,3 +1,9 @@
+---
+status: active
+last-verified: 2026-06-10
+human-verified:
+---
+
 # Threading an execution context (off goid)
 
 **Status:** design note / gating decision for the dynamic-binding refactor
