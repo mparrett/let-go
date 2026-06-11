@@ -6,7 +6,10 @@
 
 package vm
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // bindingStack is the dynamic-var binding state owned by a single
 // ExecContext. Unlike the process-global store it replaces, it is keyed by
@@ -14,18 +17,29 @@ import "sync"
 // each goroutine carrying its own ExecContext, with no goroutine-id lookup and
 // no cross-goroutine reuse hazard. The mutex guards against a value escaping to
 // a helper goroutine that shares the same context (rare, but cheap to be safe).
+//
+// active is an atomic count of bindings currently on the stack (across all
+// vars). It lets deref skip the mutex entirely when this context holds no
+// active binding — the common case for a declared-dynamic var read outside any
+// (binding …) extent, which otherwise still takes the lock because isDynamic is
+// the permanent declaration flag.
 type bindingStack struct {
 	mu       sync.Mutex
 	bindings BindingSnapshot // *Var -> stack of bound values (top = last)
+	active   atomic.Int64
 }
 
 func newBindingStack() *bindingStack {
 	return &bindingStack{bindings: make(BindingSnapshot)}
 }
 
+// anyActive reports, lock-free, whether this context holds any dynamic binding.
+func (b *bindingStack) anyActive() bool { return b.active.Load() > 0 }
+
 func (b *bindingStack) push(v *Var, val Value) {
 	b.mu.Lock()
 	b.bindings[v] = append(b.bindings[v], val)
+	b.active.Add(1)
 	b.mu.Unlock()
 }
 
@@ -38,6 +52,7 @@ func (b *bindingStack) pop(v *Var) {
 		} else {
 			b.bindings[v] = stack[:n-1]
 		}
+		b.active.Add(-1)
 	}
 	b.mu.Unlock()
 }
@@ -86,9 +101,12 @@ func (b *bindingStack) snapshot() BindingSnapshot {
 func (b *bindingStack) installSnapshot(snap BindingSnapshot) {
 	b.mu.Lock()
 	out := make(BindingSnapshot, len(snap))
+	total := int64(0)
 	for v, stack := range snap {
 		out[v] = append([]Value(nil), stack...)
+		total += int64(len(stack))
 	}
 	b.bindings = out
+	b.active.Store(total)
 	b.mu.Unlock()
 }

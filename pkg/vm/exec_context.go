@@ -130,7 +130,11 @@ func (ec *ExecContext) orRoot() *ExecContext {
 // any, else v's root.
 func (ec *ExecContext) deref(v *Var) Value {
 	ec = ec.orRoot()
-	if v.isDynamic.Load() {
+	// isDynamic is the permanent declaration flag, so it alone can't gate the
+	// lock. anyActive() is a lock-free check that skips the mutex when this
+	// context holds no binding at all — the common read of a ^:dynamic var
+	// outside any active (binding …) extent.
+	if v.isDynamic.Load() && ec.bindings.anyActive() {
 		if val, ok := ec.bindings.current(v); ok {
 			return val
 		}
