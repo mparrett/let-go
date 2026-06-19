@@ -83,7 +83,7 @@ func TestBuildCharts(t *testing.T) {
 		}),
 	}
 
-	charts := buildCharts(timeline)
+	charts := buildCharts(timeline, Baseline{}, "", defaultBudgetFraction)
 	if len(charts) != 3 {
 		t.Fatalf("chart count = %d, want 3", len(charts))
 	}
