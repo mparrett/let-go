@@ -41,9 +41,27 @@ long-standing "`make build` didn't actually regenerate" footgun.
 - **`go test ./...` / CI** — `TestGeneratedArtifactsAreFresh` in
   `pkg/genmanifest` fails when a source changed without `make generate`.
 - **`make check-generated`** — same check as a CLI (`cmd/check-generated`).
-- **git pre-commit hook** — `make install-hooks` symlinks `scripts/pre-commit`,
-  which blocks a commit with stale artifacts. **Note:** `jj` does not run git
-  hooks; jj users rely on the test + `make check-generated`.
+- **git pre-commit hook** — `scripts/pre-commit` blocks a commit with stale
+  artifacts once it's installed as `.git/hooks/pre-commit`. No make target wires
+  it up; symlink it by hand. **Note:** `jj` does not run git hooks; jj users rely
+  on the test + `make check-generated`.
+
+## Git merge driver for `core_compiled.lgb`
+
+`pkg/rt/core_compiled.lgb` is a binary bundle regenerated from the embedded
+`.lg` sources. Git cannot meaningfully merge this binary on rebase, so we ship a
+custom merge driver that regenerates it from sources *after* the `.lg` files
+have been merged as text.
+
+```sh
+make install-hooks
+```
+
+`make install-hooks` registers this merge driver (a `git config merge.lgb.*`
+pair). The config lives in `.git/config`, which is not shared, so each clone
+needs the registration once. After it, rebases and merges that touch any embedded
+`.lg` source regenerate the `.lgb` automatically — no binary merge conflicts when
+stacking PRs that edit `core.lg` and friends.
 
 ## `go build` cannot regenerate
 

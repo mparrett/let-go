@@ -10,6 +10,8 @@ human-verified: 2026-06-07
 
 Design plans, execution roadmaps, and policy for the let-go implementation. Each doc carries a `status:` frontmatter line indicating whether it's the current authority or has been superseded. See "What's current" below.
 
+User-facing reference (for writing/shipping let-go programs) lives under [`guide/`](guide/); the rest of `docs/` is contributor/implementation material.
+
 ## What's current
 
 `contribution-policy.md` is the most authoritative doc on overall direction (self-host as committed direction, `gogen_ir` deployment path, CI gates, callback error contract, `:go-deps` interop schema). Where it disagrees with older docs on direction, it wins.
@@ -36,6 +38,13 @@ Design plans, execution roadmaps, and policy for the let-go implementation. Each
 | Testing strategy, conformance | `testing-and-conformance.md` |
 | Perf ratchet, regression checkpoints, historical baselines | `perf/ratchet.md` |
 | Babashka pod support | `pods.md` |
+| Portable `.cljc` / `:lg` reader conditionals | `guide/portability.md` |
+| Version requirements, range matching (`let-go.semver`) | `guide/semver.md` |
+| `io/resource`, `-resource-paths` / `-source-paths` resolution | `guide/resources-and-source-paths.md` |
+| Embedding let-go in a Go program | `guide/embedding-in-go.md` |
+| nREPL server + editor setup | `guide/nrepl.md` |
+| Clojure compatibility: namespace table + differences | `guide/clojure-compatibility.md` |
+| Running, compiling, WASM, project mgmt (lgx) | `guide/usage.md` |
 | IR fixup / link pass | `els2023-ir-fixup-audit.md` |
 | Parallel IR lowering + determinism | `parallel-lowering-and-type-cache.md` |
 | Runtime I/O, host decoupling | `design/runtime-io-host-decoupling.md` |
