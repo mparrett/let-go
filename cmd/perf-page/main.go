@@ -26,6 +26,7 @@ type Baseline = perfdata.Baseline
 type Machine = perfdata.Machine
 type Anchor = perfdata.Anchor
 type BenchmarkEntry = perfdata.BenchmarkEntry
+type BenchmarkSample = perfdata.BenchmarkSample
 
 type BenchmarkRow struct {
 	FullName     string
@@ -62,13 +63,51 @@ type Chart struct {
 	YMax     float64
 	YMinText string
 	YMaxText string
+
+	// Reference line + regression budget band. The reference is the most
+	// recent frozen release baseline; the budget band marks the ratchet's
+	// regression ceiling (reference * (1+budget)) so "stay under the line"
+	// reads off the chart.
+	HasRef   bool
+	RefY     float64
+	RefLabel string
+
+	ShowRefLine bool // draw the dashed line in-plot; false when the reference is off-scale
+
+	HasBudget  bool
+	BudgetY    float64 // y of the regression ceiling (top edge of the danger band)
+	BudgetText string  // e.g. "±5%"
+	RefLegend  string  // reference's legend entry, e.g. "v1.8.0 = 599M ↑" (↑/↓ marks off-scale)
+
+	// Latest point's standing vs the reference (the status pill).
+	Status      string
+	StatusClass string // good | bad | flat | none
+
+	XTicks []ChartXTick
+
+	// Per-snapshot delta between the two series (series[1] vs series[0]),
+	// e.g. "how much faster aot_native is than ir_bytecode" at each point.
+	Deltas       []ChartDelta
+	DeltaCaption string // footer caption, e.g. "Δ aot_native vs ir_bytecode"
+}
+
+type ChartXTick struct {
+	X     float64
+	Label string
+}
+
+type ChartDelta struct {
+	X    float64
+	Y    float64
+	Text string
 }
 
 type ChartSeries struct {
-	Label  string
-	Color  string
-	Path   string
-	Points []ChartPoint
+	Label    string
+	Color    string
+	Path     string // line; subpaths restart (M) across missing snapshots so gaps don't bridge
+	BandPath string // variance envelope (sample min..max), one closed subpath per contiguous run
+	Points   []ChartPoint
 }
 
 type ChartPoint struct {
@@ -79,6 +118,16 @@ type ChartPoint struct {
 	SHA   string
 	Value float64
 	Text  string
+
+	// Per-run sample envelope: Low/High are the spread's metric values,
+	// LowY/HighY their pixel-y. HasBand is false when a snapshot carried <2
+	// samples (nothing to spread), so the band collapses to the point.
+	Low     float64
+	High    float64
+	LowY    float64
+	HighY   float64
+	HasBand bool
+	Spread  string // the "low .. high" fragment shown in the point's hover tooltip
 }
 
 type Summary struct {
@@ -314,7 +363,7 @@ func buildPage(current, reference Baseline, referenceName string, timeline []Sna
 		ReferenceName:     referenceName,
 		Summary:           summary,
 		Timeline:          timeline,
-		Charts:            buildCharts(timeline),
+		Charts:            buildCharts(timeline, reference, referenceName, defaultBudgetFraction),
 		Rows:              rows,
 		TopImprovements:   improvements,
 		TopSlowdowns:      slowdowns,
@@ -322,64 +371,98 @@ func buildPage(current, reference Baseline, referenceName string, timeline []Sna
 	}
 }
 
-func buildCharts(timeline []Snapshot) []Chart {
+// defaultBudgetFraction mirrors bench-ratchet's regression budget (5%): the
+// reference line plus this margin is the ceiling a benchmark must stay under.
+const defaultBudgetFraction = 0.05
+
+func buildCharts(timeline []Snapshot, reference Baseline, referenceName string, budget float64) []Chart {
+	const (
+		suite = "github.com/nooga/let-go/test.BenchmarkClojureTestSuite"
+		ir    = "github.com/nooga/let-go/pkg/ir.BenchmarkIRCompile"
+	)
+	// Series carry candidate keys in priority order: the benchmark name has
+	// grown a "[variant]" suffix over time (bytecode → ir_bytecode,
+	// gogen_ir → aot_native). Matching the first key that exists keeps a
+	// logical series continuous across the rename instead of silently
+	// dropping to an empty chart.
+	suiteSeries := []chartSeriesSpec{
+		{label: "ir_bytecode", color: "#245c73", names: []string{suite + " [ir_bytecode]", suite + " [bytecode]"}},
+		{label: "aot_native", color: "#167a48", names: []string{suite + " [aot_native]", suite + " [gogen_ir]"}},
+	}
 	specs := []struct {
 		title    string
 		subtitle string
-		unit     string
+		unit     string // used as-is for absolute charts; relative charts override it
 		metric   func(BenchmarkEntry) float64
+		sample   func(BenchmarkSample) float64
 		format   func(float64) string
 		series   []chartSeriesSpec
+		refKeys  []string // keys to try in the reference baseline (release line)
+		relative bool     // plot % vs reference (or first run) instead of raw values
 	}{
 		{
 			title:    "End-to-end suite",
-			subtitle: "Anchor-normalized jank clojure-test-suite wall time. Lower is better.",
-			unit:     "anchors",
-			metric:   func(entry BenchmarkEntry) float64 { return entry.RatioToAnchor },
+			subtitle: "Wall time relative to the release. Lower is better.",
+			metric:   func(e BenchmarkEntry) float64 { return e.RatioToAnchor },
+			sample:   func(s BenchmarkSample) float64 { return s.RatioToAnchor },
 			format:   formatRatio,
-			series: []chartSeriesSpec{
-				{label: "bytecode", color: "#245c73", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [bytecode]"},
-				{label: "gogen_ir", color: "#167a48", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [gogen_ir]"},
-			},
+			series:   suiteSeries,
+			refKeys:  []string{suite, suite + " [ir_bytecode]", suite + " [bytecode]"},
+			relative: true,
 		},
 		{
 			title:    "IR compile",
-			subtitle: "Anchor-normalized IR compile benchmark variants. Lower is better.",
-			unit:     "anchors",
-			metric:   func(entry BenchmarkEntry) float64 { return entry.RatioToAnchor },
+			subtitle: "Compile time relative to the window start. Lower is better.",
+			metric:   func(e BenchmarkEntry) float64 { return e.RatioToAnchor },
+			sample:   func(s BenchmarkSample) float64 { return s.RatioToAnchor },
 			format:   formatRatio,
 			series: []chartSeriesSpec{
-				{label: "bytecode", color: "#245c73", name: "github.com/nooga/let-go/pkg/ir.BenchmarkIRCompile [bytecode]"},
-				{label: "gogen_ir", color: "#167a48", name: "github.com/nooga/let-go/pkg/ir.BenchmarkIRCompile [gogen_ir]"},
+				{label: "bytecode", color: "#245c73", names: []string{ir + " [bytecode]"}},
+				{label: "gogen_ir", color: "#167a48", names: []string{ir + " [gogen_ir]"}},
 			},
+			refKeys:  []string{ir, ir + " [bytecode]"},
+			relative: true,
 		},
 		{
 			title:    "Suite allocations",
-			subtitle: "allocs/op for the full suite benchmark variants. Lower is better.",
+			subtitle: "Allocations per op, both variants. Lower is better.",
 			unit:     "allocs/op",
-			metric:   func(entry BenchmarkEntry) float64 { return float64(entry.AllocsPerOp) },
+			metric:   func(e BenchmarkEntry) float64 { return float64(e.AllocsPerOp) },
+			sample:   func(s BenchmarkSample) float64 { return float64(s.AllocsPerOp) },
 			format:   formatCount,
-			series: []chartSeriesSpec{
-				{label: "bytecode", color: "#245c73", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [bytecode]"},
-				{label: "gogen_ir", color: "#167a48", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [gogen_ir]"},
-			},
+			series:   suiteSeries,
 		},
 		{
 			title:    "Suite memory",
-			subtitle: "bytes/op for the full suite benchmark variants. Lower is better.",
+			subtitle: "Heap bytes per op, both variants. Lower is better.",
 			unit:     "B/op",
-			metric:   func(entry BenchmarkEntry) float64 { return float64(entry.BytesPerOp) },
+			metric:   func(e BenchmarkEntry) float64 { return float64(e.BytesPerOp) },
+			sample:   func(s BenchmarkSample) float64 { return float64(s.BytesPerOp) },
 			format:   formatBytes,
-			series: []chartSeriesSpec{
-				{label: "bytecode", color: "#245c73", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [bytecode]"},
-				{label: "gogen_ir", color: "#167a48", name: "github.com/nooga/let-go/test.BenchmarkClojureTestSuite [gogen_ir]"},
-			},
+			series:   suiteSeries,
 		},
 	}
 
 	charts := make([]Chart, 0, len(specs))
 	for _, spec := range specs {
-		chart := buildChart(timeline, spec.title, spec.subtitle, spec.unit, spec.metric, spec.format, spec.series)
+		refVal := 0.0
+		if len(spec.refKeys) > 0 {
+			refVal = lookupRef(reference, spec.refKeys, spec.metric)
+		}
+		refLabel := ""
+		if refVal > 0 {
+			refLabel = referenceName
+		}
+		unit := spec.unit
+		if spec.relative {
+			if refVal > 0 {
+				unit = "% vs " + referenceName
+			} else {
+				unit = "% vs first run"
+			}
+		}
+		chart := buildChart(timeline, spec.title, spec.subtitle, unit,
+			spec.metric, spec.sample, spec.format, spec.series, refVal, refLabel, budget, spec.relative)
 		if len(chart.Series) > 0 {
 			charts = append(charts, chart)
 		}
@@ -387,13 +470,29 @@ func buildCharts(timeline []Snapshot) []Chart {
 	return charts
 }
 
+// lookupRef returns the first reference benchmark found among keys, as the
+// chart metric. Zero means no reference (e.g. IRCompile predates the release).
+func lookupRef(reference Baseline, keys []string, metric func(BenchmarkEntry) float64) float64 {
+	for _, k := range keys {
+		if e, ok := reference.Benchmarks[k]; ok {
+			if v := metric(e); v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
 type chartSeriesSpec struct {
 	label string
 	color string
-	name  string
+	names []string // candidate keys, first match wins (tolerates variant renames)
 }
 
-func buildChart(timeline []Snapshot, title, subtitle, unit string, metric func(BenchmarkEntry) float64, format func(float64) string, specs []chartSeriesSpec) Chart {
+func buildChart(timeline []Snapshot, title, subtitle, unit string,
+	metric func(BenchmarkEntry) float64, sampleMetric func(BenchmarkSample) float64,
+	format func(float64) string, specs []chartSeriesSpec,
+	refVal float64, refLabel string, budget float64, relative bool) Chart {
 	const (
 		left   = 46.0
 		right  = 18.0
@@ -404,18 +503,19 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string, metric func(B
 	)
 	plotW := width - left - right
 	plotH := height - top - bottom
-	yMin := math.Inf(1)
-	yMax := math.Inf(-1)
-	series := make([]ChartSeries, 0, len(specs))
 
+	// Pass 1: collect raw metric values. Value/Low/High hold raw numbers until
+	// the display transform below; range tracking waits until the relative
+	// basis is known.
+	series := make([]ChartSeries, 0, len(specs))
+	oldestRaw, oldestIdx := 0.0, math.MaxInt
+	// Latest plotted value per series, for a worst-case status across all
+	// series rather than whichever series sorts first (see chartStatus).
+	var latest []seriesLatest
 	for _, spec := range specs {
-		var raw []struct {
-			index int
-			snap  Snapshot
-			value float64
-		}
+		var pts []ChartPoint
 		for i, snap := range timeline {
-			entry, ok := snap.Baseline.Benchmarks[spec.name]
+			entry, ok := lookupEntry(snap.Baseline.Benchmarks, spec.names)
 			if !ok {
 				continue
 			}
@@ -423,77 +523,448 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string, metric func(B
 			if value <= 0 {
 				continue
 			}
-			raw = append(raw, struct {
-				index int
-				snap  Snapshot
-				value float64
-			}{index: i, snap: snap, value: value})
-			if value < yMin {
-				yMin = value
+			lo, hi, hasBand := sampleSpread(entry.Samples, sampleMetric)
+			if !hasBand {
+				lo, hi = value, value
 			}
-			if value > yMax {
-				yMax = value
+			pts = append(pts, ChartPoint{
+				Index: i,
+				Date:  formatDate(snap.Baseline.CapturedAt),
+				SHA:   shortSHA(snap.Baseline.CapturedAtSHA),
+				Value: value, Low: lo, High: hi, HasBand: hasBand,
+			})
+			if i < oldestIdx {
+				oldestIdx, oldestRaw = i, value
 			}
 		}
-		if len(raw) == 0 {
+		if len(pts) == 0 {
 			continue
 		}
-		series = append(series, ChartSeries{
-			Label:  spec.label,
-			Color:  spec.color,
-			Points: make([]ChartPoint, 0, len(raw)),
-		})
-		for _, item := range raw {
-			series[len(series)-1].Points = append(series[len(series)-1].Points, ChartPoint{
-				Index: item.index,
-				Date:  formatDate(item.snap.Baseline.CapturedAt),
-				SHA:   shortSHA(item.snap.Baseline.CapturedAtSHA),
-				Value: item.value,
-				Text:  format(item.value),
-			})
-		}
+		// pts are appended in ascending timeline order, so the last is latest.
+		latest = append(latest, seriesLatest{label: spec.label, value: pts[len(pts)-1].Value})
+		series = append(series, ChartSeries{Label: spec.label, Color: spec.color, Points: pts})
 	}
-
 	if len(series) == 0 {
 		return Chart{}
 	}
+
+	// Inter-series gap (series[1] vs series[0]) per shared snapshot, captured
+	// from RAW values before the display transform below overwrites them.
+	type rawDelta struct {
+		index int
+		delta float64
+	}
+	var deltasRaw []rawDelta
+	if len(series) == 2 {
+		base := make(map[int]float64, len(series[0].Points))
+		for _, p := range series[0].Points {
+			base[p.Index] = p.Value
+		}
+		for _, p := range series[1].Points {
+			if v0, ok := base[p.Index]; ok && v0 > 0 {
+				deltasRaw = append(deltasRaw, rawDelta{p.Index, p.Value/v0 - 1})
+			}
+		}
+	}
+
+	// Relative mode plots every point as a fraction of a basis — the release
+	// reference when present, else the oldest run in the window. This keeps the
+	// baseline at a fixed on-scale coordinate (0) and turns the huge raw anchor
+	// ratios into readable percentages.
+	basis := 0.0
+	if relative {
+		if refVal > 0 {
+			basis = refVal
+		} else {
+			basis = oldestRaw
+		}
+		if basis <= 0 {
+			relative = false
+		}
+	}
+	disp := func(raw float64) float64 {
+		if relative {
+			return raw/basis - 1
+		}
+		return raw
+	}
+	fmtv := func(raw float64) string {
+		if relative {
+			return formatPct(raw/basis - 1)
+		}
+		return format(raw)
+	}
+
+	yMin, yMax := math.Inf(1), math.Inf(-1)
+	note := func(v float64) {
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			return
+		}
+		if v < yMin {
+			yMin = v
+		}
+		if v > yMax {
+			yMax = v
+		}
+	}
+
+	hasRef := refVal > 0
+	hasBudget := hasRef && budget > 0
+
+	// Pass 2: raw → display, format, and track the y-range.
+	for si := range series {
+		for pi := range series[si].Points {
+			p := &series[si].Points[pi]
+			rawV, rawLo, rawHi := p.Value, p.Low, p.High
+			p.Text = fmtv(rawV)
+			if p.HasBand {
+				p.Spread = fmtv(rawLo) + " .. " + fmtv(rawHi)
+			}
+			p.Value, p.Low, p.High = disp(rawV), disp(rawLo), disp(rawHi)
+			note(p.Value)
+			note(p.Low)
+			note(p.High)
+		}
+	}
+
 	if yMin == yMax {
 		yMin *= 0.95
 		yMax *= 1.05
 		if yMin == yMax {
-			yMin = 0
-			yMax = 1
+			yMin, yMax = 0, 1
 		}
 	}
-	if yMin > 0 {
-		padding := (yMax - yMin) * 0.08
-		yMin -= padding
-		yMax += padding
-	}
+	pad := (yMax - yMin) * 0.08
+	yMin -= pad
+	yMax += pad
+
+	yOf := func(v float64) float64 { return top + ((yMax-v)/(yMax-yMin))*plotH }
+	denom := float64(maxInt(len(timeline)-1, 1))
+	xOf := func(index int) float64 { return left + (float64(index)/denom)*plotW }
+
+	tickSet := map[int]struct{}{}
 	for si := range series {
-		pathParts := make([]string, 0, len(series[si].Points))
 		for pi := range series[si].Points {
-			point := &series[si].Points[pi]
-			denom := float64(maxInt(len(timeline)-1, 1))
-			point.X = left + (float64(point.Index)/denom)*plotW
-			point.Y = top + ((yMax-point.Value)/(yMax-yMin))*plotH
-			cmd := "L"
-			if pi == 0 {
-				cmd = "M"
-			}
-			pathParts = append(pathParts, fmt.Sprintf("%s %.2f %.2f", cmd, point.X, point.Y))
+			p := &series[si].Points[pi]
+			p.X = xOf(p.Index)
+			p.Y = yOf(p.Value)
+			p.LowY = yOf(p.Low)
+			p.HighY = yOf(p.High)
+			tickSet[p.Index] = struct{}{}
 		}
-		series[si].Path = strings.Join(pathParts, " ")
+		series[si].Path = brokenLinePath(series[si].Points)
+		series[si].BandPath = bandPath(series[si].Points)
 	}
-	return Chart{
+
+	yMinText, yMaxText, axisUnit := axisLabels(yMin, yMax, unit, relative, format)
+	chart := Chart{
 		Title:    title,
 		Subtitle: subtitle,
-		Unit:     unit,
+		Unit:     axisUnit,
 		Series:   series,
 		YMin:     yMin,
 		YMax:     yMax,
-		YMinText: format(yMin),
-		YMaxText: format(yMax),
+		YMinText: yMinText,
+		YMaxText: yMaxText,
+		XTicks:   buildXTicks(timeline, tickSet, xOf),
+	}
+
+	if len(deltasRaw) > 0 {
+		yAt := func(si, index int) (float64, bool) {
+			for _, p := range series[si].Points {
+				if p.Index == index {
+					return p.Y, true
+				}
+			}
+			return 0, false
+		}
+		// Thin to a readable number of labels on dense timelines (always keep
+		// the latest); the lines themselves still show every point. A min
+		// horizontal gap then prevents adjacent labels (and the strided run
+		// meeting the forced last) from overprinting.
+		const maxGapLabels = 6
+		const minGapPx = 56.0
+		stride := 1
+		if len(deltasRaw) > maxGapLabels {
+			stride = (len(deltasRaw) + maxGapLabels - 1) / maxGapLabels
+		}
+		for n, g := range deltasRaw {
+			if n%stride != 0 && n != len(deltasRaw)-1 {
+				continue
+			}
+			x := xOf(g.index)
+			if k := len(chart.Deltas); k > 0 && x-chart.Deltas[k-1].X < minGapPx {
+				chart.Deltas = chart.Deltas[:k-1] // drop the crowded predecessor, keep the later one
+			}
+			y0, _ := yAt(0, g.index)
+			y1, _ := yAt(1, g.index)
+			upper, lower := math.Min(y0, y1), math.Max(y0, y1)
+			labelY := upper - 9 // above the higher point, with clearance
+			if upper < top+16 {
+				labelY = lower + 15 // too close to the top axis — drop below the pair
+			}
+			chart.Deltas = append(chart.Deltas, ChartDelta{X: x, Y: labelY, Text: formatPct(g.delta)})
+		}
+		chart.DeltaCaption = "Δ " + series[1].Label + " vs " + series[0].Label
+	}
+
+	switch {
+	case hasRef:
+		// The reference and budget are evaluated in display space. We never
+		// stretch the axis to include them: when off-scale (the usual case in
+		// relative mode, where 0% sits above an all-negative data range) they
+		// show as a legend marker; when the data rises within range of the
+		// ceiling, the line and budget band draw in place automatically.
+		refDisp := disp(refVal)
+		chart.HasRef = true
+		chart.RefLabel = refLabel
+		// Keep the absolute magnitude of the 0 baseline visible; the axis unit
+		// ("% vs <ref>") already says it's the 0% line, so the chip stays terse.
+		chart.RefLegend = refLabel + " = " + format(refVal)
+		switch {
+		case refDisp >= yMin && refDisp <= yMax:
+			chart.ShowRefLine = true
+			chart.RefY = yOf(refDisp)
+			if hasBudget {
+				chart.HasBudget = true
+				chart.BudgetY = math.Max(yOf(disp(refVal*(1+budget))), top)
+				chart.BudgetText = fmt.Sprintf("±%.0f%%", budget*100)
+			}
+		case refDisp > yMax:
+			chart.RefLegend += " ↑" // 0% baseline is above the plotted range
+		default:
+			chart.RefLegend += " ↓"
+		}
+	case relative:
+		// No release reference: the baseline is the first run in the window,
+		// which is a real plotted point at 0%, so the line stays in range.
+		chart.HasRef = true
+		chart.ShowRefLine = true
+		chart.RefY = yOf(0)
+		chart.RefLabel = "first run"
+		chart.RefLegend = "first run = " + format(basis)
+	}
+
+	chart.Status, chart.StatusClass = chartStatus(latest, refVal, refLabel, budget)
+	return chart
+}
+
+// axisLabels formats the y-axis bound labels and resolves the axis unit. For
+// absolute charts it picks ONE scale from the larger bound and emits bare
+// numbers (e.g. "1.19" / "0.538" with the unit "GiB/op" carried in the meta
+// line) — long per-label strings like "1.185 GiB" overflow the narrow left
+// margin and pick inconsistent units (537.9 MiB vs 1.185 GiB) between bounds.
+func axisLabels(yMin, yMax float64, unit string, relative bool, format func(float64) string) (minText, maxText, axisUnit string) {
+	switch {
+	case relative:
+		return formatPct(yMin), formatPct(yMax), unit
+	case unit == "B/op":
+		f, u := pickBytesScale(yMax)
+		return trimAxisNum(yMin / f), trimAxisNum(yMax / f), u + "/op"
+	case strings.Contains(unit, "allocs"):
+		f, u := pickCountScale(yMax)
+		return trimAxisNum(yMin / f), trimAxisNum(yMax / f), strings.TrimSpace(u + " allocs/op")
+	default:
+		return format(yMin), format(yMax), unit
+	}
+}
+
+func pickBytesScale(v float64) (float64, string) {
+	switch {
+	case v >= 1<<30:
+		return 1 << 30, "GiB"
+	case v >= 1<<20:
+		return 1 << 20, "MiB"
+	case v >= 1<<10:
+		return 1 << 10, "KiB"
+	default:
+		return 1, "B"
+	}
+}
+
+func pickCountScale(v float64) (float64, string) {
+	switch {
+	case v >= 1e9:
+		return 1e9, "G"
+	case v >= 1e6:
+		return 1e6, "M"
+	case v >= 1e3:
+		return 1e3, "k"
+	default:
+		return 1, ""
+	}
+}
+
+// trimAxisNum renders ~3 significant figures, trailing zeros trimmed.
+func trimAxisNum(v float64) string { return fmt.Sprintf("%.3g", v) }
+
+func lookupEntry(benchmarks map[string]BenchmarkEntry, names []string) (BenchmarkEntry, bool) {
+	for _, n := range names {
+		if e, ok := benchmarks[n]; ok {
+			return e, true
+		}
+	}
+	return BenchmarkEntry{}, false
+}
+
+func sampleSpread(samples []BenchmarkSample, metric func(BenchmarkSample) float64) (lo, hi float64, ok bool) {
+	lo, hi = math.Inf(1), math.Inf(-1)
+	n := 0
+	for _, s := range samples {
+		v := metric(s)
+		if v <= 0 {
+			continue
+		}
+		n++
+		if v < lo {
+			lo = v
+		}
+		if v > hi {
+			hi = v
+		}
+	}
+	if n < 2 || lo == hi {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+// brokenLinePath restarts the subpath (M) wherever consecutive plotted points
+// skip a snapshot, so a gap in the data reads as a gap instead of a straight
+// line bridging across missing runs.
+func brokenLinePath(points []ChartPoint) string {
+	parts := make([]string, 0, len(points))
+	for i := range points {
+		cmd := "L"
+		if i == 0 || points[i].Index != points[i-1].Index+1 {
+			cmd = "M"
+		}
+		parts = append(parts, fmt.Sprintf("%s %.2f %.2f", cmd, points[i].X, points[i].Y))
+	}
+	return strings.Join(parts, " ")
+}
+
+// bandPath builds the sample min..max envelope as one closed polygon per
+// contiguous run of band-bearing points (top edge left-to-right, bottom edge
+// back). Runs break on the same gaps as the line.
+func bandPath(points []ChartPoint) string {
+	var b strings.Builder
+	i := 0
+	for i < len(points) {
+		if !points[i].HasBand {
+			i++
+			continue
+		}
+		j := i
+		for j+1 < len(points) && points[j+1].HasBand && points[j+1].Index == points[j].Index+1 {
+			j++
+		}
+		if j == i {
+			i++
+			continue // a lone banded point has no width to fill
+		}
+		for k := i; k <= j; k++ {
+			cmd := "L"
+			if k == i {
+				cmd = "M"
+			}
+			fmt.Fprintf(&b, "%s %.2f %.2f ", cmd, points[k].X, points[k].HighY)
+		}
+		for k := j; k >= i; k-- {
+			fmt.Fprintf(&b, "L %.2f %.2f ", points[k].X, points[k].LowY)
+		}
+		b.WriteString("Z ")
+		i = j + 1
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// buildXTicks labels snapshot positions with a short capture date ("Jun 04"),
+// thinned to at most 8 so a long timeline doesn't crowd the axis. The exact
+// timestamp + SHA stay in each point's hover tooltip — dates are low-entropy
+// and scannable as axis labels; SHAs are not.
+func buildXTicks(timeline []Snapshot, present map[int]struct{}, xOf func(int) float64) []ChartXTick {
+	idx := make([]int, 0, len(present))
+	for i := range present {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	if len(idx) == 0 {
+		return nil
+	}
+	stride := 1
+	if len(idx) > 8 {
+		stride = (len(idx) + 7) / 8
+	}
+	// A "Jun 04" label at ~8.5px needs ~44px of clearance so adjacent ticks
+	// (and the strided run meeting the forced last) don't collide.
+	const minGapPx = 44.0
+	last := idx[len(idx)-1]
+	ticks := make([]ChartXTick, 0, 8)
+	add := func(i int) {
+		x := xOf(i)
+		label := tickDate(timeline[i].Baseline.CapturedAt)
+		// Drop the previous tick if the new one would crowd it, or if it
+		// repeats the same date (e.g. two same-day snapshots); keep the later.
+		if n := len(ticks); n > 0 && (x-ticks[n-1].X < minGapPx || ticks[n-1].Label == label) {
+			ticks = ticks[:n-1]
+		}
+		ticks = append(ticks, ChartXTick{X: x, Label: label})
+	}
+	for n, i := range idx {
+		if i == last || n%stride == 0 {
+			add(i)
+		}
+	}
+	return ticks
+}
+
+// tickDate renders a capture timestamp as a short, scannable axis label.
+func tickDate(captured string) string {
+	t, err := time.Parse(time.RFC3339, captured)
+	if err != nil {
+		return ""
+	}
+	return t.UTC().Format("Jan 02")
+}
+
+// seriesLatest is a series' most recent plotted value, kept so chartStatus can
+// pick the worst across series instead of trusting whichever sorts first.
+type seriesLatest struct {
+	label string
+	value float64
+}
+
+// chartStatus summarizes the latest points against the reference line. With
+// multiple series it reports the worst (highest, since lower is better) latest
+// value and names the series, so the single status pill can't silently hide a
+// regression in a non-first series.
+func chartStatus(latest []seriesLatest, refVal float64, refLabel string, budget float64) (string, string) {
+	if refVal <= 0 {
+		return "no release reference", "none"
+	}
+	if len(latest) == 0 {
+		return "no recent data", "none"
+	}
+	worst := latest[0]
+	for _, s := range latest[1:] {
+		if s.value > worst.value {
+			worst = s
+		}
+	}
+	delta := worst.value/refVal - 1
+	pctText := fmt.Sprintf("%.0f%%", math.Abs(delta)*100)
+	suffix := ""
+	if len(latest) > 1 {
+		suffix = " (" + worst.label + ")"
+	}
+	switch {
+	case delta > budget:
+		return pctText + " over " + refLabel + suffix, "bad"
+	case delta < -budget:
+		return pctText + " under " + refLabel + suffix, "good"
+	default:
+		return "within budget vs " + refLabel, "flat"
 	}
 }
 
@@ -657,6 +1128,7 @@ func renderPage(page PageData) ([]byte, error) {
 		"deltaClass": deltaClass,
 		"deltaText":  deltaText,
 		"bar":        formatBar,
+		"sub":        func(a, b float64) float64 { return a - b },
 	}
 	tmpl, err := template.New("page").Funcs(funcs).Parse(pageTemplate)
 	if err != nil {
@@ -778,8 +1250,8 @@ func formatPct(value float64) string {
 }
 
 func deltaClass(value *float64) string {
-	if value == nil {
-		return "muted"
+	if value == nil || math.Abs(*value) < 0.0005 {
+		return "muted" // not in reference, or unchanged — don't color it
 	}
 	if *value <= -0.05 {
 		return "good"
@@ -793,6 +1265,9 @@ func deltaClass(value *float64) string {
 func deltaText(value *float64) string {
 	if value == nil {
 		return "new"
+	}
+	if math.Abs(*value) < 0.0005 {
+		return "—" // unchanged vs reference; "+0.0%" reads like a regression
 	}
 	return formatPct(*value)
 }
@@ -999,6 +1474,26 @@ const pageTemplate = `<!doctype html>
       color: var(--muted);
       font-size: 12px;
     }
+    /* Axis-unit + delta-descriptor line, between subtitle and chart. */
+    /* Footer row under the chart: axis-unit + Δ descriptor on the left,
+       series/reference legend on the right. */
+    .chart-foot {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 6px 16px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .chart-meta {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-style: italic;
+      font-variant-numeric: tabular-nums;
+    }
+    .chart-unit { font-weight: 650; }
+    .gap-delta { opacity: 0.9; }
     .chart svg {
       width: 100%;
       height: auto;
@@ -1022,15 +1517,65 @@ const pageTemplate = `<!doctype html>
     }
     .point {
       stroke: var(--paper);
-      stroke-width: 2;
+      stroke-width: 1.6;
     }
+    .chart-band {
+      opacity: 0.16;
+      stroke: none;
+    }
+    .ref-line {
+      stroke: var(--ink);
+      stroke-width: 1;
+      stroke-dasharray: 4 3;
+      opacity: 0.5;
+    }
+    .budget-band {
+      fill: var(--red);
+      opacity: 0.08;
+    }
+    .tick {
+      stroke: var(--line);
+      stroke-width: 1;
+    }
+    .tick-label {
+      fill: var(--muted);
+      font-size: 9.5px;
+      text-anchor: middle;
+      font-variant-numeric: tabular-nums;
+    }
+    .gap-label {
+      fill: var(--muted);
+      font-size: 8.5px;
+      font-weight: 700;
+      text-anchor: middle;
+      font-variant-numeric: tabular-nums;
+    }
+    .chart-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .status {
+      font-size: 11px;
+      font-weight: 720;
+      padding: 2px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .status.good { color: var(--green); background: var(--green-bg); }
+    .status.bad { color: var(--red); background: var(--red-bg); }
+    .status.flat { color: var(--amber); background: var(--amber-bg); }
     .legend {
       display: flex;
-      gap: 12px;
+      column-gap: 14px;
+      row-gap: 5px;
       flex-wrap: wrap;
-      margin-top: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-left: auto; /* keep the legend right-aligned even when it wraps below the meta */
       color: var(--muted);
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 650;
     }
     .legend span {
@@ -1044,6 +1589,18 @@ const pageTemplate = `<!doctype html>
       border-radius: 999px;
       background: var(--series);
       display: inline-block;
+    }
+    .swatch.dash {
+      background: none;
+      border-top: 1px dashed var(--ink);
+      opacity: 0.6;
+      height: 0;
+    }
+    .swatch.budget {
+      height: 10px;
+      border-radius: 2px;
+      background: var(--red);
+      opacity: 0.18;
     }
     table {
       width: 100%;
@@ -1206,28 +1763,43 @@ const pageTemplate = `<!doctype html>
       <div class="chart-grid">
         {{range .Charts}}
         <article class="chart">
-          <h3>{{.Title}}</h3>
+          <div class="chart-head">
+            <h3>{{.Title}}</h3>
+            {{if ne .StatusClass "none"}}<span class="status {{.StatusClass}}">{{.Status}}</span>{{end}}
+          </div>
           <p>{{.Subtitle}}</p>
           <svg viewBox="0 0 520 210" role="img" aria-label="{{.Title}} trend chart">
+            {{if .HasBudget}}<rect class="budget-band" x="46" y="{{printf "%.2f" .BudgetY}}" width="456" height="{{printf "%.2f" (sub .RefY .BudgetY)}}"></rect>{{end}}
+            {{if .ShowRefLine}}<line class="ref-line" x1="46" y1="{{printf "%.2f" .RefY}}" x2="502" y2="{{printf "%.2f" .RefY}}"></line>{{end}}
             <line class="axis" x1="46" y1="22" x2="46" y2="176"></line>
             <line class="axis" x1="46" y1="176" x2="502" y2="176"></line>
-            <text class="axis-label" x="4" y="29">{{.YMaxText}}</text>
-            <text class="axis-label" x="4" y="176">{{.YMinText}}</text>
-            <text class="axis-label" x="4" y="194">{{.Unit}}</text>
-            <text class="axis-label" x="46" y="204">older</text>
-            <text class="axis-label" x="461" y="204">newer</text>
+            <text class="axis-label" x="42" y="26" text-anchor="end">{{.YMaxText}}</text>
+            <text class="axis-label" x="42" y="173" text-anchor="end">{{.YMinText}}</text>
+            {{range .XTicks}}
+            <line class="tick" x1="{{printf "%.2f" .X}}" y1="176" x2="{{printf "%.2f" .X}}" y2="179"></line>
+            <text class="tick-label" x="{{printf "%.2f" .X}}" y="188">{{.Label}}</text>
+            {{end}}
             {{range .Series}}
             {{$color := .Color}}
+            {{if .BandPath}}<path class="chart-band" fill="{{$color}}" d="{{.BandPath}}"></path>{{end}}
             <path class="chart-line" stroke="{{$color}}" d="{{.Path}}"></path>
             {{range .Points}}
-            <circle class="point" fill="{{$color}}" cx="{{printf "%.2f" .X}}" cy="{{printf "%.2f" .Y}}" r="4">
-              <title>{{.Date}} @ {{.SHA}}: {{.Text}}</title>
+            <circle class="point" fill="{{$color}}" cx="{{printf "%.2f" .X}}" cy="{{printf "%.2f" .Y}}" r="3.2">
+              <title>{{.Date}} @ {{.SHA}}: {{.Text}}{{if .HasBand}} ({{.Spread}}){{end}}</title>
             </circle>
             {{end}}
             {{end}}
+            {{range .Deltas}}
+            <text class="gap-label" x="{{printf "%.2f" .X}}" y="{{printf "%.2f" .Y}}">{{.Text}}</text>
+            {{end}}
           </svg>
-          <div class="legend">
-            {{range .Series}}<span><i class="swatch" style="--series: {{.Color}}"></i>{{.Label}}</span>{{end}}
+          <div class="chart-foot">
+            <p class="chart-meta"><span class="chart-unit">{{.Unit}}</span>{{if .DeltaCaption}} · <span class="gap-delta">{{.DeltaCaption}}</span>{{end}}</p>
+            <div class="legend">
+              {{range .Series}}<span><i class="swatch" style="--series: {{.Color}}"></i>{{.Label}}</span>{{end}}
+              {{if .HasRef}}<span><i class="swatch dash"></i>{{.RefLegend}}</span>{{end}}
+              {{if .HasBudget}}<span><i class="swatch budget"></i>{{.BudgetText}} budget</span>{{end}}
+            </div>
           </div>
         </article>
         {{end}}
@@ -1278,17 +1850,19 @@ const pageTemplate = `<!doctype html>
     <section>
       <div class="section-head">
         <h2>Recently tightened</h2>
-        <p>Most recent per-benchmark bars in the ratchet.</p>
+        <p>Most recently lowered ratchet bars. × anchor normalizes wall time across machines; the last column is the change vs {{.ReferenceName}}.</p>
       </div>
       <table>
-        <thead><tr><th>Benchmark</th><th>Bar set</th><th>Wall</th><th>Allocs</th></tr></thead>
+        <thead><tr><th>Benchmark</th><th>Bar set</th><th>× anchor</th><th>Wall</th><th>Allocs</th><th>vs {{.ReferenceName}}</th></tr></thead>
         <tbody>
           {{range .RecentlyTightened}}
           <tr>
             <td class="bench"><span class="pkg">{{.Package}}</span>{{.Name}}</td>
             <td class="num">{{date .BestSinceAt}} @ {{shortSHA .BestSinceSHA}}</td>
+            <td class="num">{{ratio .Ratio}}</td>
             <td class="num">{{ns .NSPerOp}}</td>
             <td class="num">{{count .AllocsPerOp}}</td>
+            <td class="num {{deltaClass .Delta}}">{{deltaText .Delta}}</td>
           </tr>
           {{end}}
         </tbody>
