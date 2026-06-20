@@ -508,8 +508,10 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string,
 	// the display transform below; range tracking waits until the relative
 	// basis is known.
 	series := make([]ChartSeries, 0, len(specs))
-	latestRaw, latestIdx, haveLatest := 0.0, -1, false
 	oldestRaw, oldestIdx := 0.0, math.MaxInt
+	// Latest plotted value per series, for a worst-case status across all
+	// series rather than whichever series sorts first (see chartStatus).
+	var latest []seriesLatest
 	for _, spec := range specs {
 		var pts []ChartPoint
 		for i, snap := range timeline {
@@ -531,9 +533,6 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string,
 				SHA:   shortSHA(snap.Baseline.CapturedAtSHA),
 				Value: value, Low: lo, High: hi, HasBand: hasBand,
 			})
-			if i > latestIdx {
-				latestIdx, latestRaw, haveLatest = i, value, true
-			}
 			if i < oldestIdx {
 				oldestIdx, oldestRaw = i, value
 			}
@@ -541,6 +540,8 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string,
 		if len(pts) == 0 {
 			continue
 		}
+		// pts are appended in ascending timeline order, so the last is latest.
+		latest = append(latest, seriesLatest{label: spec.label, value: pts[len(pts)-1].Value})
 		series = append(series, ChartSeries{Label: spec.label, Color: spec.color, Points: pts})
 	}
 	if len(series) == 0 {
@@ -744,7 +745,7 @@ func buildChart(timeline []Snapshot, title, subtitle, unit string,
 		chart.RefLegend = "first run = " + format(basis)
 	}
 
-	chart.Status, chart.StatusClass = chartStatus(latestRaw, haveLatest, refVal, refLabel, budget)
+	chart.Status, chart.StatusClass = chartStatus(latest, refVal, refLabel, budget)
 	return chart
 }
 
@@ -927,21 +928,41 @@ func tickDate(captured string) string {
 	return t.UTC().Format("Jan 02")
 }
 
-// chartStatus summarizes the latest point against the reference line.
-func chartStatus(latestRaw float64, haveLatest bool, refVal float64, refLabel string, budget float64) (string, string) {
+// seriesLatest is a series' most recent plotted value, kept so chartStatus can
+// pick the worst across series instead of trusting whichever sorts first.
+type seriesLatest struct {
+	label string
+	value float64
+}
+
+// chartStatus summarizes the latest points against the reference line. With
+// multiple series it reports the worst (highest, since lower is better) latest
+// value and names the series, so the single status pill can't silently hide a
+// regression in a non-first series.
+func chartStatus(latest []seriesLatest, refVal float64, refLabel string, budget float64) (string, string) {
 	if refVal <= 0 {
 		return "no release reference", "none"
 	}
-	if !haveLatest {
+	if len(latest) == 0 {
 		return "no recent data", "none"
 	}
-	delta := latestRaw/refVal - 1
+	worst := latest[0]
+	for _, s := range latest[1:] {
+		if s.value > worst.value {
+			worst = s
+		}
+	}
+	delta := worst.value/refVal - 1
 	pctText := fmt.Sprintf("%.0f%%", math.Abs(delta)*100)
+	suffix := ""
+	if len(latest) > 1 {
+		suffix = " (" + worst.label + ")"
+	}
 	switch {
 	case delta > budget:
-		return pctText + " over " + refLabel, "bad"
+		return pctText + " over " + refLabel + suffix, "bad"
 	case delta < -budget:
-		return pctText + " under " + refLabel, "good"
+		return pctText + " under " + refLabel + suffix, "good"
 	default:
 		return "within budget vs " + refLabel, "flat"
 	}
