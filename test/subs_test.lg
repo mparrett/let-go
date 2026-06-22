@@ -1,0 +1,45 @@
+;; Tests for subs — character-indexed substring. Guards the byte-offset
+;; rewrite (no whole-string []rune): rune-index semantics must hold across
+;; ASCII, multibyte, and 4-byte runes, plus boundary and out-of-range errors.
+(ns test.subs-test
+  (:require [test :refer :all]))
+
+(deftest subs-ascii
+  (testing "two-arg slice"
+    (is (= "ell" (subs "hello" 1 4))))
+  (testing "one-arg to end"
+    (is (= "llo" (subs "hello" 2))))
+  (testing "start at length is empty"
+    (is (= "" (subs "hello" 5))))
+  (testing "empty slice"
+    (is (= "" (subs "hello" 2 2))))
+  (testing "full string"
+    (is (= "hello" (subs "hello" 0 5)))))
+
+(deftest subs-multibyte
+  ;; "héllo" — é is two UTF-8 bytes; indices are by codepoint, not byte
+  (testing "slice spanning a multibyte rune"
+    (is (= "éll" (subs "héllo" 1 4))))
+  (testing "one-arg to end past a multibyte rune"
+    (is (= "llo" (subs "héllo" 2))))
+  (testing "first rune only"
+    (is (= "h" (subs "héllo" 0 1)))))
+
+(deftest subs-four-byte-runes
+  ;; emoji are 4 UTF-8 bytes each; "a😀b😀c" is 5 codepoints
+  (testing "slice across 4-byte runes"
+    (is (= "😀b😀" (subs "a😀b😀c" 1 4))))
+  (testing "one-arg to end"
+    (is (= "c" (subs "a😀b😀c" 4))))
+  (testing "start at rune count is empty"
+    (is (= "" (subs "a😀b😀c" 5)))))
+
+(deftest subs-errors
+  (testing "start past end"
+    (is (= :err (try (subs "hi" 5) (catch e :err)))))
+  (testing "end past end"
+    (is (= :err (try (subs "hi" 0 9) (catch e :err)))))
+  (testing "negative start"
+    (is (= :err (try (subs "hi" -1) (catch e :err)))))
+  (testing "end before start"
+    (is (= :err (try (subs "hi" 2 1) (catch e :err))))))
