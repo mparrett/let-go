@@ -15,6 +15,7 @@ endif
 
 # Prefer - to _ for make var names (won't conflict with env vars):
 LG := lg
+LG-PROFILE ?= lg-profile
 GOLANGCI-LINT := github.com/golangci/golangci-lint/cmd/golangci-lint
 REPORT-SCRIPT := scripts/clojure_compat_report.sh
 
@@ -48,6 +49,8 @@ run: $(LG)
 
 build: $(LG)
 
+build-profile: $(LG-PROFILE)
+
 # Bundle target. The runtime loads compiled bytecode for the core
 # namespaces from this file, NOT from the .lg sources. Anyone editing
 # a .lg under pkg/rt/core/ must regenerate the bundle or runtime
@@ -56,6 +59,7 @@ build: $(LG)
 # the bundle in lockstep with the .lg sources.
 CORE-LG-FILES := $(shell find pkg/rt/core -name '*.lg' -type f 2>/dev/null)
 LGBGEN-SOURCES := $(shell find cmd/lgbgen -name '*.go' -type f 2>/dev/null)
+ROOT-GO-FILES := $(shell find . -maxdepth 1 -name '*.go' -type f 2>/dev/null)
 pkg/rt/core_compiled.lgb: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 	go run -tags bootstrap ./cmd/lgbgen
 
@@ -100,9 +104,13 @@ check-lowered-fresh:
 		exit 1; \
 	fi
 
-$(LG): $(GO) lg.go pkg/**/* pkg/rt/core_compiled.lgb
+$(LG): $(GO) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
 	which go
 	go build -ldflags="-s -w -X main.commit=$(COMMIT)" -o $@ .
+
+$(LG-PROFILE): $(GO) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
+	which go
+	go build -tags lg_profile -ldflags="-s -w -X main.commit=$(COMMIT)" -o $@ .
 
 test: pkg/**/* pkg/rt/core_compiled.lgb $(GO)
 	$(GO-TEST-ENV) go test $(GO-TEST-FLAGS) -count=1 -v ./test/...

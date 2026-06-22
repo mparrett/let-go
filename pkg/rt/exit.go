@@ -1,3 +1,5 @@
+//go:build lg_profile
+
 package rt
 
 import "sync"

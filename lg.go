@@ -13,10 +13,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"runtime"
-	"runtime/pprof"
 	"strings"
-	"sync"
 
 	"github.com/nooga/let-go/pkg/bundle"
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -300,8 +297,6 @@ var wasmShell string
 var wasmPayload string
 var sourcePaths string
 var resourcePaths string
-var cpuProfile string
-var memProfile string
 
 func init() {
 	flag.BoolVar(&runREPL, "r", false, "attach REPL after running given files")
@@ -327,59 +322,6 @@ func init() {
 		"resource root directories for io/resource, separated by the OS path-list "+
 			"separator (':' on Unix, ';' on Windows). Falls back to LG_RESOURCE_PATHS "+
 			"if unset. With -b, resources under these roots are embedded in the binary.")
-	flag.StringVar(&cpuProfile, "cpuprofile", "",
-		"write a Go CPU profile of script/REPL execution to this file "+
-			"(build modes -c/-b/-w and the bundled-binary path are not profiled)")
-	flag.StringVar(&memProfile, "memprofile", "",
-		"write a Go heap profile to this file after script/REPL execution")
-}
-
-// startProfiling begins CPU profiling when -cpuprofile is set and returns a
-// stop function that writes the heap profile (when -memprofile is set) and
-// stops the CPU profile. It is a no-op when neither flag is given, so the
-// caller can invoke it unconditionally.
-//
-// pprof.StopCPUProfile must run for the profile file to be valid, but main()
-// exits several paths via os.Exit, which skips deferred functions. So the stop
-// is NOT deferred: the caller invokes it explicitly at the end of the run
-// section (the only main() section with no os.Exit), and it is also registered
-// with rt.AtExit so the language-level os/exit and System/exit builtins flush
-// it before they call os.Exit. The returned stop is idempotent, so the explicit
-// call and the at-exit hook can't double-close. Hard signals and Go-level
-// panics still bypass it, matching standard os.Exit semantics.
-func startProfiling() func() {
-	stop := func() {}
-	if cpuProfile != "" {
-		f, err := os.Create(cpuProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
-		} else if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
-			_ = f.Close()
-		} else {
-			stop = func() { pprof.StopCPUProfile(); _ = f.Close() }
-		}
-	}
-	if memProfile != "" {
-		prev := stop
-		stop = func() {
-			prev()
-			f, err := os.Create(memProfile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
-				return
-			}
-			defer f.Close()
-			runtime.GC() // materialize up-to-date heap stats before the dump
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
-			}
-		}
-	}
-	var once sync.Once
-	safeStop := func() { once.Do(stop) }
-	rt.AtExit(safeStop) // os/exit and System/exit flush before os.Exit
-	return safeStop
 }
 
 // buildSearchPaths resolves the resolver's path list from the -source-paths
@@ -616,11 +558,9 @@ func main() {
 		return
 	}
 
-	// Profile only the script/REPL execution below. This section has no
-	// os.Exit, so the explicit stop at the end of main flushes the profile on a
-	// normal return; the rt.AtExit registration covers a script that calls
-	// os/exit or System/exit mid-run.
-	stopProfiling := startProfiling()
+	// In profiling builds, profile only the script/REPL execution below.
+	// Default builds compile this to a no-op so the release binary stays small.
+	startProfiling()
 
 	// Script mode: treat only the first positional as the script to run.
 	// Any further positionals belong to the script (it reads os/args).
