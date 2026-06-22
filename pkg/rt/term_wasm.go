@@ -268,6 +268,23 @@ func installTermNS() {
 	})
 	ns.Def("main-screen", mainScreen)
 
+	// enable-mouse / disable-mouse — same SGR mouse-reporting escapes as the
+	// native term ns (term.go). xterm.js honors \e[?1000;1006h and forwards
+	// clicks back through onData → the SAB → read-key. The WASM read-key does
+	// not yet decode the report into a tagged map (Phase 3), so a click surfaces
+	// as the raw escape string — enough for "any key/click" prompts like the
+	// title screen; in-game click-to-move needs the decode. Defined here so the
+	// shared xsofy lifecycle (init/shutdown-terminal) resolves them in WASM too.
+	enableMouse := vm.NewCtxNativeFn("enable-mouse", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		return vm.NIL, WriteToOut(ec, "\033[?1000;1006h")
+	})
+	ns.Def("enable-mouse", enableMouse)
+
+	disableMouse := vm.NewCtxNativeFn("disable-mouse", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		return vm.NIL, WriteToOut(ec, "\033[?1000;1006l")
+	})
+	ns.Def("disable-mouse", disableMouse)
+
 	// flush — sync the active *out* binding, then drive the JS-side transport
 	// flush so the default screen path still reaches xterm.js. A rebound
 	// (buffered/embedder) *out* is flushed by Sync(); _lgFlush then no-ops on

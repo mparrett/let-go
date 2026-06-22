@@ -108,3 +108,51 @@ func TestScanKeyReady(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeSGRMouse(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want MouseEvent
+	}{
+		{"left press", "\x1b[<0;10;5M", MouseEvent{Action: "press", Button: "left", X: 10, Y: 5}},
+		{"left release", "\x1b[<0;10;5m", MouseEvent{Action: "release", Button: "left", X: 10, Y: 5}},
+		{"middle press", "\x1b[<1;3;4M", MouseEvent{Action: "press", Button: "middle", X: 3, Y: 4}},
+		{"right press", "\x1b[<2;7;8M", MouseEvent{Action: "press", Button: "right", X: 7, Y: 8}},
+		{"shift+left", "\x1b[<4;1;1M", MouseEvent{Action: "press", Button: "left", X: 1, Y: 1, Shift: true}},
+		{"meta+left", "\x1b[<8;1;1M", MouseEvent{Action: "press", Button: "left", X: 1, Y: 1, Meta: true}},
+		{"ctrl+left", "\x1b[<16;1;1M", MouseEvent{Action: "press", Button: "left", X: 1, Y: 1, Ctrl: true}},
+		{"ctrl+shift+right", "\x1b[<22;2;2M", MouseEvent{Action: "press", Button: "right", X: 2, Y: 2, Shift: true, Ctrl: true}},
+		{"wheel up", "\x1b[<64;9;9M", MouseEvent{Action: "press", Button: "wheel-up", X: 9, Y: 9}},
+		{"wheel down", "\x1b[<65;9;9M", MouseEvent{Action: "press", Button: "wheel-down", X: 9, Y: 9}},
+		{"large coords", "\x1b[<0;220;140M", MouseEvent{Action: "press", Button: "left", X: 220, Y: 140}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := decodeSGRMouse(c.in)
+			if !ok {
+				t.Fatalf("decodeSGRMouse(%q) returned ok=false", c.in)
+			}
+			if got != c.want {
+				t.Errorf("decodeSGRMouse(%q) = %+v, want %+v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestDecodeSGRMouseRejects(t *testing.T) {
+	// Non-mouse tokens and malformed reports must report ok=false so read-key
+	// falls through to returning them as plain key strings.
+	for _, in := range []string{
+		"l",             // plain key
+		"\x1b[A",        // arrow (CSI, no '<')
+		"\x1b[<0;10;5",  // missing final M/m
+		"\x1b[<0;10M",   // only two params
+		"\x1b[<x;10;5M", // non-numeric param
+		"\x1b[<",        // truncated
+	} {
+		if ev, ok := decodeSGRMouse(in); ok {
+			t.Errorf("decodeSGRMouse(%q) = %+v, ok=true; want ok=false", in, ev)
+		}
+	}
+}
