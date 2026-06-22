@@ -100,12 +100,71 @@ var termOldState *term.State
 // term ops, embedders (api.WithKeySource), and tests share one source.
 type nativeKeySource struct{}
 
-func (nativeKeySource) ReadKey() (string, error) {
+// keyBuf holds bytes read from stdin but not yet handed out as keys. A single
+// raw read can carry several keys (held-key auto-repeat / queued input) or a
+// multi-byte escape sequence; ReadKey tokenizes one key per call off this
+// buffer (see nextKey) and refills via readRaw only when it's empty. Native
+// has a single stdin and reads aren't concurrent, so a package-level buffer is
+// safe.
+var keyBuf []byte
+
+// readChunkSize is the per-read stdin buffer. os.Stdin.Read returns as soon as
+// any data is available (it never waits to fill), so a larger buffer adds no
+// latency to a single keystroke — it just grabs more bytes when a burst is
+// already queued, cutting syscalls and ReadKey refills. Correctness doesn't
+// depend on it: a token straddling the buffer is stitched by the refill path
+// (see incompleteToken). 256 covers held-key bursts and back-to-back escape
+// sequences with headroom.
+const readChunkSize = 256
+
+func (s nativeKeySource) ReadKey() (string, error) {
+	for {
+		if len(keyBuf) == 0 {
+			chunk, err := s.readRaw()
+			if err != nil {
+				return "", err
+			}
+			switch chunk {
+			case "":
+				return "", nil // EOF / nil contract
+			case "\x07":
+				return "\x07", nil // SIGWINCH wake — synthetic, not tokenized
+			}
+			keyBuf = append(keyBuf, chunk...)
+		}
+		// If the buffer ends mid-token (split escape sequence or UTF-8 rune)
+		// and more bytes are actually waiting on stdin, pull them in and
+		// re-tokenize rather than emitting a broken partial. Gating on
+		// rawPending keeps a genuinely truncated token from blocking a refill
+		// that would never complete.
+		if incompleteToken(keyBuf) && s.rawPending() {
+			chunk, err := s.readRaw()
+			if err != nil {
+				return "", err
+			}
+			if chunk != "" && chunk != "\x07" {
+				keyBuf = append(keyBuf, chunk...)
+				continue
+			}
+		}
+		tok, n := nextKey(keyBuf)
+		keyBuf = keyBuf[n:]
+		if len(keyBuf) == 0 {
+			keyBuf = nil // release the backing array once drained
+		}
+		return tok, nil
+	}
+}
+
+// readRaw does one blocking poll+read, returning raw stdin bytes, "" on EOF, or
+// BEL ("\x07") when only the SIGWINCH wake fired. This is the pre-tokenizer
+// read-key body, unchanged — ReadKey now buffers and tokenizes its result.
+func (nativeKeySource) readRaw() (string, error) {
 	setupWinch() // idempotent; armed on first read-key
 
 	if winchPipeR == nil {
 		// Pipe setup failed; plain blocking read (preserves prior behavior).
-		buf := make([]byte, 16)
+		buf := make([]byte, readChunkSize)
 		n, err := os.Stdin.Read(buf)
 		if err != nil || n == 0 {
 			return "", nil
@@ -152,7 +211,7 @@ func (nativeKeySource) ReadKey() (string, error) {
 	// emitting BEL forever — EOF never surfaced. Routing through os.Stdin.Read
 	// here too surfaces n==0 as the nil contract callers had pre-PR.
 	if fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
-		buf := make([]byte, 16)
+		buf := make([]byte, readChunkSize)
 		n, err := os.Stdin.Read(buf)
 		if err != nil || n == 0 {
 			return "", nil
@@ -162,7 +221,7 @@ func (nativeKeySource) ReadKey() (string, error) {
 
 	// Prefer real input — user keys shouldn't queue behind a resize wake.
 	if fds[0].Revents&unix.POLLIN != 0 {
-		buf := make([]byte, 16)
+		buf := make([]byte, readChunkSize)
 		n, err := os.Stdin.Read(buf)
 		if err != nil || n == 0 {
 			return "", nil
@@ -174,7 +233,18 @@ func (nativeKeySource) ReadKey() (string, error) {
 	return "\x07", nil
 }
 
-func (nativeKeySource) KeyPending() bool {
+func (s nativeKeySource) KeyPending() bool {
+	if len(keyBuf) > 0 {
+		return true // tokens still buffered from a prior multi-key read
+	}
+	return s.rawPending()
+}
+
+// rawPending reports whether stdin (or the SIGWINCH wake-pipe) has bytes the
+// buffer hasn't consumed yet — the OS-level half of KeyPending, without the
+// keyBuf check. ReadKey uses it to decide whether refilling a straddled token
+// will actually make progress.
+func (nativeKeySource) rawPending() bool {
 	// Arm the winch handler if it hasn't been already — a caller that hits
 	// key-pending? before any read-key would otherwise miss SIGWINCH wakes.
 	setupWinch()
