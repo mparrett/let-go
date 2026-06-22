@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -4404,23 +4405,56 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("subs expected Int start")
 		}
-		runes := []rune(string(s))
 		si := int(start)
-		if si < 0 || si > len(runes) {
+		if si < 0 {
 			return vm.NIL, fmt.Errorf("string index out of range")
 		}
-		if len(vs) == 3 {
+		hasEnd := len(vs) == 3
+		ei := 0
+		if hasEnd {
 			end, ok := vs[2].(vm.Int)
 			if !ok {
 				return vm.NIL, fmt.Errorf("subs expected Int end")
 			}
-			ei := int(end)
-			if ei < si || ei > len(runes) {
+			ei = int(end)
+			if ei < si {
 				return vm.NIL, fmt.Errorf("string index out of range")
 			}
-			return vm.String(string(runes[si:ei])), nil
 		}
-		return vm.String(string(runes[si:])), nil
+		// subs is character-indexed, but a substring needs byte offsets. Walk
+		// the string to map the start/end rune indices to byte offsets instead
+		// of materializing []rune(s) for the whole string on every call — subs
+		// is hot in parsers, and the full conversion dominated allocation.
+		// Stop as soon as both offsets are known (i.e. at max(si, ei) runes).
+		str := string(s)
+		byteStart, byteEnd := -1, -1
+		ri, bo := 0, 0
+		for {
+			if ri == si {
+				byteStart = bo
+			}
+			if hasEnd && ri == ei {
+				byteEnd = bo
+			}
+			if byteStart >= 0 && (!hasEnd || byteEnd >= 0) {
+				break
+			}
+			if bo >= len(str) {
+				break
+			}
+			_, size := utf8.DecodeRuneInString(str[bo:])
+			bo += size
+			ri++
+		}
+		if byteStart < 0 {
+			return vm.NIL, fmt.Errorf("string index out of range") // si past end
+		}
+		if !hasEnd {
+			byteEnd = len(str)
+		} else if byteEnd < 0 {
+			return vm.NIL, fmt.Errorf("string index out of range") // ei past end
+		}
+		return vm.String(str[byteStart:byteEnd]), nil
 	})
 
 	// format: sprintf-style string formatting
