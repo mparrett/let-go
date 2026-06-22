@@ -22,7 +22,8 @@ var coreFS embed.FS
 // EmbeddedSource returns the source of an embedded namespace by its
 // dotted ns name.
 //
-// Naming rule (mirrors `cmd/lgbgen.nsToGoPkgName` direction-flipped):
+// Naming rule (the source-side analog of `cmd/lgbgen.nsToGoRelDir`, which
+// nests the lowered Go tree the same way):
 //   - dots are path separators: `ir.passes.dce` → `ir/passes/dce.lg`
 //   - in the *leaf* segment, hyphens map to underscores so the file
 //     name is a legal Go-style identifier: `ir.lower-go` → `ir/lower_go.lg`

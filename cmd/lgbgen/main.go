@@ -500,12 +500,26 @@ func refreshManifest() {
 	fmt.Printf("wrote %s (%s)\n", genmanifest.ManifestRelPath, digest[:12])
 }
 
-// nsToGoPkgName converts a let-go namespace name to a valid Go package name.
-// Dots become underscores (ir.zipper → ir_zipper), hyphens become underscores.
+// nsToGoPkgName converts a let-go namespace name to a valid Go package name:
+// the LAST dot-segment, with hyphens turned into underscores
+// (ir.passes.pipeline → pipeline, ir.lower-go → lower_go, edn → edn). This is
+// both the `package` identifier and the filename stem; the directory nesting
+// that mirrors the full namespace is built by nsToGoRelDir. Mirrors Glojure's
+// mungeID(getLastNSPart(ns)).
 func nsToGoPkgName(nsName string) string {
-	s := strings.ReplaceAll(nsName, ".", "_")
-	s = strings.ReplaceAll(s, "-", "_")
-	return s
+	parts := strings.Split(nsName, ".")
+	last := parts[len(parts)-1]
+	return strings.ReplaceAll(last, "-", "_")
+}
+
+// nsToGoRelDir converts a let-go namespace name to the relative directory path
+// (under the lowered-output root) that mirrors the namespace nesting: dots
+// become path separators, hyphens become underscores
+// (ir.passes.pipeline → ir/passes/pipeline, ir.lower-go → ir/lower_go).
+// Mirrors Glojure's nsToPath.
+func nsToGoRelDir(nsName string) string {
+	s := strings.ReplaceAll(nsName, "-", "_")
+	return filepath.FromSlash(strings.ReplaceAll(s, ".", "/"))
 }
 
 // goGeneratedBanner is stamped on the first line of every Go file lgbgen
@@ -682,9 +696,13 @@ func runGoTarget(outDir string) {
 			continue
 		}
 
-		// Each namespace maps to its own Go package in a subdirectory.
+		// Each namespace maps to its own Go package in a directory that
+		// mirrors the namespace nesting (ir.passes.pipeline →
+		// ir/passes/pipeline/), with the package and filename named after the
+		// leaf segment (package pipeline, pipeline.go).
 		pkgName := nsToGoPkgName(ns.name)
-		pkgDir := filepath.Join(outDir, pkgName)
+		relDir := nsToGoRelDir(ns.name)
+		pkgDir := filepath.Join(outDir, relDir)
 		if err := os.MkdirAll(pkgDir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "create pkg dir %s: %v\n", pkgDir, err)
 			os.Exit(1)
@@ -718,7 +736,10 @@ func runGoTarget(outDir string) {
 			os.Exit(1)
 		}
 		fmt.Printf("  wrote %s (%d bytes, %d defns)\n", filename, len(goSrc), len(defnForms))
-		generated = append(generated, pkgName)
+		// Wireup blank-imports by directory path (slash-separated), not the
+		// leaf package name — sibling namespaces share a leaf name but live at
+		// distinct paths.
+		generated = append(generated, filepath.ToSlash(relDir))
 	}
 	// Emit the //go:build gogen_ir blank-import wireup files from exactly
 	// the set we just wrote — so namespaces that were skipped or failed to

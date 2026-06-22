@@ -58,7 +58,7 @@
 (defn file-size [path] (count (slurp path)))
 (defn file-loc  [path] (count (re-seq #"\n" (slurp path))))
 
-;; Parent-directory name: ".../ir_lower_go/ir_lower_go.go" -> "ir_lower_go".
+;; Parent-directory name: ".../ir/lower_go/lower_go.go" -> "lower_go".
 (defn parent-dir [path]
   (let [m (re-find #"([^/]+)/[^/]+$" path)] (if m (second m) "_root")))
 

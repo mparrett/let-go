@@ -66,17 +66,24 @@
 
 (defn- ns-form? [form] (and (seq? form) (= 'ns (first form))))
 
+;; Go package name = leaf namespace segment (hyphens→_); the lowered tree mirrors
+;; namespace nesting, so the package and filename are the last segment only.
 (defn- nsname->pkg [ns-name]
-  (string/replace (string/replace (str ns-name) "." "_") "-" "_"))
+  (string/replace (last (string/split (str ns-name) #"\.")) "-" "_"))
 
-;; The lowered Go package name for a fixture, read independently of lowering so
-;; cleanup can remove it even when lowering/building threw.
-(defn fixture-pkg [fixture]
+;; Relative dir under core_go_lowered/ that mirrors the namespace (dots→/,
+;; hyphens→_): ir.passes.pipeline → ir/passes/pipeline. Matches cmd/lgbgen.nsToGoRelDir.
+(defn- nsname->reldir [ns-name]
+  (string/replace (string/replace (str ns-name) "-" "_") "." "/"))
+
+;; The lowered Go package's relative dir for a fixture, read independently of
+;; lowering so cleanup can remove the tree even when lowering/building threw.
+(defn fixture-reldir [fixture]
   (let [forms (read-string (str "[" (slurp fixture) "]"))
         nsd   (first (filter ns-form? forms))]
-    (when nsd (nsname->pkg (second nsd)))))
+    (when nsd (nsname->reldir (second nsd)))))
 
-;; Lower one fixture FILE into <out-dir>/<pkg>/<pkg>.go and return {:ns :pkg}.
+;; Lower one fixture FILE into <out-dir>/<reldir>/<pkg>.go and return {:ns :pkg :reldir}.
 ;; Establishes lower-ns-to-go's precondition by evaluating the whole fixture
 ;; first (so build-fn can resolve the fixture's own ->T / protocol / sibling
 ;; names) — the native Go is emitted separately from the captured forms.
@@ -87,11 +94,12 @@
     (when (nil? ns-name) (die (str "no (ns ...) form in " fixture)))
     (doseq [form forms] (eval form))
     (let [pkg     (nsname->pkg ns-name)
+          reldir  (nsname->reldir ns-name)
           go-src  (ir.passes.pipeline/lower-ns-to-go pkg ns-name (vec (filter lowerable? forms)))
-          pkg-dir (str out-dir "/" pkg)]
-      (mkdir pkg-dir)
+          pkg-dir (str out-dir "/" reldir)]
+      (os/sh "mkdir" "-p" pkg-dir)
       (spit (str pkg-dir "/" pkg ".go") go-src)
-      {:ns ns-name :pkg pkg})))
+      {:ns ns-name :pkg pkg :reldir reldir})))
 
 ;; Run the (run) entry under a binary, requiring the fixture from src-root.
 ;; Returns {:result <str> :native <bool>} — :native reflects whether the entry
@@ -109,26 +117,25 @@
 (def WIREUP "zz_lg_trampoline_gen.go")        ; //go:build lg_trampoline (gitignored)
 (def work   (trim-tail (str (:out (os/sh "mktemp" "-d")))))
 
-(defn cleanup [pkg]
+(defn cleanup [reldir]
   (os/sh "rm" "-f" WIREUP)
-  (when pkg (os/sh "rm" "-rf" (str "pkg/rt/core_go_lowered/" pkg)))
+  (when reldir (os/sh "rm" "-rf" (str "pkg/rt/core_go_lowered/" reldir)))
   (os/sh "rm" "-rf" work))
 
 (defn trampoline-one [fixture]
-  (let [{:keys [ns pkg]} (lower-fixture! fixture "pkg/rt/core_go_lowered")
+  (let [{:keys [ns pkg reldir]} (lower-fixture! fixture "pkg/rt/core_go_lowered")
         ;; stage the fixture on a source path matching its ns so `require` finds it
-        rel      (string/replace (string/replace (str ns) "." "/") "-" "_")
         src-root (str work "/src-" pkg)
         driver   (str work "/driver-" pkg ".lg")]
-    (os/sh "mkdir" "-p" (str src-root "/" (or (re-find #"^.*/" rel) "")))
-    (spit (str src-root "/" rel ".lg") (slurp fixture))
+    (os/sh "mkdir" "-p" (str src-root "/" (or (re-find #"^.*/" reldir) "")))
+    (spit (str src-root "/" reldir ".lg") (slurp fixture))
     (spit driver (str "(require '" ns ")\n"
                       "(println \"RESULT\" (" ns "/run))\n"
                       "(println \"FNREPR\" (str " ns "/run))\n"))
     ;; wire ONLY this package in under the lg_trampoline tag; build a tagged binary
     (spit WIREUP (str "//go:build lg_trampoline\n\n"
                       "package main\n\n"
-                      "import _ \"github.com/nooga/let-go/pkg/rt/core_go_lowered/" pkg "\"\n"))
+                      "import _ \"github.com/nooga/let-go/pkg/rt/core_go_lowered/" reldir "\"\n"))
     (let [tagged (str work "/lg-" pkg)
           br (os/sh go-bin "build" "-tags" "lg_trampoline" "-o" tagged ".")]
       (os/sh "rm" "-f" WIREUP)
@@ -149,12 +156,12 @@
 (println "gogen-trampoline: go =" go-bin "| lg =" lg-bin "| fixtures =" (count fixtures))
 
 (let [results (mapv (fn [fixture]
-                      ;; pkg is read up front so cleanup removes the lowered
+                      ;; reldir is read up front so cleanup removes the lowered
                       ;; package even when lowering or the tagged build throws.
-                      (let [pkg (try (fixture-pkg fixture) (catch _ nil))
+                      (let [reldir (try (fixture-reldir fixture) (catch _ nil))
                             r   (try (trampoline-one fixture)
                                      (catch e (println (str "  " fixture " ERROR: " e)) {:ok false}))]
-                        (cleanup pkg)
+                        (cleanup reldir)
                         r))
                     fixtures)]
   (if (every? :ok results)

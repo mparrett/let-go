@@ -65,7 +65,7 @@ pkg/rt/core_compiled.lgb: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 # the two engines silently disagree (parity-full diverges on bucket
 # hashes even when pass/fail counts match). lower_go.go is the timestamp
 # anchor for the whole tree — every regen rewrites it.
-pkg/rt/core_go_lowered/ir_lower_go/ir_lower_go.go: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
+pkg/rt/core_go_lowered/ir/lower_go/lower_go.go: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 	go run -tags bootstrap ./cmd/lgbgen --target=go
 
 # Regenerate every committed code-gen artifact via the let-go orchestrator
@@ -92,7 +92,7 @@ PERF-SNAPSHOT ?= $(PERF-TIMELINE-DIR)/$(shell date -u +%Y%m%dT%H%M%SZ)-$(COMMIT)
 # core_go_lowered/ is stale (untagged vs gogen_ir run two different
 # versions of the IR pipeline). Caught the hard way 2026-05-28.
 check-lowered-fresh:
-	@stale=$$(find pkg/rt/core -name '*.lg' -newer pkg/rt/core_go_lowered/ir_lower_go/ir_lower_go.go 2>/dev/null); \
+	@stale=$$(find pkg/rt/core -name '*.lg' -newer pkg/rt/core_go_lowered/ir/lower_go/lower_go.go 2>/dev/null); \
 	if [ -n "$$stale" ]; then \
 		echo "ERROR: pkg/rt/core_go_lowered/ is stale relative to:"; \
 		echo "$$stale" | sed 's/^/  /'; \
