@@ -13,6 +13,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/nooga/let-go/pkg/bundle"
@@ -297,6 +299,8 @@ var wasmShell string
 var wasmPayload string
 var sourcePaths string
 var resourcePaths string
+var cpuProfile string
+var memProfile string
 
 func init() {
 	flag.BoolVar(&runREPL, "r", false, "attach REPL after running given files")
@@ -322,6 +326,53 @@ func init() {
 		"resource root directories for io/resource, separated by the OS path-list "+
 			"separator (':' on Unix, ';' on Windows). Falls back to LG_RESOURCE_PATHS "+
 			"if unset. With -b, resources under these roots are embedded in the binary.")
+	flag.StringVar(&cpuProfile, "cpuprofile", "",
+		"write a Go CPU profile of script/REPL execution to this file "+
+			"(build modes -c/-b/-w and the bundled-binary path are not profiled)")
+	flag.StringVar(&memProfile, "memprofile", "",
+		"write a Go heap profile to this file after script/REPL execution")
+}
+
+// startProfiling begins CPU profiling when -cpuprofile is set and returns a
+// stop function that writes the heap profile (when -memprofile is set) and
+// stops the CPU profile. It is a no-op when neither flag is given, so the
+// caller can invoke it unconditionally.
+//
+// The returned stop must be called explicitly rather than deferred in main():
+// main() exits several paths via os.Exit, which skips deferred functions, and
+// pprof.StopCPUProfile must run for the profile file to be valid. Scoping the
+// start/stop pair to the script/REPL run — the only main() section with no
+// os.Exit — keeps the flush guaranteed without a run()-returns-code refactor.
+func startProfiling() func() {
+	stop := func() {}
+	if cpuProfile != "" {
+		f, err := os.Create(cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+		} else if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+			_ = f.Close()
+		} else {
+			stop = func() { pprof.StopCPUProfile(); _ = f.Close() }
+		}
+	}
+	if memProfile != "" {
+		prev := stop
+		stop = func() {
+			prev()
+			f, err := os.Create(memProfile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+				return
+			}
+			defer f.Close()
+			runtime.GC() // materialize up-to-date heap stats before the dump
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+			}
+		}
+	}
+	return stop
 }
 
 // buildSearchPaths resolves the resolver's path list from the -source-paths
@@ -558,6 +609,11 @@ func main() {
 		return
 	}
 
+	// Profile only the script/REPL execution below. This section has no
+	// os.Exit, so the explicit stop at the end of main always runs and flushes
+	// the profile; a deferred stop would be skipped by the os.Exit paths above.
+	stopProfiling := startProfiling()
+
 	// Script mode: treat only the first positional as the script to run.
 	// Any further positionals belong to the script (it reads os/args).
 	ranSomething := false
@@ -598,4 +654,5 @@ func main() {
 		repl(context)
 	}
 
+	stopProfiling()
 }
