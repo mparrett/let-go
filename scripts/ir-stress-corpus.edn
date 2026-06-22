@@ -1,9 +1,8 @@
 {:doc
  "IR-stress lower-go corpus: every repo .lg the AOT lowering should handle. Failures against :stress are real lowering gaps - forward/mutual-ref resolution, unsupported arg patterns, gogen emission, lowering-cost timeouts. Widest net: core via go:embed all:core plus tests, examples, scripts; external deps are themselves lowered .lg so they stay IN. Consumer: make ir-stress runs lower-go on :stress minus :exclude. Regenerate the file list via scripts/ir-stress.lg."
+ ;; Nothing excluded: every listed file must read and lower.
  :exclude
- {"test/simple.lg" "harness read-string error - close-paren in a string in a line comment; see simple.lg line 63"
-  "test/hello.lg"  "harness read-string error - same class"
-  "test/perf.lg"   "harness read-string error - same class"}
+ {}
  :stress
  ["examples/async.lg"
   "examples/concurrent-primes.lg"
