@@ -27,9 +27,11 @@
 ;; The Clojure side picks which [op type-pair] combinations exist;
 ;; the orchestrator emits the nested dispatch tree.
 ;;
-;; Run with: lg -source-paths examples/go-gen examples/go-gen/numeric_specialize.lg
+;; Run with: lg examples/gogen/numeric_specialize.lg   (gogen is on the deps.edn path)
 
-(require '[gogen :as g])
+(ns numeric-specialize-gen
+  (:require
+   [gogen :as g]))
 
 ;; --- type-name conventions ------------------------------------------
 ;;

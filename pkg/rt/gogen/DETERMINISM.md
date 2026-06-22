@@ -55,7 +55,7 @@ research notes); `gogen` must not introduce new ones.
 path. Add a regression test (`gogen_determinism_test.go`) that renders
 the same AST 100× and asserts byte-equal output.
 
-**In the macro layer (`examples/go-gen/gogen.lg`):**
+**In the macro layer (`pkg/rt/gogen/gogen.lg`):**
 
 The walker iterates user-supplied collections positionally. If the user
 passes a vector or list, order is preserved. If the user passes a

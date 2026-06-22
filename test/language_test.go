@@ -49,9 +49,9 @@ func TestRunner(t *testing.T) {
 	// Set up a loader so rt.NS can autoload namespaces from files during tests.
 	loaderCtx := compiler.NewCompiler(consts, rt.NS(rt.NameCoreNS))
 	// Search paths for `require`: current dir for in-tree test helpers
-	// (test/test.lg etc.), plus examples/go-gen so tests can exercise
-	// example libraries like gogen.
-	rt.SetNSLoader(resolver.NewNSResolver(loaderCtx, []string{".", "../examples/go-gen"}))
+	// (test/test.lg etc.), plus pkg/rt/gogen so tests can exercise the
+	// gogen macro layer.
+	rt.SetNSLoader(resolver.NewNSResolver(loaderCtx, []string{".", "../pkg/rt/gogen"}))
 
 	// Per-file isolation baseline: a snapshot of the (clean) dynamic-binding
 	// state taken before any test file runs. Each file is executed within this

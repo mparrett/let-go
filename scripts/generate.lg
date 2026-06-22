@@ -1,5 +1,6 @@
 ;; scripts/generate.lg — coordinate the whole code-generation pipeline in one
-;; let-go script, using os/sh (capture) + os/exec* (stream) + spit.
+;; let-go script. The generators are loaded and run IN-PROCESS (load-string),
+;; not via a subprocess; os/exec* (stream) + spit + gofmt handle the rest.
 ;;
 ;; Replaces three shell scripts (generate-ir-{ops,bridge,data}.sh) and the
 ;; per-artifact Makefile recipe sequencing. Run it via:
@@ -13,7 +14,7 @@
 ;;
 ;;     --go <path>            go compiler          (default "go")
 ;;     --lg <path>            lg binary            (default "./lg")
-;;     --source-paths <dir>   go-gen source root   (default "examples/go-gen")
+;;     --source-paths <dir>   gogen lib require root (default "pkg/rt/gogen")
 ;;
 ;; Bootstrap note: this script runs ON ./lg (built from the bundle) and shells
 ;; out to `<go> run -tags bootstrap ./cmd/lgbgen` for the bundle and lowered
@@ -40,7 +41,7 @@
 (def argv      os/args)
 (def go-bin    (flag argv "--go" "go"))
 (def lg-bin    (flag argv "--lg" "./lg"))
-(def src-paths (flag argv "--source-paths" "examples/go-gen"))
+(def src-paths (flag argv "--source-paths" "pkg/rt/gogen"))
 
 (defn die [msg]
   (println "generate.lg ERROR:" msg)
@@ -57,13 +58,19 @@
       (trim-tail (:out r))
       name)))
 
-;; Run lg on a go-gen source and return its stdout. Aborts on nonzero exit.
+;; Run a go-gen source IN-PROCESS and return what it prints to *out*. We're
+;; already inside an `lg` process, so shelling out to compile+run the generator
+;; was redundant; the subprocess stdout capture also dropped trailing bytes
+;; nondeterministically. load-string evaluates each top-level form before
+;; reading the next, so the generators' own defmacros (defirdata/defgostruct)
+;; register before their uses — a single (do ...) eval would compile every form
+;; before any executed and the macro calls would fail. The (binding [*ns* *ns*])
+;; restores our namespace after the file's own (ns ...) form switches it.
 (defn lg-gen [src]
-  (let [r (os/sh lg-bin "-source-paths" src-paths src)]
-    (when (not= 0 (:exit r))
-      (println (:err r))
-      (die (str "lg failed on " src)))
-    (:out r)))
+  (let [saved (ns-name *ns*)
+        out   (with-out-str (load-string (slurp src)))]
+    (in-ns saved)                          ; the generator's (ns ...) switches the
+    out))                                  ; process-global current ns; switch back
 
 ;; Emit a generated Go file: fixed header + lg-emitted body, then gofmt -w.
 (defn gen-go [head src out]
@@ -74,10 +81,19 @@
       (println (:err r))
       (die (str "gofmt failed on " out)))))
 
-;; Emit a generated Lisp file: lg-emitted body verbatim (no header, no gofmt).
+;; Emit a generated Lisp file. ir_data has no formatter (unlike gen-go, which
+;; normalizes Go via go/format), so determinism must come from the write
+;; itself. Load the generator IN-PROCESS and evaluate (emit-data-file) as the
+;; final form, writing its value with one atomic spit. load-string evaluates
+;; each top-level form in turn — so defirdata's defmacro registers before its
+;; uses — and emit-data-file already ends in exactly one newline. Deterministic:
+;; no subprocess, no stdout-capture race, no post-hoc normalization.
 (defn gen-lisp [src out]
   (println ">> gen" out)
-  (spit out (lg-gen src)))
+  (let [saved  (ns-name *ns*)
+        result (load-string (str (slurp src) "\n(emit-data-file)"))]
+    (in-ns saved)                          ; restore the ns the generator switched away from
+    (spit out result)))
 
 ;; Run a build command (the resolved go) with inherited stdio; abort nonzero.
 (defn run! [& cmd]
@@ -111,9 +127,11 @@
 (println "generate.lg: go =" go-bin "| lg =" lg-bin "| source-paths =" src-paths)
 (surface-drift (read-prior))
 
-(gen-go   "scripts/gen/op_generated.head"        (str src-paths "/ir_ops.lg")    "pkg/ir/op_generated.go")
-(gen-go   "scripts/gen/ir_bridge_generated.head" (str src-paths "/ir_bridge.lg") "pkg/rt/ir_bridge_generated.go")
-(gen-lisp (str src-paths "/ir_data.lg") "pkg/rt/core/ir/data/generated.lg")
+;; The IR-generation specs live with the IR (pkg/ir); src-paths is the require
+;; root for the gogen macro library (pkg/rt/gogen) the specs depend on.
+(gen-go   "scripts/gen/op_generated.head"        "pkg/ir/ir_ops.lg"    "pkg/ir/op_generated.go")
+(gen-go   "scripts/gen/ir_bridge_generated.head" "pkg/ir/ir_bridge.lg" "pkg/rt/ir_bridge_generated.go")
+(gen-lisp "pkg/ir/ir_data.lg" "pkg/rt/core/ir/data/generated.lg")
 
 ;; One core compile emits BOTH the .lgb bundle and the gogen_ir Go tree.
 ;; Hermetic generation (clearing the stale lowered-tree before regen) is

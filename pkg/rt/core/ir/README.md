@@ -29,7 +29,7 @@ Each layer is one file (or one directory) in this tree:
 | Path                                          | Role                                                  |
 |-----------------------------------------------|-------------------------------------------------------|
 | `data.lg`                                     | IR data layer: Function/Block/Inst atom shape, ctors, structural mutators, uses cache. Loaded from source (intern block exposes accessors under `ir/`). |
-| `data/generated.lg`                           | Mechanical field accessors, generated from `examples/go-gen/ir_data.lg`. |
+| `data/generated.lg`                           | Mechanical field accessors, generated from `pkg/ir/ir_data.lg`. |
 | `zipper.lg`                                   | Fn-scoped cursor over Insts in block-order.           |
 | `passes.lg`                                   | `defpass` DSL; binds `*current-fn*` / `*current-inst*` / `*current-zip*`. |
 | `build.lg`                                    | `ir.build/build-fn` — Lisp form → IR Function.        |
@@ -123,7 +123,7 @@ If your pass needs block-level state (e.g., a hash table reset per block, as CSE
 
 Two-step process — the op is a Go-side enum value because it's referenced from the chunk-emission bridge.
 
-1. **Edit `examples/go-gen/ir_ops.lg`**. Add a row to the `ops` vector:
+1. **Edit `pkg/ir/ir_ops.lg`**. Add a row to the `ops` vector:
    ```clojure
    ["MyOp" 1 1 true false OP_MY_OP false "MyOp" "what it does"]
    ;; name, stk-in, stk-out, pure?, term?, bytecode, cheap?, display, comment
@@ -144,7 +144,7 @@ Order matters: the iota values in the op enum are positional. Inserting an op in
 
 The IR data is a Lisp atom holding a map. Adding a field means updating both the spec and the hand-written companion:
 
-1. **Edit `examples/go-gen/ir_data.lg`**. Add the field to the appropriate `defirdata` block (Function/Block/Inst/BranchTarget/CondTarget):
+1. **Edit `pkg/ir/ir_data.lg`**. Add the field to the appropriate `defirdata` block (Function/Block/Inst/BranchTarget/CondTarget):
    ```clojure
    (defirdata Inst
      :fields [[:op :kw] [:refs :vec] ... [:my-field :any]]
@@ -161,7 +161,7 @@ The IR data is a Lisp atom holding a map. Adding a field means updating both the
 
 Bridge primitives cross the Go ↔ Lisp boundary and are reserved for VM-substrate operations (chunk emission, op-table queries, value constructors). Adding one to a spec:
 
-1. **Edit `examples/go-gen/ir_bridge.lg`**. Add an `:extras` entry to the relevant `defgostruct` block:
+1. **Edit `pkg/ir/ir_bridge.lg`**. Add an `:extras` entry to the relevant `defgostruct` block:
    ```clojure
    {:name "my-prim" :lisp-name "ir/my-prim"
     :args [Self Int]

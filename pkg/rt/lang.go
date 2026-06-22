@@ -7453,16 +7453,39 @@ func installLangNS() {
 		var resolved *vm.Var
 		if strings.Contains(symStr, "/") {
 			parts := strings.SplitN(symStr, "/", 2)
-			nsMu.RLock()
-			rns := nsRegistry[resolveNSAlias(parts[0])]
+			// Resolve the namespace part. Honor PER-NAMESPACE aliases of the
+			// current ns first (mirrors the compiler): `(require '[gogen :as g])`
+			// registers `g` on the requiring ns, NOT the global alias table — so a
+			// global-only lookup leaves aliased macro calls like `g/gquote`
+			// unexpanded, which is exactly what stalled expand-all in the IR
+			// pipeline. Fall back to the global alias map / direct ns name.
+			var rns *vm.Namespace
+			if cur, ok := CurrentNS.Deref().(*vm.Namespace); ok && cur != nil {
+				rns = cur.ResolveAlias(vm.Symbol(parts[0]))
+			}
+			if rns == nil {
+				nsMu.RLock()
+				rns = nsRegistry[resolveNSAlias(parts[0])]
+				nsMu.RUnlock()
+			}
 			if rns != nil {
 				if v := rns.Lookup(vm.Symbol(parts[1])); v != vm.NIL {
 					resolved, _ = v.(*vm.Var)
 				}
 			}
-			nsMu.RUnlock()
 		} else {
-			if CoreNS != nil {
+			// Unqualified: resolve through the CURRENT namespace first — Clojure
+			// resolves the leading symbol via *ns*, whose mappings include the
+			// core refers, so a macro defined in the current ns expands. Fall
+			// back to clojure.core directly so core macros still expand when *ns*
+			// doesn't refer core (e.g. during bootstrap). The IsMacro gate below
+			// keeps non-macro vars (a plain `(def x 5)`) untouched, as in Clojure.
+			if cur, ok := CurrentNS.Deref().(*vm.Namespace); ok && cur != nil {
+				if v := cur.Lookup(vm.Symbol(symStr)); v != vm.NIL {
+					resolved, _ = v.(*vm.Var)
+				}
+			}
+			if resolved == nil && CoreNS != nil {
 				if v := CoreNS.Lookup(vm.Symbol(symStr)); v != vm.NIL {
 					resolved, _ = v.(*vm.Var)
 				}
@@ -7726,7 +7749,7 @@ func installLangNS() {
 	})
 	ns.Def("==", numericEq)
 
-	// IR namespace primitives — declared in examples/go-gen/ir_bridge.lg,
+	// IR namespace primitives — declared in pkg/ir/ir_bridge.lg,
 	// generated into pkg/rt/ir_bridge_generated.go via 'make generate-ir-bridge'.
 	// Creates a real `ir` namespace (registered globally via RegisterNS)
 	// so namespaced Lisp refs like `(ir/new-fn ...)` resolve.

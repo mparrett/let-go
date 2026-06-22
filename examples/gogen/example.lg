@@ -1,8 +1,10 @@
 ;; Worked examples for gogen — refactored to use go/ast directly.
 ;;
-;; Run with:  lg -source-paths examples/go-gen example.lg
+;; Run with:  lg examples/gogen/example.lg   (gogen is on the deps.edn path)
 
-(require '[gogen :as g])
+(ns gogen-example
+  (:require
+   [gogen :as g]))
 
 ;; --- Example 1: hand-written, no splicing ---------------------------
 
@@ -38,10 +40,10 @@
     (func ~(symbol (str "Equal" type-name))
           [(a ~(symbol type-name)) (b ~(symbol type-name))]
           bool
-      (return ~(reduce (fn [acc f]
-                         (g/gquote (&& ~acc (== (field a ~f) (field b ~f)))))
-                       (g/gquote true)
-                       fields)))))
+          (return ~(reduce (fn [acc f]
+                             (g/gquote (&& ~acc (== (field a ~f) (field b ~f)))))
+                           (g/gquote true)
+                           fields)))))
 
 (println "\n--- Example 3: spec-driven equality ---")
 (println (g/render (equal-fn-for "Point" '[X Y Z])))

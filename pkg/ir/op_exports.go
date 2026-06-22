@@ -7,7 +7,7 @@
 package ir
 
 // Public wrappers for helpers generated into op_generated.go. The
-// generated file is rewritten by examples/go-gen/ir_ops.lg and must
+// generated file is rewritten by pkg/ir/ir_ops.lg and must
 // not be hand-edited; keep these exports here so the generator stays
 // pristine.
 

@@ -1,6 +1,6 @@
 ;; Generate pkg/ir/op_generated.go from a single op-spec.
 ;;
-;; Run with: lg -source-paths examples/go-gen examples/go-gen/ir_ops.lg
+;; Run with: lg -source-paths pkg/rt/gogen pkg/ir/ir_ops.lg
 ;;
 ;; Architecture: the entire op catalog lives in `ops` below (a vector
 ;; of vectors — deterministic iteration). From it we drive five
@@ -17,7 +17,9 @@
 ;; "Code generated" header and `package ir` declaration, then writes
 ;; the result to pkg/ir/op_generated.go.
 
-(require '[gogen :as g])
+(ns ir-ops-gen
+  (:require
+   [gogen :as g]))
 
 ;; --- the op catalog -------------------------------------------------
 ;;

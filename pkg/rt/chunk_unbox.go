@@ -13,7 +13,7 @@ import (
 )
 
 // chunkFromBoxed extracts a *vm.CodeChunk from a Lisp Value. The IR
-// chunk primitives generated from examples/go-gen/ir_bridge.lg use
+// chunk primitives generated from pkg/ir/ir_bridge.lg use
 // this as their unbox helper when an arg is declared :Self (the
 // receiver of a chunk method).
 func chunkFromBoxed(v vm.Value) (*vm.CodeChunk, error) {

@@ -1,0 +1,35 @@
+;; Regression test: runtime `macroexpand` must resolve an UNQUALIFIED macro
+;; from the current namespace, matching Clojure.
+;;
+;; Validated against Clojure 1.12 (`clojure -M -e ...`):
+;;   (defmacro m [] 1) (macroexpand '(m))      => 1        ; expands
+;;   (def x 5)         (macroexpand '(x))       => (x)      ; non-macro untouched
+;;   (macroexpand '(inc 1))                     => (inc 1)  ; fn call untouched
+;;   (macroexpand '(undefined 1))               => (undefined 1)
+;;
+;; Before the fix the unqualified branch of `macroexpand` only consulted
+;; clojure.core, so a macro defined in the current ns resolved to nil and the
+;; form came back unexpanded — a divergence from Clojure. The qualified-alias
+;; path (`g/gquote`, added by the gogen-macroexpand work) was unaffected.
+
+(ns test.macroexpand-current-ns-test
+  (:require
+   [test :refer :all]))
+
+(defmacro mx-local [] 1)
+(defmacro mx-wrap [x] (list 'if x 1 0))
+(def mx-not-a-macro 5)
+
+(deftest macroexpand-resolves-unqualified-current-ns-macro
+  (testing "an unqualified macro defined in the current ns expands (Clojure parity)"
+    (is (= 1 (macroexpand '(mx-local)))))
+  (testing "current-ns macro with args expands its body"
+    (is (= '(if true 1 0) (macroexpand '(mx-wrap true))))))
+
+(deftest macroexpand-leaves-non-macros-untouched
+  (testing "a non-macro def in the current ns is returned unchanged"
+    (is (= '(mx-not-a-macro) (macroexpand '(mx-not-a-macro)))))
+  (testing "a plain function call is returned unchanged"
+    (is (= '(inc 1) (macroexpand '(inc 1)))))
+  (testing "an undefined head symbol is returned unchanged"
+    (is (= '(mx-totally-undefined 1) (macroexpand '(mx-totally-undefined 1))))))
