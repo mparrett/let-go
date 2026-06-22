@@ -102,6 +102,7 @@ func installSystemNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("System/exit expected Int")
 		}
+		RunExitHooks() // flush profiling etc.; os.Exit skips deferred funcs
 		os.Exit(int(code))
 		return vm.NIL, nil
 	}))

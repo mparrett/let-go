@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"sync"
 
 	"github.com/nooga/let-go/pkg/bundle"
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -338,11 +339,14 @@ func init() {
 // stops the CPU profile. It is a no-op when neither flag is given, so the
 // caller can invoke it unconditionally.
 //
-// The returned stop must be called explicitly rather than deferred in main():
-// main() exits several paths via os.Exit, which skips deferred functions, and
-// pprof.StopCPUProfile must run for the profile file to be valid. Scoping the
-// start/stop pair to the script/REPL run — the only main() section with no
-// os.Exit — keeps the flush guaranteed without a run()-returns-code refactor.
+// pprof.StopCPUProfile must run for the profile file to be valid, but main()
+// exits several paths via os.Exit, which skips deferred functions. So the stop
+// is NOT deferred: the caller invokes it explicitly at the end of the run
+// section (the only main() section with no os.Exit), and it is also registered
+// with rt.AtExit so the language-level os/exit and System/exit builtins flush
+// it before they call os.Exit. The returned stop is idempotent, so the explicit
+// call and the at-exit hook can't double-close. Hard signals and Go-level
+// panics still bypass it, matching standard os.Exit semantics.
 func startProfiling() func() {
 	stop := func() {}
 	if cpuProfile != "" {
@@ -372,7 +376,10 @@ func startProfiling() func() {
 			}
 		}
 	}
-	return stop
+	var once sync.Once
+	safeStop := func() { once.Do(stop) }
+	rt.AtExit(safeStop) // os/exit and System/exit flush before os.Exit
+	return safeStop
 }
 
 // buildSearchPaths resolves the resolver's path list from the -source-paths
@@ -610,8 +617,9 @@ func main() {
 	}
 
 	// Profile only the script/REPL execution below. This section has no
-	// os.Exit, so the explicit stop at the end of main always runs and flushes
-	// the profile; a deferred stop would be skipped by the os.Exit paths above.
+	// os.Exit, so the explicit stop at the end of main flushes the profile on a
+	// normal return; the rt.AtExit registration covers a script that calls
+	// os/exit or System/exit mid-run.
 	stopProfiling := startProfiling()
 
 	// Script mode: treat only the first positional as the script to run.
