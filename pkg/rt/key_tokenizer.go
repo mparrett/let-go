@@ -1,6 +1,10 @@
 package rt
 
-import "unicode/utf8"
+import (
+	"strconv"
+	"strings"
+	"unicode/utf8"
+)
 
 // nextKey splits exactly one key token off the front of b and returns the
 // token plus the number of bytes consumed.
@@ -121,4 +125,67 @@ func incompleteRune(b []byte) bool {
 		return false // continuation byte or invalid lead — nextKey emits as-is
 	}
 	return len(b) < need
+}
+
+// MouseEvent is a decoded SGR (1006) mouse report. Click-only scope: press and
+// release of the three buttons plus wheel up/down, with Shift/Ctrl/Meta from the
+// button byte. Drag/motion (the 1002/1003 modes) is out of scope, so the motion
+// bit is ignored here — those modes are never enabled.
+type MouseEvent struct {
+	Action            string // "press" | "release"
+	Button            string // "left" | "middle" | "right" | "wheel-up" | "wheel-down" | "none"
+	X, Y              int    // 1-based cell coordinates
+	Shift, Ctrl, Meta bool
+}
+
+// decodeSGRMouse parses one SGR (1006) mouse report:
+//
+//	ESC '[' '<' Cb ';' Cx ';' Cy ('M'|'m')   M = press, m = release
+//
+// Cb is the button byte: low two bits select the button, bit 2/3/4 carry
+// Shift/Meta/Ctrl, bit 6 marks a wheel event. Returns the decoded event and
+// true, or a zero event and false if s is not a well-formed SGR mouse report.
+// nextKey keeps such a report intact as a single token, so this runs on exactly
+// one report at a time.
+func decodeSGRMouse(s string) (MouseEvent, bool) {
+	if !strings.HasPrefix(s, "\x1b[<") || len(s) < 4 {
+		return MouseEvent{}, false
+	}
+	final := s[len(s)-1]
+	if final != 'M' && final != 'm' {
+		return MouseEvent{}, false
+	}
+	parts := strings.Split(s[3:len(s)-1], ";")
+	if len(parts) != 3 {
+		return MouseEvent{}, false
+	}
+	cb, err1 := strconv.Atoi(parts[0])
+	x, err2 := strconv.Atoi(parts[1])
+	y, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return MouseEvent{}, false
+	}
+
+	ev := MouseEvent{
+		X: x, Y: y,
+		Shift: cb&4 != 0,
+		Meta:  cb&8 != 0,
+		Ctrl:  cb&16 != 0,
+	}
+	if final == 'M' {
+		ev.Action = "press"
+	} else {
+		ev.Action = "release"
+	}
+	switch {
+	case cb&64 != 0: // wheel
+		if cb&1 == 0 {
+			ev.Button = "wheel-up"
+		} else {
+			ev.Button = "wheel-down"
+		}
+	default:
+		ev.Button = []string{"left", "middle", "right", "none"}[cb&3]
+	}
+	return ev, true
 }

@@ -270,6 +270,30 @@ func (nativeKeySource) rawPending() bool {
 	return false
 }
 
+// mouseEventMap renders a decoded SGR mouse report as the tagged map read-key
+// hands to Clojure: {:type :mouse :action :press :button :left :x 10 :y 5
+// :mods #{:shift}}. :mods is an empty set when no modifier is held.
+func mouseEventMap(ev MouseEvent) vm.Value {
+	var mods []vm.Value
+	if ev.Shift {
+		mods = append(mods, vm.Keyword("shift"))
+	}
+	if ev.Ctrl {
+		mods = append(mods, vm.Keyword("ctrl"))
+	}
+	if ev.Meta {
+		mods = append(mods, vm.Keyword("meta"))
+	}
+	m := vm.EmptyPersistentMap
+	m = m.Assoc(vm.Keyword("type"), vm.Keyword("mouse")).(*vm.PersistentMap)
+	m = m.Assoc(vm.Keyword("action"), vm.Keyword(ev.Action)).(*vm.PersistentMap)
+	m = m.Assoc(vm.Keyword("button"), vm.Keyword(ev.Button)).(*vm.PersistentMap)
+	m = m.Assoc(vm.Keyword("x"), vm.MakeInt(ev.X)).(*vm.PersistentMap)
+	m = m.Assoc(vm.Keyword("y"), vm.MakeInt(ev.Y)).(*vm.PersistentMap)
+	m = m.Assoc(vm.Keyword("mods"), vm.NewPersistentSet(mods)).(*vm.PersistentMap)
+	return m
+}
+
 func init() { RegisterInstaller(installTermNS) }
 
 // nolint
@@ -355,6 +379,12 @@ func installTermNS() {
 		}
 		if s == "" {
 			return vm.NIL, nil
+		}
+		// Hybrid return: plain keys stay strings (no caller churn), an SGR
+		// mouse report becomes a tagged map. Mouse reports only arrive once
+		// enable-mouse has been called, so string-only callers are unaffected.
+		if ev, ok := decodeSGRMouse(s); ok {
+			return mouseEventMap(ev), nil
 		}
 		return vm.String(s), nil
 	})
@@ -631,6 +661,23 @@ func installTermNS() {
 		return vm.NIL, WriteToOut(ec, "\033[?1049l")
 	})
 	ns.Def("main-screen", mainScreen)
+
+	// enable-mouse — turn on SGR mouse reporting (1000 button tracking + 1006
+	// SGR extended coords). Reports then arrive through read-key as tagged maps
+	// (see decodeSGRMouse). Click-only: drag/motion modes (1002/1003) are not
+	// enabled. The same sequence works through xterm.js for the WASM build.
+	// Callers must pair this with disable-mouse in their cleanup, alongside
+	// restore-mode!, or the terminal is left emitting click escapes.
+	enableMouse := vm.NewCtxNativeFn("enable-mouse", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		return vm.NIL, WriteToOut(ec, "\033[?1000;1006h")
+	})
+	ns.Def("enable-mouse", enableMouse)
+
+	// disable-mouse — turn off the reporting that enable-mouse switched on.
+	disableMouse := vm.NewCtxNativeFn("disable-mouse", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		return vm.NIL, WriteToOut(ec, "\033[?1000;1006l")
+	})
+	ns.Def("disable-mouse", disableMouse)
 
 	// flush — sync the active *out* binding so flush hits the same sink the
 	// term/* bytes did. File-backed handles fsync; buffered embedder writers
