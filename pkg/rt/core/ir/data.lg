@@ -90,6 +90,11 @@
          :entry     0
          :consts    (ir/new-consts)
          :insts     []
+         ;; source-infos live OFF the inst tuple, in a positional (Indexed-RPN)
+         ;; transient vector indexed by nid. Attaching source info (the #1
+         ;; IR mutator by volume) used to copy the whole 6-element inst tuple +
+         ;; the :insts spine per call; the side table is mutated in place.
+         :source-info (transient [])
          :blocks    [{:id 0 :params [] :insts [] :preds [] :term nil}]
          :uses-cache nil
          :uses-dirty? true}))
@@ -129,8 +134,13 @@
     (if (nil? t) :unknown t)))
 
 (defn source-infos [nid f]
-  (let [si (nth (nth (:insts @f) nid) 4)]
-    (if (nil? si) [] si)))
+  ;; Positional read from the side table (see new-fn). Bounds-checked: a nid
+  ;; with no attached source info (or beyond the table's high-water mark)
+  ;; reads as empty.
+  (let [sis (:source-info @f)]
+    (if (< nid (count sis))
+      (let [si (nth sis nid)] (if (nil? si) [] si))
+      [])))
 
 (defn block-params [bid f] (:params (nth (:blocks @f) bid)))
 (defn block-preds  [bid f] (:preds  (nth (:blocks @f) bid)))
@@ -148,7 +158,7 @@
         (let [nid (first remaining)]
           (and (= :load-arg (op nid f))
                (= i (aux nid f))))
-          (first remaining)
+        (first remaining)
         :else (recur (rest remaining))))))
 
 (defn fn-load-arg-type [f i]
@@ -285,8 +295,23 @@
 (defn add-pred! [f bid pred-bid]
   (swap! f update-in [:blocks bid :preds] conj pred-bid))
 
+(defn- ensure-si! [f nid]
+  ;; Grow the source-info side table so index nid is addressable, then return
+  ;; the transient. nids are dense and source info is attached right after an
+  ;; inst is created, so this appends ~1 slot amortized (never a large gap-fill).
+  (let [sis (:source-info @f)]
+    (loop []
+      (when (<= (count sis) nid)
+        (conj! sis nil)
+        (recur)))
+    sis))
+
 (defn add-source-info! [f nid si]
-  (swap! f update-in [:insts nid 4] conj si))
+  ;; In-place positional update — no inst-tuple copy, no :insts spine copy, no
+  ;; swap! (was the #1 IR mutator by call volume).
+  (let [sis (ensure-si! f nid)
+        cur (nth sis nid)]
+    (assoc! sis nid (conj (if (nil? cur) [] cur) si))))
 
 ;; --- pass-time mutators ----------------------------------------------
 
@@ -355,6 +380,11 @@
   (let [src (nth (:insts @f) nid)
         new-id (count (:insts @f))]
     (swap! f update :insts conj src)
+    ;; Carry the source-info side-table entry to the clone (it no longer
+    ;; rides in the inst tuple).
+    (let [src-sis (source-infos nid f)]
+      (when (seq src-sis)
+        (assoc! (ensure-si! f new-id) new-id src-sis)))
     (invalidate-uses-state! f)
     new-id))
 
@@ -451,10 +481,10 @@
                        @acc)
         old-sis      (source-infos old-id f)]
     (when (seq old-sis)
-      (swap! f update-in [:insts new-id 4]
-             (fn [new-sis]
-               (let [nsis (if (nil? new-sis) [] new-sis)]
-                 (vec (distinct (concat nsis old-sis)))))))
+      (let [sis  (ensure-si! f new-id)
+            cur  (nth sis new-id)
+            nsis (if (nil? cur) [] cur)]
+        (assoc! sis new-id (vec (distinct (concat nsis old-sis))))))
     (doseq [cid consumer-ids]
       (swap! f update-in [:insts cid]
              (fn [i]
@@ -465,12 +495,12 @@
                      i        (if (= refs new-refs) i (assoc i 1 new-refs))]
                  (case op
                    :branch
-                     (assoc i 2 (rewrite-branch-target-args aux old-id new-id))
+                   (assoc i 2 (rewrite-branch-target-args aux old-id new-id))
                    :branch-if
-                     (assoc i 2
-                       (-> aux
-                           (assoc :true-target  (rewrite-branch-target-args (:true-target  aux) old-id new-id))
-                           (assoc :false-target (rewrite-branch-target-args (:false-target aux) old-id new-id))))
+                   (assoc i 2
+                     (-> aux
+                         (assoc :true-target  (rewrite-branch-target-args (:true-target  aux) old-id new-id))
+                         (assoc :false-target (rewrite-branch-target-args (:false-target aux) old-id new-id))))
                    i))))) ;; close: case, let, fn, swap!, doseq
     ;; Phase 1: incremental uses-cache update.
     ;; After rewrite, every consumer's old-id ref is now new-id, so
