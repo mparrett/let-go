@@ -655,12 +655,15 @@ func installTermNS() {
 			err = os.Stdout.Sync()
 			fileBacked = true
 		}
-		// fsync on a terminal returns ENOTTY (macOS/BSD); flushing a TTY is a
-		// no-op, so swallow it. Only for a file-backed *out* — an embedder
-		// writer's Sync goes through Flush() and must surface its own errors.
-		// A regular file's fsync never returns ENOTTY, so real I/O errors
-		// (EIO, ENOSPC, …) still propagate.
-		if fileBacked && errors.Is(err, syscall.ENOTTY) {
+		// fsync on terminals and pipes returns ENOTTY, EBADF, or EINVAL
+		// depending on the platform; flushing those fds is a no-op, so swallow
+		// them. Only for a file-backed *out* -- an embedder writer's Sync goes
+		// through Flush() and must surface its own errors. A regular file's
+		// fsync never returns these, so real I/O errors (EIO, ENOSPC, etc.)
+		// still propagate.
+		if fileBacked && (errors.Is(err, syscall.ENOTTY) ||
+			errors.Is(err, syscall.EBADF) ||
+			errors.Is(err, syscall.EINVAL)) {
 			err = nil
 		}
 		return vm.NIL, err
