@@ -34,6 +34,8 @@ Design plans, execution roadmaps, and policy for the let-go implementation. Each
 | Real-world Clojure compat findings | `xsofy-portability-gaps.md` |
 | Clojure-test-suite (jank) workflow | `clojure-test-suite.md` |
 | Testing strategy, conformance | `testing-and-conformance.md` |
+| Docs frontmatter convention + maintenance hook | `frontmatter-hook.md` |
+| Docs judgement-layer report (stale/supersession/index) | `docs-status.md` |
 | Perf ratchet, regression checkpoints, historical baselines | `perf/ratchet.md` |
 | Babashka pod support | `pods.md` |
 | IR fixup / link pass | `els2023-ir-fixup-audit.md` |

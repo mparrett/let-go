@@ -126,6 +126,9 @@ pass. Staleness is a signal for readers (via `last-verified:` and
 - **Tombstone-on-delete** — when a doc is removed, appending a
   pointer to `docs/archived_files.md` with the SHA of the last
   containing commit. Tracked separately.
-- **`docs-status` CLI / agent skill** — a report tool surfacing stale
-  docs, contradictions, missing `authoritative-for:` claims, and
-  similar judgement-level concerns. Tracked separately.
+- **`docs-status` CLI / agent skill** — **shipped.** A read-only report
+  over the judgement-layer fields (stale `last-verified:`, aged
+  `human-verified:`, dangling/asymmetric supersession links, clashing
+  `authoritative-for:` claims, docs missing from the README index). See
+  [`docs-status.md`](docs-status.md) and
+  [`scripts/docs_status.py`](../scripts/docs_status.py).

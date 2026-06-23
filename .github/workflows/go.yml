@@ -164,6 +164,88 @@ jobs:
           echo "$changed"
           echo "$changed" | xargs python3 scripts/docs_frontmatter_hook.py --check
 
+  # Non-blocking judgement-layer report on docs PRs. Unlike docs-frontmatter
+  # (a per-file floor gate), this runs scripts/docs_status.py over the WHOLE
+  # docs/ tree — the supersession / authoritative-for / index checks are
+  # cross-doc and need the full corpus — and writes the result to the run's
+  # step summary (visible in the PR Checks tab, and works for fork PRs since
+  # it needs no write token). It never fails the build: staleness and the
+  # judgement fields are reviewer signals, not gates. See docs/docs-status.md.
+  docs-status:
+    name: docs-status (report)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    # pull-requests: write lets the sticky-comment step post on same-repo PRs.
+    # On cross-repo fork PRs GitHub forces the token read-only regardless, so
+    # the comment step is gated off there and the annotation/summary stand in.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Report docs-status when this PR touches docs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+        run: |
+          git fetch --no-tags --depth=50 origin "${GITHUB_BASE_REF}"
+          changed=$(git diff --name-only --diff-filter=AM \
+            "origin/${GITHUB_BASE_REF}...HEAD" -- ':(glob)docs/**/*.md' || true)
+          if [ -z "$changed" ]; then
+            echo "No docs/**/*.md changed in this PR; skipping docs-status report."
+            exit 0
+          fi
+          report=$(python3 scripts/docs_status.py || true)
+          headline=$(printf '%s\n' "$report" | head -1)
+          {
+            echo '## docs-status report'
+            echo
+            echo 'Read-only judgement-layer scan over the whole `docs/` tree.'
+            echo 'Non-blocking — reviewer signals, not gate failures. See `docs/docs-status.md`.'
+            echo
+            echo '```'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Surface the headline as an annotation + log line so the result is
+          # legible from the PR without opening the run summary: a notice when
+          # clean, a (non-blocking) warning when there's anything to look at.
+          echo "$headline"
+          if printf '%s' "$headline" | grep -q ' 0 findings'; then
+            echo "::notice title=docs-status::${headline} — clean"
+          else
+            echo "::warning title=docs-status::${headline} — see the run summary"
+          fi
+          # Sticky PR comment so the result is legible right on the PR. Only on
+          # same-repo PRs — a cross-repo fork PR's token is read-only and the
+          # POST would 403; there the annotation + summary already cover it.
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "Cross-repo PR — skipping comment (read-only token)."
+            exit 0
+          fi
+          marker='<!-- docs-status-report -->'
+          {
+            printf '%s\n' "$marker"
+            printf '**%s**\n\n' "$headline"
+            printf 'Read-only judgement-layer scan over the whole `docs/` tree. Non-blocking — reviewer signal, not a gate. See `docs/docs-status.md`.\n\n'
+            printf '```\n%s\n```\n' "$report"
+          } > comment.md
+          jq -Rs '{body: .}' comment.md > comment.json
+          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq "first(.[] | select(.body | startswith(\"$marker\")) | .id)" || true)
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input comment.json >/dev/null
+            echo "Updated existing docs-status comment ($existing)."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input comment.json >/dev/null
+            echo "Posted new docs-status comment."
+          fi
+
   # Bootstrap-parity gate (deferred — runs as 'make parity-full' locally).
   # Until parity-full is wired as a CI job, `make check-generated` protects
   # the artifacts parity-full depends on.

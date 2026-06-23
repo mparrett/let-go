@@ -152,7 +152,12 @@ benchmark/letgo
 .lsp
 *.calva-repl
 CLAUDE.md
-.claude
+# Keep local Claude state (settings, sessions) out of the repo, but ship
+# shared skills. .claude/skills/ holds symlinks into the cross-client
+# .agents/skills/ tree so Claude Code (which doesn't scan .agents/ yet)
+# auto-discovers them. See .agents/skills/.
+.claude/*
+!.claude/skills/
 .DS_Store
 .nrepl-port
 
