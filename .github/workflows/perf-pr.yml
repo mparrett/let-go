@@ -10,9 +10,16 @@ name: Perf PR
 # has real within-run variance, so it reports deltas for a human to read rather
 # than gating. A budget gate can come later, once the observed noise floor is
 # known.
+#
+# Opt-in: a two-pass bench is ~35-40 min, too costly to run on every PR. It runs
+# only on PRs carrying the `perf` label — add the label to run it, and it
+# re-runs on each push while the label is on; remove the label to stop. Without
+# the label the job is skipped instantly (no runner minutes). The path filter is
+# a second guard so a labeled doc-only PR still skips.
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'pkg/**'
       - 'cmd/**'
@@ -28,6 +35,10 @@ concurrency:
 
 jobs:
   bench:
+    # Opt-in: only when the PR carries the `perf` label. Unlabeled -> skipped,
+    # no runner allocated. The `labeled` event above fires the run when the
+    # label is added.
+    if: contains(github.event.pull_request.labels.*.name, 'perf')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
