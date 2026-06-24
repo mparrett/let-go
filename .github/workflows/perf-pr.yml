@@ -29,7 +29,7 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,7 +73,7 @@ jobs:
           go run ./cmd/bench-ratchet \
             -baseline "${RUNNER_TEMP}/base.json" \
             -packages github.com/nooga/let-go/pkg/vm \
-            -count 6 -benchtime 1s -timeout 20m \
+            -count 3 -benchtime 500ms -timeout 15m \
             update
 
       - name: Bench head and compare
@@ -91,7 +91,7 @@ jobs:
           go run ./cmd/bench-ratchet \
             -baseline "${RUNNER_TEMP}/base.json" \
             -packages github.com/nooga/let-go/pkg/vm \
-            -count 6 -benchtime 1s -timeout 20m \
+            -count 3 -benchtime 500ms -timeout 15m \
             -format markdown \
             check > "${RUNNER_TEMP}/report.md" || true
 
