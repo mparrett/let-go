@@ -24,21 +24,26 @@ on:
       - 'pkg/**'
       - 'cmd/**'
       - '.github/workflows/perf-pr.yml'
+  # Manual escape hatch: run against any PR by number without touching labels.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to benchmark'
+        required: true
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: perf-pr-${{ github.event.pull_request.number }}
+  group: perf-pr-${{ github.event.pull_request.number || github.event.inputs.pr }}
   cancel-in-progress: true
 
 jobs:
   bench:
-    # Opt-in: only when the PR carries the `perf` label. Unlabeled -> skipped,
-    # no runner allocated. The `labeled` event above fires the run when the
-    # label is added.
-    if: contains(github.event.pull_request.labels.*.name, 'perf')
+    # Opt-in: the `perf` label (pull_request), or a manual workflow_dispatch.
+    # Unlabeled PR events skip the job instantly, with no runner allocated.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'perf')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -54,17 +59,31 @@ jobs:
       - name: Resolve base and head
         id: refs
         env:
-          PR: ${{ github.event.pull_request.number }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT: ${{ github.event_name }}
+          PR_FROM_EVENT: ${{ github.event.pull_request.number }}
+          PR_FROM_INPUT: ${{ github.event.inputs.pr }}
+          BASE_FROM_EVENT: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # workflow_dispatch has no PR context, so take the number from the
+          # input and look the base branch up via the API. pull_request carries
+          # both directly.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            pr="$PR_FROM_INPUT"
+            base_ref="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --jq .base.ref)"
+          else
+            pr="$PR_FROM_EVENT"
+            base_ref="$BASE_FROM_EVENT"
+          fi
           # refs/pull/<n>/head is on the BASE repo for both same-repo and fork
           # PRs, so this resolves the head without needing fork remote access.
-          git fetch --no-tags origin "$BASE_REF" "refs/pull/${PR}/head:pr-head"
+          git fetch --no-tags origin "$base_ref" "refs/pull/${pr}/head:pr-head"
           head_sha="$(git rev-parse pr-head)"
           # The merge-base is the PR's own fork point, so we measure the PR's
           # delta, not unrelated drift that landed on the base branch since.
-          base_sha="$(git merge-base "origin/${BASE_REF}" pr-head)"
+          base_sha="$(git merge-base "origin/${base_ref}" pr-head)"
+          echo "pr=${pr}" >> "$GITHUB_OUTPUT"
           echo "head=${head_sha}" >> "$GITHUB_OUTPUT"
           echo "base=${base_sha}" >> "$GITHUB_OUTPUT"
           echo "Base (merge-base): ${base_sha}"
@@ -145,13 +164,17 @@ jobs:
       - name: Upsert PR comment
         continue-on-error: true
         uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.refs.outputs.pr }}
         with:
           script: |
             const fs = require('fs');
             const marker = '<!-- perf-pr-report -->';
             const body = marker + '\n' + fs.readFileSync(process.env.RUNNER_TEMP + '/comment.md', 'utf8');
             const {owner, repo} = context.repo;
-            const issue_number = context.payload.pull_request.number;
+            // Resolved in the refs step so it works for both pull_request and
+            // workflow_dispatch (where there's no pull_request in the payload).
+            const issue_number = Number(process.env.PR);
             const {data: comments} = await github.rest.issues.listComments({owner, repo, issue_number});
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
