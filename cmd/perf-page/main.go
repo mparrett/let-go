@@ -163,6 +163,8 @@ func main() {
 		timelinePath   = flag.String("timeline", "docs/perf/timeline", "timeline snapshot directory")
 		outPath        = flag.String("out", "docs/perf/index.html", "HTML output path")
 		logoPath       = flag.String("logo", "meta/logo.svg", "logo SVG to embed")
+		cpuFilter      = flag.String("cpu", "", "keep only timeline snapshots whose machine cpu_model contains this substring (CI runs land on ≥2 CPU tiers whose ratio_to_anchor doesn't normalize across them, so a mixed timeline zig-zags ~2x; filtering to one tier gives a clean series). Empty = all.")
+		anchorName     = flag.String("anchor", "", "historical baseline to compare against, by file stem (e.g. 'v1.8.0'); empty = newest. Lets the page swap anchors — e.g. a fresh same-machine baseline for the modern suite vs the legacy v1.8.0 (Apple M3, pre-IR) reference.")
 	)
 	flag.Parse()
 
@@ -170,7 +172,7 @@ func main() {
 	if err != nil {
 		die("load baseline: %v", err)
 	}
-	reference, referenceName, err := loadLatestHistorical(*historicalPath)
+	reference, referenceName, err := loadHistoricalAnchor(*historicalPath, *anchorName)
 	if err != nil {
 		die("load historical baseline: %v", err)
 	}
@@ -178,6 +180,7 @@ func main() {
 	if err != nil {
 		die("load timeline: %v", err)
 	}
+	timeline = filterTimelineByCPU(timeline, *cpuFilter)
 	logo, err := logoDataURI(*logoPath)
 	if err != nil {
 		die("load logo: %v", err)
@@ -200,6 +203,44 @@ func main() {
 func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "perf-page: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// filterTimelineByCPU reports the CPU-tier mix of the timeline and, when sub is
+// non-empty, keeps only snapshots whose machine cpu_model contains it. The mix
+// matters because ratio_to_anchor does not normalize across CI CPU tiers (a
+// trivial ~1ns anchor can't track each microarch's cache/memory/GC profile), so
+// a mixed timeline zig-zags ~2x between tiers and a single point is unreadable.
+// Filtering to one tier yields a clean, comparable series.
+func filterTimelineByCPU(timeline []Snapshot, sub string) []Snapshot {
+	counts := map[string]int{}
+	for _, s := range timeline {
+		cpu := s.Baseline.Machine.CPUModel
+		if cpu == "" {
+			cpu = "(unknown)"
+		}
+		counts[cpu]++
+	}
+	models := make([]string, 0, len(counts))
+	for m := range counts {
+		models = append(models, m)
+	}
+	sort.Slice(models, func(i, j int) bool { return counts[models[i]] > counts[models[j]] })
+	fmt.Fprintf(os.Stderr, "timeline CPU tiers (%d snapshots):\n", len(timeline))
+	for _, m := range models {
+		fmt.Fprintf(os.Stderr, "  %3d  %s\n", counts[m], m)
+	}
+	if sub == "" {
+		return timeline
+	}
+	want := strings.ToLower(sub)
+	kept := make([]Snapshot, 0, len(timeline))
+	for _, s := range timeline {
+		if strings.Contains(strings.ToLower(s.Baseline.Machine.CPUModel), want) {
+			kept = append(kept, s)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "cpu filter %q → kept %d of %d snapshots\n", sub, len(kept), len(timeline))
+	return kept
 }
 
 func loadBaseline(path string) (Baseline, error) {
@@ -258,6 +299,23 @@ func loadLatestHistorical(dir string) (Baseline, string, error) {
 		return all[i].path > all[j].path
 	})
 	return all[0].baseline, all[0].name, nil
+}
+
+// loadHistoricalAnchor selects the comparison baseline. With name empty it
+// keeps the existing behavior (newest historical). With a name (file stem,
+// e.g. "v1.8.0") it loads that specific baseline — so the page can anchor the
+// modern suite to a fresh same-machine baseline while keeping v1.8.0 available
+// as an explicit, labeled legacy reference rather than the silent default.
+func loadHistoricalAnchor(dir, name string) (Baseline, string, error) {
+	if name == "" {
+		return loadLatestHistorical(dir)
+	}
+	path := filepath.Join(dir, name+".json")
+	baseline, err := loadBaseline(path)
+	if err != nil {
+		return Baseline{}, "", fmt.Errorf("anchor %q (%s): %w", name, path, err)
+	}
+	return baseline, name, nil
 }
 
 func loadTimeline(timelineDir, historicalDir string, current Baseline) ([]Snapshot, error) {
