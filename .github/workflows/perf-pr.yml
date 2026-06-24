@@ -95,15 +95,38 @@ jobs:
             -format markdown \
             check > "${RUNNER_TEMP}/report.md" || true
 
-          {
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          header() {
             echo "## Perf (pkg/vm micros) — base vs head, same runner"
             echo
             echo "Base \`${BASE:0:12}\` vs head \`${HEAD:0:12}\`. Anchor-normalized; informational, not a gate."
-            cat "${RUNNER_TEMP}/report.md"
-          } > "${RUNNER_TEMP}/comment.md"
+            echo
+          }
 
-          # The job summary always renders, regardless of comment permissions.
-          cat "${RUNNER_TEMP}/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          # Full table → job summary, which renders on the run page (and is the
+          # only channel that works on fork PRs, where the comment token is RO).
+          { header; sed -n '/\*\*bench-ratchet\*\*/,$p' "${RUNNER_TEMP}/report.md"; } > "${RUNNER_TEMP}/summary.md"
+          cat "${RUNNER_TEMP}/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+          # Abbreviated PR comment: the preamble plus only rows past the budget
+          # (REGRESSION/IMPROVED/NEW/MISSING), then a link to the full table. The
+          # full ~60-row table is too long for a comment; the run summary holds it.
+          total="$(grep -cE '^\| `' "${RUNNER_TEMP}/report.md" || true)"
+          changed="$(grep -E '\| (REGRESSION|IMPROVED|NEW|MISSING) \|$' "${RUNNER_TEMP}/report.md" || true)"
+          shown="$(printf '%s' "$changed" | grep -c . || true)"
+          {
+            header
+            # Preamble (summary + machine + anchor lines) through the table header.
+            sed -n '/\*\*bench-ratchet\*\*/,/^| Benchmark/p' "${RUNNER_TEMP}/report.md"
+            echo "|---|---:|---:|---:|---:|---|---|"
+            if [ -n "$changed" ]; then
+              echo "$changed"
+            else
+              echo "| _nothing past the budget threshold_ | | | | | | |"
+            fi
+            echo
+            echo "_Showing ${shown:-0} of ${total:-0} benchmarks (past budget). [Full table in the run summary →](${run_url})_"
+          } > "${RUNNER_TEMP}/comment.md"
 
       # Sticky PR comment (upsert by marker). Fork PRs get a read-only token, so
       # this can't post there — continue-on-error keeps the job green and the
