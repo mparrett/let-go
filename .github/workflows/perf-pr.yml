@@ -83,9 +83,11 @@ jobs:
           # The merge-base is the PR's own fork point, so we measure the PR's
           # delta, not unrelated drift that landed on the base branch since.
           base_sha="$(git merge-base "origin/${base_ref}" pr-head)"
-          echo "pr=${pr}" >> "$GITHUB_OUTPUT"
-          echo "head=${head_sha}" >> "$GITHUB_OUTPUT"
-          echo "base=${base_sha}" >> "$GITHUB_OUTPUT"
+          {
+            echo "pr=${pr}"
+            echo "head=${head_sha}"
+            echo "base=${base_sha}"
+          } >> "$GITHUB_OUTPUT"
           echo "Base (merge-base): ${base_sha}"
           echo "Head:              ${head_sha}"
 
