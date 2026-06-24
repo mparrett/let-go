@@ -36,11 +36,13 @@ Design plans, execution roadmaps, and policy for the let-go implementation. Each
 | Testing strategy, conformance | `testing-and-conformance.md` |
 | Docs frontmatter convention + maintenance hook | `frontmatter-hook.md` |
 | Docs judgement-layer report (stale/supersession/index) | `docs-status.md` |
+| Regenerating generated artifacts after `.lg` edits | `regenerating-generated-artifacts.md` |
 | Perf ratchet, regression checkpoints, historical baselines | `perf/ratchet.md` |
 | Babashka pod support | `pods.md` |
 | IR fixup / link pass | `els2023-ir-fixup-audit.md` |
 | Parallel IR lowering + determinism | `parallel-lowering-and-type-cache.md` |
 | Runtime I/O, host decoupling | `design/runtime-io-host-decoupling.md` |
+| Off-goroutine execution context threading | `design/exec-context-threading.md` |
 
 ## Reading order if starting cold
 
