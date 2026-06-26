@@ -89,3 +89,26 @@ func runLispString(t *testing.T, expr string) string {
 	}
 	return string(s)
 }
+
+// TestWithRedefsDisablesNativeDirect guards the Var override seam: a body that
+// rebinds a core var via with-redefs must NOT lower calls to that var into a
+// baked native-direct call (corefns.Count), because with-redefs mutates the
+// var root at runtime and the native call would ignore it. The call must fall
+// back to the cached-var / InvokeValue trampoline, which re-reads the root.
+func TestWithRedefsDisablesNativeDirect(t *testing.T) {
+	ensureLoader()
+	rendered := runLispString(t,
+		`(do (create-ns (quote withredefseedns))
+		     (intern (quote withredefseedns) (quote probe))
+		     (ir.passes.pipeline/lower-ns-to-go "withredefseedns" (quote withredefseedns)
+		       [(quote (defn probe [x] (with-redefs [count (fn [_] 42)] (count x))))]))`)
+
+	if strings.Contains(rendered, "corefns.Count(") {
+		t.Fatalf("with-redefs over count must disable native-direct; found baked corefns.Count(...):\n--- go ---\n%s", rendered)
+	}
+	// And the call must still happen — through the var-mediated cached-var
+	// trampoline, which re-reads count's root each call so the redef is seen.
+	if !strings.Contains(rendered, `rt.CachedVarFn(&__v_clojure_core_count, "clojure.core", "count")`) {
+		t.Fatalf("expected count to fall back to the cached-var trampoline:\n--- go ---\n%s", rendered)
+	}
+}

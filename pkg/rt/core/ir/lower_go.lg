@@ -13,6 +13,7 @@
    [clojure.string]
    [graph]
    [ir.data]
+   [ir.passes.mutability :as mut]
    [ir.structurize :as st]))
 
 (def ^:private binary-op
@@ -1374,6 +1375,42 @@
           acc mods)))
     {} native-modules))
 
+(defn native-registry
+  "Build the native half of *lowered-registry* from the modules exposed by
+   (rt/native-modules): a flat {[ns-sym name arity] entry} map. Each native
+   module is {:go-pkg :ns :fns {name {:go-ident :arity :variadic?
+   :param-specs :result-spec :needs-error?}}}.
+
+   Variadic fns are skipped — the direct-call path can't coerce a rest
+   slice, so they stay on the trampoline. Entries are keyed under the
+   INTERNAL ns symbol (internal-ns-sym), matching how lookup-direct-callable
+   derives call-ns, so both qualified (clojure.core/seq) and referred-core
+   (bare seq) calls resolve via resolve-call-entry."
+  [native-modules]
+  (reduce-kv
+    (fn [acc ns-str mods]
+      (let [ns-sym (internal-ns-sym ns-str)]
+        (reduce
+          (fn [acc2 mod]
+            (let [go-pkg (:go-pkg mod)]
+              (reduce-kv
+                (fn [acc3 fn-name desc]
+                  (if (:variadic? desc)
+                    acc3
+                    (assoc acc3
+                           (registry-key ns-sym fn-name (:arity desc))
+                           {:go-name      (:go-ident desc)
+                            :arity        (:arity desc)
+                            :needs-error? (:needs-error? desc)
+                            :param-specs  (vec (:param-specs desc))
+                            :result-spec  (:result-spec desc)
+                            :native?      true
+                            :go-pkg       go-pkg
+                            :variadic?    false})))
+                acc2 (:fns mod))))
+          acc mods)))
+    {} native-modules))
+
 (defn resolve-registry-entry
   "Exact-key lookup into *lowered-registry* (the flat {[ns name arity] entry}
    map). `ns-sym` must be a concrete namespace symbol — nil is NOT a
@@ -1565,6 +1602,15 @@
         (swap! *native-imports-used* conj (:go-pkg entry)))
       stmts)))
 
+;; Bound true while lowering a fn body whose dynamic extent can rebind var
+;; roots (see ir.passes.mutability/rebinds-var-roots?). with-redefs /
+;; alter-var-root / intern mutate the root of an ordinary var at runtime, and
+;; the override is observed through the var — so a baked direct call
+;; (corefns.Count, a lowered sibling's Go func) would ignore it. Under this
+;; flag lookup-direct-callable returns nil so every call falls back to the
+;; cached-var / InvokeValue trampoline, which re-reads the root each call.
+(def ^:dynamic *direct-calls-disabled?* false)
+
 (defn- lookup-direct-callable
   "Direct-call hit. Returns the registry entry when the callee is a :load-var
    resolving (via resolve-call-entry) to a fn in *lowered-registry* — a same-ns
@@ -1579,7 +1625,8 @@
    Returns nil if any condition fails; the caller falls back to the trampoline
    (cached-var IFn dispatch) when nil."
   [f callee-nid arg-count]
-  (when (and (seq *lowered-registry*) (= :load-var (ir/op callee-nid f)))
+  (when (and (not *direct-calls-disabled?*)
+             (seq *lowered-registry*) (= :load-var (ir/op callee-nid f)))
     (let [sym     (symbol (ir/aux callee-nid f))
           sns     (namespace sym)
           call-ns (when sns (internal-ns-sym sns))
@@ -2738,14 +2785,25 @@
             *closure-arg-prefix* (when (seq closed-exprs) (str *closure-arg-prefix* "c" cid "_"))]
     (let [params  (params-for f)
           results (result-node f)
-          body    (lower-body f closed-exprs)]
+          ;; A closure can itself introduce var rebinding (e.g. a (fn [] (with-redefs …)))
+          ;; even when its enclosing fn does not, so re-evaluate the flag here too;
+          ;; OR keeps an enclosing disable in force for this closure's own body.
+          body    (binding [*direct-calls-disabled?* (or *direct-calls-disabled?*
+                                                         (mut/rebinds-var-roots? f))]
+                    (lower-body f closed-exprs))]
       (when (and params results body)
         (gogen/func-lit params results body)))))
 
 (defn- lower-fn* [f mode]
   (let [params  (params-for f)
         results (result-node f)
-        body    (lower-body f)
+        ;; Disable native/typed direct calls in this fn AND its nested closures
+        ;; (lowered within this dynamic extent via lower-fn-lit) when the body
+        ;; can rebind a var root — with-redefs / alter-var-root / intern. The
+        ;; flag is OR'd with any enclosing binding so it only ever widens.
+        body    (binding [*direct-calls-disabled?* (or *direct-calls-disabled?*
+                                                       (mut/rebinds-var-roots? f))]
+                  (lower-body f))
         needs-rt? (function-needs-rt? f)
         needs-error? (function-needs-error? f)
         ;; Every lowered fn now takes an `ec *vm.ExecContext` first parameter,

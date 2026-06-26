@@ -4,16 +4,22 @@
 ;; CSE, LICM, and later GVN should ask this namespace whether a LoadVar
 ;; can be treated as stable instead of embedding mutation policy locally.
 
-(ns ir.passes.mutability)
+(ns ir.passes.mutability
+  (:require [ir.data]))
 
 (def known-var-mutating-builtins
   "Core vars whose calls can mutate var roots. If one appears as an
    OpCall callee, this analysis cannot statically identify the target
-   var, so every LoadVar is treated as unstable."
+   var, so every LoadVar is treated as unstable.
+
+   with-redefs-fn is the post-macroexpansion callee of with-redefs (the
+   macro symbol is gone by the time IR is built); it installs and restores
+   roots via alter-var-root, so it rebinds roots for the extent of its body."
   #{"#'core/alter-var-root"
     "#'core/alter-var-root!"
     "#'core/intern"
-    "#'core/with-redefs"})
+    "#'core/with-redefs"
+    "#'core/with-redefs-fn"})
 
 (defn mutating-var-call? [nid f]
   "True when Inst nid is a call to a known var-root mutating builtin."
@@ -55,3 +61,13 @@
   "True when facts prove loading var-value is stable within the function."
   (and (not (:unknown-all? facts))
        (not (contains? (:mutated-vars facts) var-value))))
+
+(defn rebinds-var-roots? [f]
+  "True when f's body can rebind a var root at runtime — it calls a known
+   var-root-mutating builtin (with-redefs-fn / alter-var-root / intern) or
+   directly set!s a var. A baked direct call (corefns.Count, a lowered
+   sibling's Go func) inside such a body's dynamic extent would ignore the
+   rebind, so callers must fall back to the var-mediated cached-var trampoline."
+  (let [facts (analyze-var-stability f)]
+    (or (:unknown-all? facts)
+        (boolean (seq (:mutated-vars facts))))))
