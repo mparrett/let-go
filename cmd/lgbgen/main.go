@@ -64,13 +64,18 @@ var goLoweringNSOrder = []string{
 	"ir.passes",
 	"ir.dominance",
 	"ir.lattice",
+	"ir.ops",
 	"ir.structurize",
 	"ir.lower",
 	"ir.lower-go",
 	"ir.validate",
+	// purity must precede its dependents (dce/cse/licm :require it) and follow
+	// its own dep (mutability); otherwise a fresh bundle omits purity and
+	// purity/effect-free-inst? resolves to nil at runtime in dce/removable?.
+	"ir.passes.mutability",
+	"ir.passes.purity",
 	"ir.passes.dce",
 	"ir.passes.constfold",
-	"ir.passes.mutability",
 	"ir.passes.cse",
 	"ir.passes.typeinfer",
 	"ir.passes.licm",
@@ -714,7 +719,13 @@ func runGoTarget(outDir string) {
 				fmt.Fprintf(os.Stderr, "%s: read error: %v\n", ns.name, err)
 				os.Exit(1)
 			}
-			if isDefnOnly(form) && isSingleArityDefn(form) {
+			// deftype/defprotocol declaration forms are forwarded raw (no
+			// single-arity gate) so lower-ns-to-go can capture them and emit
+			// native Go interface/struct/methods + bind the ctor/protocol
+			// registries that devirtualize their own namespace's calls.
+			if isDeclForm(form) {
+				defnForms = append(defnForms, form)
+			} else if isDefnOnly(form) && isSingleArityDefn(form) {
 				defnForms = append(defnForms, form)
 			}
 		}
@@ -830,6 +841,26 @@ func writeGogenWireup(pkgNames []string) {
 		}
 		fmt.Printf("  wrote %s (%d pkgs)\n", f.path, len(sorted))
 	}
+}
+
+// isDeclForm returns true if form is a (deftype ...) or (defprotocol ...)
+// declaration. lower-ns-to-go captures these raw (before macroexpansion turns
+// them into runtime make-deftype/extend-type* calls) and emits native Go type
+// declarations + receiver methods, rather than letting them bytecode-bridge.
+func isDeclForm(form vm.Value) bool {
+	list, ok := form.(vm.Sequable)
+	if !ok {
+		return false
+	}
+	seq := list.Seq()
+	if seq == nil {
+		return false
+	}
+	sym, ok := seq.First().(vm.Symbol)
+	if !ok {
+		return false
+	}
+	return string(sym) == "deftype" || string(sym) == "defprotocol"
 }
 
 // isDefnOnly returns true if form is a list beginning with defn or defn-

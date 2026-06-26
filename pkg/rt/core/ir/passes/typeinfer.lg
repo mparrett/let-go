@@ -16,7 +16,8 @@
 (ns ir.passes.typeinfer
   (:require
    [ir.dominance]
-   [ir.lattice :as lat]))
+   [ir.lattice :as lat]
+   [ir.ops :as ops]))
 
 ;; Local aliases for the lifted lattice fns (ir.lattice) so the worklist below
 ;; reads unqualified. (`:refer` snapshots nil in the source-load path; a plain
@@ -30,6 +31,7 @@
 (def union-type? lat/union-type?)
 (def const-type? lat/const-type?)
 (def dtype-type? lat/dtype-type?)
+(def classify-const lat/classify-const)
 (def ti-inc! lat/ti-inc!)
 (def fact-from-type lat/fact-from-type)
 (def state-type lat/state-type)
@@ -159,37 +161,6 @@
                                     (rest t))))
       :else t)))
 
-;; --- Aux value classification ----------------------------------------
-
-(defn classify-const [aux]
-  "Pick a type for a Const's Aux value."
-  (cond
-    (nil?     aux) :nil
-    (= aux true)   :true
-    (= aux false)  :false
-    ;; int? — NOT integer? — for the native :int lattice: a BigInt satisfies
-    ;; integer? but is an arbitrary-precision heap value with no native Go int
-    ;; representation. Typing it :int would route gogen through int-lit (which
-    ;; can't render it) and let constfold treat it as a machine int. It falls to
-    ;; :any below → boxes to vm.Value, like Ratio/BigDecimal.
-    (and (int? aux) (= aux 0)) [:const :int 0]
-    (and (float? aux) (= aux 0.0)) [:const :float 0.0]
-    (int?     aux) :int
-    (float?   aux) :float
-    (ratio?   aux) :ratio
-    (string?  aux) :string
-    (char?    aux) :char
-    ;; Collection/seq literals → concrete lattice kinds, so a value flowing from
-    ;; a literal is typed by the vm interfaces it satisfies (Sequable/Counted/
-    ;; Seq), enabling typed direct calls in lower-go. Order matters: a vector is
-    ;; not a seq?, a map/set are distinct; list? before seq? (a list is a seq).
-    (vector?  aux) :vector
-    (map?     aux) :map
-    (set?     aux) :set
-    (list?    aux) :list
-    (seq?     aux) :cons
-    :else          :any))
-
 ;; --- CFG helpers -----------------------------------------------------
 
 (def terminator-ops #{:branch :branch-if :return})
@@ -280,9 +251,10 @@
 
 (defn infer-one [inst f state]
   (let [op   (ir/op inst f)
-        refs (ir/refs inst f)]
+        refs (ir/refs inst f)
+        ot   (ops/op-type-for op)]
     (cond
-      (= op :const)            (classify-const (ir/aux inst f))
+      (some? ot)                (ops/infer-op op inst f state)
       (= op :load-arg)         (arg-seed inst f state)
       (= op :load-var)         :unknown
       (= op :load-closed)      :unknown

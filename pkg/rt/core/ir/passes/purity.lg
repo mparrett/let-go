@@ -1,0 +1,404 @@
+;; lgbgen:skip-go — not yet wired into the ir-exploration pipeline; bytecode only
+;; Purity analysis — single source of truth for "is this side-effect-free?"
+;; questions, queried at four nested levels:
+;;
+;;   1. pure-op?   — a single op-kind, no Inst context. Static set.
+;;   2. pure-call? — a :call Inst whose target is a registered pure
+;;                   builtin via a STABLE :load-var (per mutability).
+;;   3. pure-inst? — composite: op-level purity OR :load-var stability
+;;                   OR pure call. The right "is this Inst safe to fold,
+;;                   hoist, or delete-when-unused?" predicate.
+;;   4. pure-block? / pure-fn? — block- and function-level rollups.
+;;
+;; Consumers (each :requires this ns explicitly — no transitive reliance):
+;;   - cse.lg   uses pure-ops (+ its own stable :load-var check) for CSE eligibility
+;;   - dce.lg   uses effect-free-inst? to decide removal-when-unused
+;;   - licm.lg  uses pure-op? (purity/pure-ops) to decide hoist eligibility
+;;   - future call-site analyses (devirt, inline) will consume pure-fn?
+;;
+;; The pure-builtins registry is conservative-by-default. If we can't
+;; prove purity we return false: a false-negative leaves the call alone,
+;; a false-positive could fold a side-effect. Start small, grow on demand.
+
+(ns ir.passes.purity
+  (:require
+   [ir.passes.mutability :as mut]))
+
+;; --- Op-level -----------------------------------------------------------
+
+(def pure-ops
+  "Op kinds whose Insts have no observable side effect, independent of
+   their operands or aux. Canonical set — CSE, DCE, and LICM all
+   reference this rather than maintaining their own copies.
+
+   :quot is value-pure (deterministic; no I/O or state) and so is CSE-,
+   LICM-, and DCE-eligible. Deliberate consequence: an UNUSED :quot may be
+   deleted by DCE even when its divisor is zero, dropping the divide-by-zero
+   trap. That is intentional — DCE only removes zero-use Insts, and an
+   unobserved computation's trap is not a guaranteed effect here. A :quot
+   whose value IS used still traps at runtime (verified: (let [x (quot 5 0)]
+   x) => 'divide by zero')."
+  #{:const :load-arg :load-closed :block-arg
+    :add :sub :mul :quot :lt :lte :gt :gte :eq :inc :dec})
+
+(defn pure-op?
+  "True when an op kind is unconditionally pure."
+  [op]
+  (contains? pure-ops op))
+
+(def pure-terminator-ops
+  "Terminator ops that are themselves side-effect-free (control flow /
+   dataflow only). A block whose terminator is in this set can be
+   pure-block? if all its body Insts are pure."
+  #{:branch :branch-if :return})
+
+(defn pure-terminator-op?
+  [op]
+  (contains? pure-terminator-ops op))
+
+;; --- Pure-call registry -------------------------------------------------
+
+(def pure-builtins
+  "Known side-effect-free clojure.core / clojure.string functions.
+   Conservative initial set — constructors, projections, arithmetic,
+   predicates, and pure string ops. No higher-order fns (their purity
+   depends on the callback's purity); no I/O; no transients."
+  #{;; constructors
+    ["clojure.core" "str"]
+    ["clojure.core" "ex-info"]
+    ["clojure.core" "vector"]
+    ["clojure.core" "vec"]
+    ["clojure.core" "list"]
+    ["clojure.core" "list*"]
+    ["clojure.core" "hash-map"]
+    ["clojure.core" "hash-set"]
+    ["clojure.core" "sorted-map"]
+    ["clojure.core" "sorted-set"]
+    ["clojure.core" "into"]
+    ["clojure.core" "concat"]
+    ["clojure.core" "cons"]
+    ["clojure.core" "conj"]
+    ["clojure.core" "assoc"]
+    ["clojure.core" "dissoc"]
+    ["clojure.core" "merge"]
+
+    ;; projections / coercions
+    ["clojure.core" "keyword"]
+    ["clojure.core" "symbol"]
+    ["clojure.core" "name"]
+    ["clojure.core" "namespace"]
+    ["clojure.core" "identity"]
+    ["clojure.core" "constantly"]
+    ["clojure.core" "int"]
+    ["clojure.core" "long"]
+    ["clojure.core" "double"]
+    ["clojure.core" "float"]
+    ["clojure.core" "boolean"]
+    ["clojure.core" "byte"]
+    ["clojure.core" "short"]
+    ["clojure.core" "char"]
+
+    ;; arithmetic
+    ["clojure.core" "+"]
+    ["clojure.core" "-"]
+    ["clojure.core" "*"]
+    ["clojure.core" "/"]
+    ["clojure.core" "mod"]
+    ["clojure.core" "rem"]
+    ["clojure.core" "quot"]
+    ["clojure.core" "max"]
+    ["clojure.core" "min"]
+    ["clojure.core" "abs"]
+    ["clojure.core" "inc"]
+    ["clojure.core" "dec"]
+    ["clojure.core" "inc'"]
+    ["clojure.core" "dec'"]
+
+    ;; comparisons / predicates
+    ["clojure.core" "<"]
+    ["clojure.core" "<="]
+    ["clojure.core" ">"]
+    ["clojure.core" ">="]
+    ["clojure.core" "="]
+    ["clojure.core" "not="]
+    ["clojure.core" "=="]
+    ["clojure.core" "not"]
+    ["clojure.core" "compare"]
+
+    ;; type predicates — pure structural inspection
+    ["clojure.core" "pos?"]
+    ["clojure.core" "neg?"]
+    ["clojure.core" "zero?"]
+    ["clojure.core" "even?"]
+    ["clojure.core" "odd?"]
+    ["clojure.core" "int?"]
+    ["clojure.core" "string?"]
+    ["clojure.core" "keyword?"]
+    ["clojure.core" "symbol?"]
+    ["clojure.core" "nil?"]
+    ["clojure.core" "boolean?"]
+    ["clojure.core" "number?"]
+    ["clojure.core" "float?"]
+    ["clojure.core" "decimal?"]
+    ["clojure.core" "ratio?"]
+    ["clojure.core" "bigint?"]
+    ["clojure.core" "integer?"]
+    ["clojure.core" "rational?"]
+    ["clojure.core" "ident?"]
+    ["clojure.core" "simple-keyword?"]
+    ["clojure.core" "qualified-keyword?"]
+    ["clojure.core" "simple-symbol?"]
+    ["clojure.core" "qualified-symbol?"]
+    ["clojure.core" "map?"]
+    ["clojure.core" "set?"]
+    ["clojure.core" "vector?"]
+    ["clojure.core" "list?"]
+    ["clojure.core" "seq?"]
+    ["clojure.core" "sequential?"]
+    ["clojure.core" "coll?"]
+    ["clojure.core" "associative?"]
+    ["clojure.core" "counted?"]
+    ["clojure.core" "fn?"]
+    ["clojure.core" "ifn?"]
+
+    ;; structural projections
+    ["clojure.core" "count"]
+    ["clojure.core" "empty?"]
+    ["clojure.core" "first"]
+    ["clojure.core" "second"]
+    ["clojure.core" "rest"]
+    ["clojure.core" "next"]
+    ["clojure.core" "last"]
+    ["clojure.core" "butlast"]
+    ["clojure.core" "seq"]
+    ["clojure.core" "vals"]
+    ["clojure.core" "keys"]
+    ["clojure.core" "nth"]
+    ["clojure.core" "get"]
+    ["clojure.core" "get-in"]
+    ["clojure.core" "contains?"]
+    ["clojure.core" "find"]
+    ["clojure.core" "peek"]
+    ["clojure.core" "pop"]
+
+    ;; bitwise
+    ["clojure.core" "bit-and"]
+    ["clojure.core" "bit-or"]
+    ["clojure.core" "bit-xor"]
+    ["clojure.core" "bit-not"]
+    ["clojure.core" "bit-shift-left"]
+    ["clojure.core" "bit-shift-right"]
+    ["clojure.core" "unsigned-bit-shift-right"]
+
+    ;; clojure.string — all entries below are pure projections / formatters
+    ["clojure.string" "lower-case"]
+    ["clojure.string" "upper-case"]
+    ["clojure.string" "capitalize"]
+    ["clojure.string" "join"]
+    ["clojure.string" "split"]
+    ["clojure.string" "split-lines"]
+    ["clojure.string" "replace"]
+    ["clojure.string" "replace-first"]
+    ["clojure.string" "trim"]
+    ["clojure.string" "triml"]
+    ["clojure.string" "trimr"]
+    ["clojure.string" "starts-with?"]
+    ["clojure.string" "ends-with?"]
+    ["clojure.string" "blank?"]
+    ["clojure.string" "includes?"]
+    ["clojure.string" "index-of"]
+    ["clojure.string" "last-index-of"]
+    ["clojure.string" "reverse"]
+    ["clojure.core" "subs"]
+    ["clojure.core" "format"]})
+
+;; --- User-defined-function purity registry -----------------------------
+;;
+;; pure-builtins captures STATICALLY-known pure functions. user-pure-fns
+;; grows during a single compilation run as pure-fn? gets evaluated on
+;; each defn after its optimization passes complete. Topologically-
+;; earlier callees register first, so by the time pure-fn? is checked on
+;; a caller, its callees are already in the registry (when they qualify).
+;;
+;; CONTRACT: the pipeline driver MUST call reset-user-pure-fns! at the top
+;; of each lower-ns-to-go run. Otherwise a stale entry from a prior namespace
+;; poisons the next, and lowering becomes order-dependent (non-deterministic).
+;; NOTE: this registry is not yet wired (see the lgbgen:skip-go header) —
+;; nothing calls reset-user-pure-fns!/register-pure-fn! today — so the leak is
+;; latent until that wiring lands. Wire the reset call at the same time.
+
+(def ns-canonical-aliases
+  "Reverse of pkg/rt/lang.go's nsAliases. let-go stores namespaces
+   under short names (\"core\", \"string\") but Vars report their ns
+   using the Clojure-facing alias (\"clojure.core\", \"clojure.string\").
+   pure-call? reads the alias form via (symbol var); registration
+   reads the canonical form via (ns-name *ns*). Translate at
+   registration time so both ends agree."
+  {"core"   "clojure.core"
+   "test"   "clojure.test"
+   "string" "clojure.string"
+   "set"    "clojure.set"
+   "walk"   "clojure.walk"
+   "edn"    "clojure.edn"
+   "zip"    "clojure.zip"
+   "data"   "clojure.data"
+   "pprint" "clojure.pprint"})
+
+(defn canonical-ns
+  "Map an internal ns name to the Var-facing alias name. Identity for
+   ns names that have no alias."
+  [ns-str]
+  (get ns-canonical-aliases ns-str ns-str))
+
+(def user-pure-fns
+  "Atom-backed set of [ns-string name-string] pairs for user-defined
+   defns proven pure during this compilation run. Consulted by
+   pure-call? alongside the static pure-builtins registry."
+  (atom #{}))
+
+(defn register-pure-fn!
+  "Add a user-defined fn to the in-process purity registry. Called by
+   the pipeline driver after a defn's optimization passes finish AND
+   pure-fn? returned true."
+  [ns-str name-str]
+  (when (System/getenv "LG_PURITY_DEBUG")
+    (println (str "purity/register: " ns-str "/" name-str)))
+  (swap! user-pure-fns conj [ns-str name-str]))
+
+(defn reset-user-pure-fns!
+  "Clear the registry. Called once per lower-ns-to-go run so registrations
+   don't leak across compilation sessions / namespaces."
+  []
+  (reset! user-pure-fns #{}))
+
+(defn user-pure-fn?
+  "True when [ns-str name-str] was registered as pure during this
+   compilation run."
+  [ns-str name-str]
+  (contains? @user-pure-fns [ns-str name-str]))
+
+(defn pure-call?
+  "True when nid is a :call op whose callee resolves to a known-pure
+   function — either a static builtin OR a user-defined fn registered
+   during this compilation run — accessed via a STABLE :load-var.
+
+   Both conditions matter:
+   - Registry membership (static or user) says the function is
+     contractually side-effect-free.
+   - Mutability stability says the Var hasn't been redefined to
+     something that breaks that contract.
+
+   Returns false for any case we can't classify cleanly — closures,
+   :load-closed callees, or vars not in either registry."
+  [f nid var-facts]
+  (and (= :call (ir/op nid f))
+       (let [refs (ir/refs nid f)]
+         (when (pos? (count refs))
+           (let [callee-nid (first refs)]
+             (and (= :load-var (ir/op callee-nid f))
+                  (mut/stable-load-var? var-facts (ir/aux callee-nid f))
+                  (let [aux (ir/aux callee-nid f)
+                        sym (try (symbol aux) (catch e nil))]
+                    (and sym
+                         (let [ns-str (namespace sym)
+                               name-str (name sym)]
+                           (or (contains? pure-builtins [ns-str name-str])
+                               (user-pure-fn? ns-str name-str)))))))))))
+
+;; --- Inst-level (the right predicate for most passes) -------------------
+
+(defn pure-inst?
+  "Strict purity: this Inst is side-effect-free AND yields the same
+   value on each evaluation. Required by CSE (two pure Insts with the
+   same key are interchangeable) and by LICM (hoisting moves an Inst
+   outside its loop, so it must produce the same value when run early).
+
+   Three sources of purity:
+   - op is unconditionally pure (pure-op?).
+   - op is :load-var AND the Var is stable per mutability analysis.
+   - op is :call AND the callee is a registered pure builtin via a
+     stable Var (pure-call?).
+
+   var-facts is the mutability analysis result; pass nil to skip the
+   load-var / call branches."
+  [f nid var-facts]
+  (let [op (ir/op nid f)]
+    (cond
+      (pure-op? op) true
+      (nil? var-facts) false
+      (= op :load-var) (mut/stable-load-var? var-facts (ir/aux nid f))
+      (= op :call)     (pure-call? f nid var-facts)
+      :else false)))
+
+(defn effect-free-inst?
+  "Weaker than pure-inst?: this Inst has no observable side effect when
+   evaluated, but may yield different values on different evaluations.
+   Required by DCE — an unused load-var is always removable (the read
+   itself has no side effect) even when the Var is unstable, because
+   nobody consumes the read.
+
+   The difference from pure-inst? is the :load-var branch: this is
+   true unconditionally; pure-inst? gates on stability."
+  [f nid var-facts]
+  (let [op (ir/op nid f)]
+    (cond
+      (pure-op? op) true
+      (= op :load-var) true
+      (nil? var-facts) false
+      (= op :call)     (pure-call? f nid var-facts)
+      :else false)))
+
+;; --- Block- and function-level rollups ----------------------------------
+
+(defn pure-block?
+  "True when every body Inst in the block is pure-inst? AND the block's
+   terminator is a pure-terminator-op (control flow / return only — no
+   :throw or other effectful terminators). A pure block can be moved,
+   merged, or skipped by aggressive passes without altering semantics."
+  [f bid var-facts]
+  (let [term (ir/block-term bid f)]
+    (and (or (nil? term) (pure-terminator-op? (ir/op term f)))
+         (every? (fn [nid] (pure-inst? f nid var-facts))
+                 (ir/block-insts bid f)))))
+
+(defn pure-fn?
+  "True when every block in f is pure-block?. Such a function is
+   referentially transparent: it can be called speculatively, its
+   results memoized, or its call site folded by CSE just like the
+   pure-builtins in the static registry.
+
+   Two arities:
+
+   - (pure-fn? f)              — for ad-hoc queries; recursive
+                                 self-calls within f count as
+                                 IMPURE unless f is already in the
+                                 registry.
+   - (pure-fn? f self-ns-str self-name-str)
+                               — used during pipeline registration.
+                                 Optimistically pre-registers
+                                 [self-ns self-name] so recursive
+                                 self-calls inside f see it as
+                                 pure; if the overall check fails
+                                 OR throws, the registration is
+                                 rolled back. This is the form the
+                                 pipeline driver calls."
+  ([f]
+   (let [var-facts (mut/analyze-var-stability f)]
+     (every? (fn [bid] (pure-block? f bid var-facts))
+             (ir/blocks f))))
+  ([f self-ns-str self-name-str]
+   ;; Optimistic self-registration so recursive self-calls inside f resolve
+   ;; as pure during analysis. The registration is fully owned by this call:
+   ;; roll it back on a non-true result OR a thrown exception, so a failed or
+   ;; partial proof can never strand a stale "pure" entry. Per the reset
+   ;; contract above no legitimate pre-existing entry for [self-ns self-name]
+   ;; exists here, so the unconditional register/disj pairing is safe.
+   (register-pure-fn! self-ns-str self-name-str)
+   (try
+     (let [result (pure-fn? f)]
+       (when-not result
+         (swap! user-pure-fns disj [self-ns-str self-name-str]))
+       result)
+     (catch e
+       (swap! user-pure-fns disj [self-ns-str self-name-str])
+       (throw e)))))

@@ -28,18 +28,15 @@
 ;;     loop-invariant doesn't trigger re-evaluation of the rest of
 ;;     the loop body — caller can re-run LICM to fixed point)
 ;;   - Doesn't detect/handle side-effect-free OpCall (only the pure
-;;     ops in pure-ops set)
+;;     ops in purity.lg's pure-ops set)
 
 (ns ir.passes.licm
-  (:require [ir.passes :refer []]
-            [ir.dominance :as dom]))
+  (:require
+   [ir.dominance :as dom]
+   [ir.passes]
+   [ir.passes.purity :as purity]))
 
-(def pure-ops
-  "Ops safe to hoist — same as DCE's pure set."
-  #{:const :load-arg :load-closed :block-arg
-    :add :sub :mul :quot :lt :lte :gt :gte :eq :inc :dec})
-
-(defn pure-op? [op] (contains? pure-ops op))
+(defn pure-op? [op] (contains? purity/pure-ops op))
 
 ;; --- back-edge + loop-block detection ---------------------------------
 
@@ -211,41 +208,41 @@
                                       (block-params-map src))]]
             (case op
               :branch
-                (let [tgt (ir/branch-target-target aux)]
-                  (when (body tgt)
-                    ;; Target is in the loop, append val-to-pass to args
-                    (let [new-args (conj (vec (ir/branch-target-args aux)) val-to-pass)
-                          new-bt   (ir/new-branch-target tgt new-args)]
-                      (ir/set-aux! f term new-bt))))
+              (let [tgt (ir/branch-target-target aux)]
+                (when (body tgt)
+                  ;; Target is in the loop, append val-to-pass to args
+                  (let [new-args (conj (vec (ir/branch-target-args aux)) val-to-pass)
+                        new-bt   (ir/new-branch-target tgt new-args)]
+                    (ir/set-aux! f term new-bt))))
               :branch-if
-                (let [tt (ir/cond-target-true aux)
-                      ft (ir/cond-target-false aux)
-                      tt-tgt (ir/branch-target-target tt)
-                      ft-tgt (ir/branch-target-target ft)
-                      tt-in-loop? (body tt-tgt)
-                      ft-in-loop? (body ft-tgt)]
-                  (when (or tt-in-loop? ft-in-loop?)
-                    ;; Symmetric invariant: both targets' args vectors must be identical!
-                    ;; So if either target is in the loop, we must append val-to-pass to both.
-                    ;; If one of the targets is outside the loop, it must be balanced with a new block parameter.
-                    (when (not tt-in-loop?)
-                      (let [pos (count (ir/block-params tt-tgt f))
-                            pid (ir/add-inst f tt-tgt :block-arg [] pos)]
-                        (ir/add-block-param! f tt-tgt pid)
-                        (doseq [si (ir/source-infos val-to-pass f)]
-                          (ir/add-source-info! f pid si))))
-                    (when (not ft-in-loop?)
-                      (let [pos (count (ir/block-params ft-tgt f))
-                            pid (ir/add-inst f ft-tgt :block-arg [] pos)]
-                        (ir/add-block-param! f ft-tgt pid)
-                        (doseq [si (ir/source-infos val-to-pass f)]
-                          (ir/add-source-info! f pid si))))
-                    (let [new-tt (ir/new-branch-target tt-tgt (conj (vec (ir/branch-target-args tt)) val-to-pass))
-                          new-ft (ir/new-branch-target ft-tgt (conj (vec (ir/branch-target-args ft)) val-to-pass))
-                          new-aux (-> aux
-                                      (ir/cond-target-set-true! new-tt)
-                                      (ir/cond-target-set-false! new-ft))]
-                      (ir/set-aux! f term new-aux))))
+              (let [tt (ir/cond-target-true aux)
+                    ft (ir/cond-target-false aux)
+                    tt-tgt (ir/branch-target-target tt)
+                    ft-tgt (ir/branch-target-target ft)
+                    tt-in-loop? (body tt-tgt)
+                    ft-in-loop? (body ft-tgt)]
+                (when (or tt-in-loop? ft-in-loop?)
+                  ;; Symmetric invariant: both targets' args vectors must be identical!
+                  ;; So if either target is in the loop, we must append val-to-pass to both.
+                  ;; If one of the targets is outside the loop, it must be balanced with a new block parameter.
+                  (when (not tt-in-loop?)
+                    (let [pos (count (ir/block-params tt-tgt f))
+                          pid (ir/add-inst f tt-tgt :block-arg [] pos)]
+                      (ir/add-block-param! f tt-tgt pid)
+                      (doseq [si (ir/source-infos val-to-pass f)]
+                        (ir/add-source-info! f pid si))))
+                  (when (not ft-in-loop?)
+                    (let [pos (count (ir/block-params ft-tgt f))
+                          pid (ir/add-inst f ft-tgt :block-arg [] pos)]
+                      (ir/add-block-param! f ft-tgt pid)
+                      (doseq [si (ir/source-infos val-to-pass f)]
+                        (ir/add-source-info! f pid si))))
+                  (let [new-tt (ir/new-branch-target tt-tgt (conj (vec (ir/branch-target-args tt)) val-to-pass))
+                        new-ft (ir/new-branch-target ft-tgt (conj (vec (ir/branch-target-args ft)) val-to-pass))
+                        new-aux (-> aux
+                                    (ir/cond-target-set-true! new-tt)
+                                    (ir/cond-target-set-false! new-ft))]
+                    (ir/set-aux! f term new-aux))))
               nil)))))))
 
 ;; --- driver ---------------------------------------------------------

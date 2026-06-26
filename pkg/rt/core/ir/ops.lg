@@ -1,0 +1,50 @@
+;; ir.ops — IR ops reified as types (S3 walking skeleton).
+;;
+;; Each op's per-op behavior facets (lower-stmts, infer) are co-located on a
+;; single op-type (a deftype implementing IROp), instead of scattered across
+;; cond/case arms in lower_go.lg + typeinfer.lg. op-registry maps the op
+;; keyword to its op-type instance; the dispatch sites consult it first and
+;; fall back to their existing cond for ops not yet reified.
+;;
+;; Leaf namespace: requires ONLY ir.data + ir.lattice (must stay below
+;; typeinfer/lower-go in the load order, else the require graph cycles).
+(ns ir.ops
+  (:require
+   [ir.data :as ir]
+   [ir.lattice :as lat]))
+
+(defprotocol IROp
+  ;; lower-go facet: statements to emit for this inst (mirrors lower-inst-stmts).
+  (op-lower-stmts [this f closed-exprs nid])
+  ;; typeinfer facet: result type for this inst (mirrors infer-one's arm).
+  (op-infer [this inst f state]))
+
+(deftype ConstOp []
+  IROp
+  ;; Consts emit no statement; the value is inlined at uses by value-expr.
+  (op-lower-stmts [this f closed-exprs nid] [])
+  ;; Type comes from the constant value itself.
+  (op-infer [this inst f state] (lat/classify-const (ir/aux inst f))))
+
+;; op-keyword -> op-type instance. Only reified ops appear here; everything
+;; else returns nil from op-type-for and falls back to legacy dispatch.
+(def op-registry {:const (->ConstOp)})
+
+(defn op-type-for [op-kw]
+  (get op-registry op-kw))
+
+;; Devirtualizing dispatch bridges. The op-keyword set is closed-world, so each
+;; arm constructs the concrete op-type inline: typeinfer types (->ConstOp) as
+;; [:dtype ConstOp], so under gogen_ir the protocol call lowers to a DIRECT
+;; native method call (recv.OpInfer / recv.OpLowerStmts) instead of boxed var
+;; dispatch. Callers gate on (op-type-for op) first, so the :else arms are
+;; unreachable in practice (defensive nil).
+(defn infer-op [op inst f state]
+  (cond
+    (= op :const) (op-infer (->ConstOp) inst f state)
+    :else nil))
+
+(defn lower-op [op f closed-exprs nid]
+  (cond
+    (= op :const) (op-lower-stmts (->ConstOp) f closed-exprs nid)
+    :else nil))

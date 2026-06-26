@@ -190,7 +190,12 @@ bench-ratchet-full: lowered $(GO)
 bench-ratchet-full-update: lowered $(GO)
 	go run ./cmd/bench-ratchet -full update
 
-clean:
+clean-lowered:
+	$(RM) -r pkg/rt/core_go_lowered
+	$(RM) lg_gogen_ir.go lg_gogen_accel.go cmd/lgbgen/main_gogen_ir.go cmd/lgbgen/main_gogen_accel.go pkg/ir/zz_gogen_ir_wire_test.go pkg/ir/zz_gogen_accel_wire_test.go pkg/rt/generated.provenance
+	@echo "Cleaned lowered Go tree and wireup files"
+
+clean: clean-lowered
 	$(RM) $(LG)
 
 distclean: clean
@@ -326,4 +331,4 @@ ratchets-update: build lowered $(GO)
 	./lg scripts/fanout-ratchet.lg update --go "$$(command -v go)" --no-regen
 
 # PHONY targets are for ones that have conflicting files/dirs present:
-.PHONY: test
+.PHONY: test clean clean-lowered

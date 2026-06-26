@@ -2,22 +2,22 @@
 ;;
 ;; Algorithm (matching OLD pkg/ir/passes/dce.go @ mxpovksx):
 ;;   1. Iterate blocks. For each Inst:
-;;      - if its op is pure AND it has zero uses → remove it.
+;;      - if its op is effect-free AND it has zero uses → remove it.
 ;;   2. Removing an Inst can make its operands dead → iterate to fixed point.
 ;;
 ;; Removal: ir/remove-inst! marks the slot :invalid (InstId stability)
 ;; and rips it from the block's Insts list. The uses cache invalidates
 ;; on each remove; (ir/uses f) rebuilds on next read.
 
-(ns ir.passes.dce)
-
-(def pure-ops
-  "Ops eligible for DCE — same set as LICM's hoist-pure-ops."
-  #{:const :load-arg :load-var :load-closed :block-arg
-    :add :sub :mul :lt :lte :gt :gte :eq :inc :dec})
+(ns ir.passes.dce
+  (:require
+   [ir.passes.purity :as purity]))
 
 (defn- removable? [nid f]
-  (and (pure-ops (ir/op nid f))
+  "An Inst is removable if it's effect-free and has no uses.
+   Uses purity.lg's effect-free-inst? (which is weaker than pure-inst?
+   — a load-var is always effect-free even if the Var is unstable)."
+  (and (purity/effect-free-inst? f nid nil)
        (ir/uses-empty? (nth (ir/uses f) nid))))
 
 (defn- one-pass [f]
@@ -33,7 +33,7 @@
     @removed))
 
 (defn dce [f]
-  "Remove dead pure Insts. Iterates to fixed point — a single sweep
+  "Remove dead effect-free Insts. Iterates to fixed point — a single sweep
    isn't enough because removing one Inst can make its operands dead."
   (loop []
     (when (one-pass f) (recur)))

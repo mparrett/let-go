@@ -1,0 +1,68 @@
+;; Tests for ir.lattice/classify-const and ir.ops op-type machinery
+(ns test.ir-ops-const-optype
+  (:require
+   [ir.data :as ir]
+   [ir.lattice :as lat]
+   [ir.ops :as ops]
+   [ir.passes.typeinfer :as ti]
+   [test :refer :all]))
+
+;; Task 1 tests: classify-const behavior
+(deftest classify-const-nil
+  (testing "nil classifies as :nil"
+    (is (= :nil (lat/classify-const nil)))))
+
+(deftest classify-const-bool
+  (testing "true classifies as :true and false as :false"
+    (is (= :true (lat/classify-const true)))
+    (is (= :false (lat/classify-const false)))))
+
+(deftest classify-const-int
+  (testing "non-zero integers classify as :int; zero as [:const :int 0]"
+    (is (= [:const :int 0] (lat/classify-const 0)))
+    (is (= :int (lat/classify-const 7)))
+    (is (= :int (lat/classify-const -42)))))
+
+(deftest classify-const-float
+  (testing "non-zero floats classify as :float; 0.0 as [:const :float 0.0]"
+    (is (= [:const :float 0.0] (lat/classify-const 0.0)))
+    (is (= :float (lat/classify-const 3.14)))
+    (is (= :float (lat/classify-const -2.7)))))
+
+(deftest classify-const-string
+  (testing "strings classify as :string"
+    (is (= :string (lat/classify-const "")))
+    (is (= :string (lat/classify-const "hello")))))
+
+;; Task 2 tests: op-type machinery
+(deftest const-optype-registered
+  (testing ":const resolves to a ConstOp via the registry"
+    (is (some? (ops/op-type-for :const)))
+    (is (nil? (ops/op-type-for :call)))))
+
+(deftest const-optype-infer
+  (testing "ConstOp/op-infer classifies the inst's aux like classify-const"
+    ;; Build a 1-inst fn whose only inst is (:const 7), then infer it.
+    (let [f   (ir/new-fn "t" 0 false)
+          nid (ir/add-inst f 0 :const [] 7)
+          ot  (ops/op-type-for :const)]
+      (is (= (lat/classify-const 7) (ops/op-infer ot nid f nil))))))
+
+(deftest const-optype-lower
+  (testing "ConstOp/op-lower-stmts matches the legacy :const arm (no statements)"
+    (let [f   (ir/new-fn "t" 0 false)
+          nid (ir/add-inst f 0 :const [] 7)
+          ot  (ops/op-type-for :const)]
+      (is (= [] (ops/op-lower-stmts ot f nil nid))))))
+
+;; Task 3 test: infer-one routes :const through the registry
+(deftest infer-one-routes-const-through-optype
+  (testing "infer-one routes :const through op-type registry"
+    (let [f   (ir/new-fn "test" 0 false)
+          nid (ir/add-inst f 0 :const [] 3.5)
+          _   (ti/typeinfer f)                       ;; Run inference
+          ty  (ir/type-of nid f)]                    ;; Get inferred type
+      ;; The op-type machinery should infer the type as :float.
+      (is (= :float ty))
+      ;; Verify it matches what classify-const directly returns.
+      (is (= (lat/classify-const 3.5) ty)))))

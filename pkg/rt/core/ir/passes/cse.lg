@@ -4,7 +4,7 @@
 ;;   For each block:
 ;;     hash-table seen: (op refs aux) → first-seen-InstId
 ;;     for each Inst in the block (in body order):
-;;       if op is in pure-cse-ops:
+;;       if op is CSE-eligible (purity/pure-ops, or a stable :load-var):
 ;;         k = (op refs aux)
 ;;         if k in seen: replace all uses of this Inst with seen[k]
 ;;         else: seen[k] = this Inst
@@ -14,14 +14,11 @@
 ;; conservatively mark all vars unstable.
 
 (ns ir.passes.cse
-  (:require [ir.passes.mutability :as mut]))
-
-(def pure-cse-ops
-  "Ops safely CSE-eligible without additional flow analysis. Excludes
-   :call (general effects), :branch / :branch-if / :return
-   (terminators)."
-  #{:const :load-arg :load-closed :block-arg
-    :add :sub :mul :lt :lte :gt :gte :eq :inc :dec})
+  (:require
+   [ir.passes.mutability :as mut]
+   ;; Explicit dependency: cse-eligible? consults purity/pure-ops directly
+   ;; rather than relying on a transitive load or bundle ordering.
+   [ir.passes.purity :as purity]))
 
 (defn- inst-key [nid f]
   "Hashable key identifying this Inst's value. Two Insts with the
@@ -29,7 +26,11 @@
   [(ir/op nid f) (vec (ir/refs nid f)) (ir/aux nid f)])
 
 (defn- cse-eligible? [op nid f var-facts]
-  (or (contains? pure-cse-ops op)
+  ;; Value-pure ops come from purity/pure-ops (the canonical set, shared
+  ;; with DCE and LICM — no local copy to drift). :call and the
+  ;; terminators (:branch/:branch-if/:return) are excluded by omission.
+  ;; :load-var is eligible only when mutability proves the Var stable.
+  (or (contains? purity/pure-ops op)
       (and (= op :load-var)
            (mut/stable-load-var? var-facts (ir/aux nid f)))))
 

@@ -65,6 +65,35 @@
 (def ^:private counted-kinds #{:vector :map :set :list :cons :lazyseq :string})
 (def ^:private seq-kinds     #{:vector :map :set :list :cons :lazyseq :string})
 
+(defn classify-const [aux]
+  "Pick a type for a Const's Aux value."
+  (cond
+    (nil?     aux) :nil
+    (= aux true)   :true
+    (= aux false)  :false
+    ;; int? — NOT integer? — for the native :int lattice: a BigInt satisfies
+    ;; integer? but is an arbitrary-precision heap value with no native Go int
+    ;; representation. Typing it :int would route gogen through int-lit (which
+    ;; can't render it) and let constfold treat it as a machine int. It falls to
+    ;; :any below → boxes to vm.Value, like Ratio/BigDecimal.
+    (and (int? aux) (= aux 0)) [:const :int 0]
+    (and (float? aux) (= aux 0.0)) [:const :float 0.0]
+    (int?     aux) :int
+    (float?   aux) :float
+    (ratio?   aux) :ratio
+    (string?  aux) :string
+    (char?    aux) :char
+    ;; Collection/seq literals → concrete lattice kinds, so a value flowing from
+    ;; a literal is typed by the vm interfaces it satisfies (Sequable/Counted/
+    ;; Seq), enabling typed direct calls in lower-go. Order matters: a vector is
+    ;; not a seq?, a map/set are distinct; list? before seq? (a list is a seq).
+    (vector?  aux) :vector
+    (map?     aux) :map
+    (set?     aux) :set
+    (list?    aux) :list
+    (seq?     aux) :cons
+    :else          :any))
+
 ;; --- diagnostic instrumentation ---
 ;; Bind *ti-counters* to an atom-map around an analysis to record per-pass
 ;; counts (e.g. type-join / normalize calls). Zero overhead when nil; used by

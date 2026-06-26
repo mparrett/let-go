@@ -13,6 +13,7 @@
    [clojure.string]
    [graph]
    [ir.data]
+   [ir.ops :as ops]
    [ir.passes.mutability :as mut]
    [ir.structurize :as st]))
 
@@ -1956,7 +1957,10 @@
       (= op :load-closed) []
       (and (= op :const) (any-fn-template? aux))
       []
-      (= op :const)     []
+      (and (= op :const) (some? (ops/op-type-for op)))
+      (ops/lower-op op f closed-exprs nid)
+      (= op :const)
+      []
       (= op :make-closure) []
       (= op :push-closed)  []
       (= op :block-arg) []
