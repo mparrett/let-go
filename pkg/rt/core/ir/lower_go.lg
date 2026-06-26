@@ -1818,9 +1818,9 @@
         body-id    (nth refs 0)
         handler-id (when has-handler? (nth refs 1))
         finally-id (when has-finally? (nth refs (if has-handler? 2 1)))
-        body-x     (box-as-value f closed-exprs body-id)
-        handler-x  (when handler-id (box-as-value f closed-exprs handler-id))
-        finally-x  (when finally-id (box-as-value f closed-exprs finally-id))
+        body-x     (try (box-as-value f closed-exprs body-id) (catch _ nil))
+        handler-x  (when handler-id (try (box-as-value f closed-exprs handler-id) (catch _ nil)))
+        finally-x  (when finally-id (try (box-as-value f closed-exprs finally-id) (catch _ nil)))
         ;; result target (pre-declared value-ident, or '_' when unused)
         target     (if (live? f nid) (value-ident f nid) (gogen/ident "_"))
         ;; per-inst-unique temp names so multiple trys in one fn don't clash
