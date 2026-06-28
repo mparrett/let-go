@@ -31,14 +31,16 @@ func TestAssembleHTMLGolden(t *testing.T) {
 		name     string
 		shell    bool
 		external bool
+		hostEval bool
 		golden   string
 	}{
-		{"xterm shell, inline wasm", true, false, "assemble_golden.html"},
-		{"shell-less core, inline wasm", false, false, "assemble_golden_shellless.html"},
-		{"xterm shell, external wasm", true, true, "assemble_golden_external.html"},
-		{"shell-less core, external wasm", false, true, "assemble_golden_shellless_external.html"},
+		{"xterm shell, inline wasm", true, false, false, "assemble_golden.html"},
+		{"shell-less core, inline wasm", false, false, false, "assemble_golden_shellless.html"},
+		{"xterm shell, external wasm", true, true, false, "assemble_golden_external.html"},
+		{"shell-less core, external wasm", false, true, false, "assemble_golden_shellless_external.html"},
+		{"shell-less core, external wasm, host-eval", false, true, true, "assemble_golden_hosteval.html"},
 	} {
-		got := AssembleHTML(wasmExecJS, wasmGzB64, tc.shell, tc.external)
+		got := AssembleHTML(wasmExecJS, wasmGzB64, tc.shell, tc.external, tc.hostEval)
 		goldenPath := filepath.Join("testdata", tc.golden)
 
 		if *updateGolden {
@@ -72,17 +74,20 @@ func TestAssembleHTMLGolden(t *testing.T) {
 func TestMarkersGone(t *testing.T) {
 	for _, shell := range []bool{true, false} {
 		for _, external := range []bool{true, false} {
-			got := AssembleHTML("anything", "whatever", shell, external)
-			for _, m := range []string{
-				"__WASM_EXEC_JS__",
-				"__WASM_MODE__",
-				"__WASM_GZ_B64__",
-				"__LG_HOST_JS_BODY_PLACEHOLDER__",
-				"__LG_XTERM_CSS__",
-				"__LG_XTERM_JS__",
-			} {
-				if contains(got, m) {
-					t.Errorf("shell=%v external=%v: marker %q still present in assembled output", shell, external, m)
+			for _, hostEval := range []bool{true, false} {
+				got := AssembleHTML("anything", "whatever", shell, external, hostEval)
+				for _, m := range []string{
+					"__WASM_EXEC_JS__",
+					"__WASM_MODE__",
+					"__WASM_GZ_B64__",
+					"__LG_HOST_EVAL__",
+					"__LG_HOST_JS_BODY_PLACEHOLDER__",
+					"__LG_XTERM_CSS__",
+					"__LG_XTERM_JS__",
+				} {
+					if contains(got, m) {
+						t.Errorf("shell=%v external=%v hostEval=%v: marker %q still present in assembled output", shell, external, hostEval, m)
+					}
 				}
 			}
 		}

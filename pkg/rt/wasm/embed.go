@@ -43,9 +43,10 @@ const (
 // client binds its own shell to window.LetGoHost. With externalWasm == true
 // the payload is delivered as a separate main.wasm the loader fetches and
 // streams (wasmGzB64 is ignored); otherwise it is gzip-base64 inlined into the
-// page. Pure function: same inputs produce same output. Tested via golden
-// files in testdata/.
-func AssembleHTML(wasmExecJS, wasmGzB64 string, shell, externalWasm bool) string {
+// page. With hostEval == true the page exposes LetGoHost.eval (the -w-host-eval
+// bundle); when false it is omitted, so feature detection stays honest. Pure
+// function: same inputs produce same output. Tested via golden files in testdata/.
+func AssembleHTML(wasmExecJS, wasmGzB64 string, shell, externalWasm, hostEval bool) string {
 	execJSON, _ := json.Marshal(wasmExecJS)
 
 	// WASM_MODE selects the loader path; in external mode the inline payload
@@ -57,10 +58,12 @@ func AssembleHTML(wasmExecJS, wasmGzB64 string, shell, externalWasm bool) string
 	}
 	modeJSON, _ := json.Marshal(mode)
 	b64JSON, _ := json.Marshal(wasmGzB64)
+	hostEvalJSON, _ := json.Marshal(hostEval) // true | false -> gates LetGoHost.eval
 
 	hostJS := mustReplaceOnce(lgHostCoreJS, "__WASM_EXEC_JS__", string(execJSON))
 	hostJS = mustReplaceOnce(hostJS, "__WASM_MODE__", string(modeJSON))
 	hostJS = mustReplaceOnce(hostJS, "__WASM_GZ_B64__", string(b64JSON))
+	hostJS = mustReplaceOnce(hostJS, "__LG_HOST_EVAL__", string(hostEvalJSON))
 
 	css, js := "", ""
 	if shell {

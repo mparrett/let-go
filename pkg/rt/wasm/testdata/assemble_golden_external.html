@@ -46,6 +46,7 @@ if (!crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigat
 const WASM_EXEC_JS = "// stub wasm_exec.js for the golden test\nconsole.log('exec stub');\n";
 const WASM_MODE = "external";
 const WASM_GZ_B64 = ""; // inline payload; "" in external mode
+const HOST_EVAL = false;  // built with -w-host-eval? gates LetGoHost.eval
 // External mode resolves the payload to an absolute URL so the Blob-URL worker
 // (whose relative base is the blob, not the page) can fetch it. A client can
 // override this to point at its own CDN.
@@ -77,6 +78,9 @@ async function decompressWasm(b64) {
 //   onEmit(cb)        register sink for js/emit events; cb(name, parsedData)
 //   sendInput(str)    inject UTF-8 keystrokes/bytes toward the VM
 //   setSize(c, r)     advertise a new terminal size to the VM
+//   eval(code)        -w-host-eval bundles only: run code in the loaded image,
+//                     -> Promise<string> (stringified value or error). Direct
+//                     call on the main thread, worker round-trip when isolated.
 //
 // wake() is intentionally NOT in this slice. Unblocking a parked read-key
 // without sending real input requires a SAB-level protocol change (a
@@ -123,6 +127,34 @@ window.LetGoHost = (function() {
     _ready(mode) { readyMode = mode; if (readyCb) readyCb(mode); },
   };
 })();
+
+// --- LetGoHost.eval plumbing (-w-host-eval bundles only) ---
+// runtimeReady resolves once the wasm runtime has installed its _lgEval hook and
+// called _lgRuntimeReady (wired per boot mode below). evalImpl is installed by
+// whichever boot mode runs: a direct _lgEval call on the main thread, or a worker
+// round-trip when cross-origin isolated. The vars stay declared in every bundle
+// (the boot relays below reference them), but eval is exposed only when the bundle
+// was built with -w-host-eval: a default bundle never calls _lgRuntimeReady, so an
+// installed eval would await a ready signal that never comes (hang) and would lie
+// to feature detection. Omitting it keeps `typeof LetGoHost.eval` honest.
+let runtimeReadyResolve;
+const runtimeReady = new Promise((r) => { runtimeReadyResolve = r; });
+let evalImpl = null;
+let evalSeq = 0;
+const evalPending = new Map();
+// Worker-path safety net: a worker crash or dropped message means the
+// 'eval-result' reply never arrives, so without this the pending entry leaks
+// and the caller's Promise hangs forever. The timer rejects + removes the entry
+// so the leak is bounded and the caller sees a failure. A late reply arriving
+// after the timeout is harmless — its id is already gone from evalPending and
+// the result is dropped. Generous by design: the worker runs eval synchronously,
+// so this guards lost responses, not slow-but-valid evaluation.
+const EVAL_TIMEOUT_MS = 30000;
+if (HOST_EVAL) {
+  window.LetGoHost.eval = function(code) {
+    return runtimeReady.then(() => evalImpl(code));
+  };
+}
 
 // Boot status text. May be absent when a client ships its own HTML without
 // a #status element, so every use is guarded.
@@ -219,7 +251,20 @@ async function startWorkerMode() {
     globalThis._lgEmit = function(name, dataJson) {
       postMessage({t:'emit', name, data: dataJson});
     };
+    // Host-eval (worker): the runtime sets globalThis._lgEval, then calls this to
+    // announce readiness; relay to the main thread so it can resolve the gate.
+    globalThis._lgRuntimeReady = function() {
+      postMessage({t:'host-eval-ready'});
+    };
     onmessage = async (e) => {
+      if (e.data.t === 'eval') {
+        // Runs synchronously even while the program is parked on go.run: an
+        // async onmessage doesn't block the worker, and the _lgEval FuncOf
+        // returns its value on the calling stack.
+        const r = globalThis._lgEval ? globalThis._lgEval(e.data.code) : 'error: runtime not ready';
+        postMessage({t:'eval-result', id: e.data.id, result: r});
+        return;
+      }
       if (e.data.t !== 'init') return;
       const { sab, mode, wasmModule, wasmGzB64, wasmExecJS, urlSearch } = e.data;
       globalThis._lgKeyInt32 = new Int32Array(sab);
@@ -277,6 +322,30 @@ async function startWorkerMode() {
     if (e.data.t === 'emit') {
       try { window.LetGoHost._emit(e.data.name, JSON.parse(e.data.data)); }
       catch (err) { console.error('lg emit relay:', err); }
+    }
+    // Host-eval relay: the worker runs the eval and posts the string back,
+    // matched to its request id. evalImpl is installed here (not at startup) so
+    // it only exists once the worker's runtime is actually ready.
+    if (e.data.t === 'host-eval-ready') {
+      evalImpl = (code) => new Promise((resolve, reject) => {
+        const id = ++evalSeq;
+        const timer = setTimeout(() => {
+          if (evalPending.delete(id)) {
+            reject(new Error('LetGoHost.eval: no worker response within ' + EVAL_TIMEOUT_MS + 'ms'));
+          }
+        }, EVAL_TIMEOUT_MS);
+        evalPending.set(id, { resolve, timer });
+        worker.postMessage({t:'eval', id, code});
+      });
+      runtimeReadyResolve();
+    }
+    if (e.data.t === 'eval-result') {
+      const pending = evalPending.get(e.data.id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        evalPending.delete(e.data.id);
+        pending.resolve(e.data.result);
+      }
     }
   };
 
@@ -352,6 +421,12 @@ async function startMainThreadMode() {
   globalThis._lgEmit = function(name, dataJson) {
     try { window.LetGoHost._emit(name, JSON.parse(dataJson)); }
     catch (err) { console.error('lg emit:', err); }
+  };
+  // Host-eval (main thread): the runtime sets window._lgEval, then calls this to
+  // announce readiness. Eval runs in-page, so dispatch is a direct call.
+  globalThis._lgRuntimeReady = function() {
+    evalImpl = (code) => window._lgEval(code);
+    runtimeReadyResolve();
   };
 
   // Load wasm_exec.js

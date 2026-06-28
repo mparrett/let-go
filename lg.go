@@ -302,6 +302,7 @@ var bundleBase string
 var wasmOutput string
 var wasmShell string
 var wasmPayload string
+var wasmHostEval bool
 var storageID string
 var sourcePaths string
 var resourcePaths string
@@ -320,6 +321,7 @@ func init() {
 	flag.StringVar(&wasmOutput, "w", "", "build .lg file into a WASM web app (specify output directory)")
 	flag.StringVar(&wasmShell, "w-shell", "xterm", "shell for -w: 'xterm' (default) or 'none' (emit core only; client supplies its own shell via window.LetGoHost)")
 	flag.StringVar(&wasmPayload, "w-wasm", "inline", "wasm delivery for -w: 'inline' (default; gzip-base64 baked into index.html) or 'external' (emit a separate main.wasm the loader fetches + streams)")
+	flag.BoolVar(&wasmHostEval, "w-host-eval", false, "for -w: expose LetGoHost.eval(code) to call into the loaded image and keep it live (park after the program's main returns); works in both boot modes. Pair with -w-shell none")
 	flag.StringVar(&storageID, "storage-id", "", "logical storage store id for the storage namespace (default: script name, or current directory for main.lg)")
 	flag.StringVar(&sourcePaths, "source-paths", "",
 		"namespace search paths separated by the OS path-list separator "+
@@ -589,7 +591,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: -w-wasm must be 'inline' or 'external', got %q\n", wasmPayload)
 			os.Exit(1)
 		}
-		if err := buildWasm(context, nsResolver, files[0], wasmOutput, wasmShell == "xterm", wasmPayload == "external", storageIDForScript(files[0])); err != nil {
+		if err := buildWasm(context, nsResolver, files[0], wasmOutput, wasmShell == "xterm", wasmPayload == "external", wasmHostEval, storageIDForScript(files[0])); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}

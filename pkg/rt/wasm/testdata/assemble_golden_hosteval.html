@@ -1,3 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>let-go app</title>
+
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{height:100%;height:100dvh;background:#0c0c0c;color:#e8e6df;overflow:hidden}
+    body{display:flex;flex-direction:column}
+    #terminal{flex:1;min-height:0}
+    #status{color:#5a584f;font-family:monospace;font-size:13px;padding:1rem;position:absolute;
+            top:50%;left:50%;transform:translate(-50%,-50%)}
+    .xterm{height:100%}
+  </style>
+</head>
+<body>
+  <div id="status">loading...</div>
+  <div id="terminal" style="display:none"></div>
+
+  <script>
 // --- Cross-origin isolation: prefer server headers, fall back to SW ---
 // When the dev/host server sends the COI headers itself (dev/serve.json
 // does this), crossOriginIsolated is already true and we don't need the
@@ -20,10 +42,10 @@ if (!crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigat
 // WASM_MODE is 'inline' (gzip-base64 baked into this page, decoded in JS) or
 // 'external' (a separate main.wasm fetched + stream-compiled). Both load paths
 // ship below; the build picks one via -w-wasm.
-const WASM_EXEC_JS = __WASM_EXEC_JS__;
-const WASM_MODE = __WASM_MODE__;
-const WASM_GZ_B64 = __WASM_GZ_B64__; // inline payload; "" in external mode
-const HOST_EVAL = __LG_HOST_EVAL__;  // built with -w-host-eval? gates LetGoHost.eval
+const WASM_EXEC_JS = "// stub wasm_exec.js for the golden test\nconsole.log('exec stub');\n";
+const WASM_MODE = "external";
+const WASM_GZ_B64 = ""; // inline payload; "" in external mode
+const HOST_EVAL = true;  // built with -w-host-eval? gates LetGoHost.eval
 // External mode resolves the payload to an absolute URL so the Blob-URL worker
 // (whose relative base is the blob, not the page) can fetch it. A client can
 // override this to point at its own CDN.
@@ -443,3 +465,7 @@ async function startMainThreadMode() {
     console.error(err);
   }
 })();
+
+  </script>
+</body>
+</html>
