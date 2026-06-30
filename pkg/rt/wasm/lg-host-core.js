@@ -84,6 +84,9 @@ window.LetGoHost = (function() {
       window.dispatchEvent(new CustomEvent(name, { detail: data }));
     } catch (err) { console.error('lg emit:', err); }
   };
+  // Surface sink — backs onSurface, fed by the binary _lgSurface channel. The
+  // payload is a raw RGBA ArrayBuffer + size; a shell blits it (putImageData).
+  let surfaceSink = null;
   let readyCb = null;
   let readyMode = null; // set if _ready fires before onReady registers
   return {
@@ -96,11 +99,13 @@ window.LetGoHost = (function() {
       if (outputBuffer.length) { for (const s of outputBuffer.splice(0)) cb(s); }
     },
     onEmit(cb) { emitSink = cb; },
+    onSurface(cb) { surfaceSink = cb; },
     sendInput(s) { return window._lgKey ? window._lgKey(s) : false; },
     setSize(c, r) { return window._lgSetSize ? window._lgSetSize(c, r) : undefined; },
     // Internal — invoked by the runtime/relay code below.
     _output(s) { if (outputSink) outputSink(s); else outputBuffer.push(s); },
     _emit(name, data) { emitSink(name, data); },
+    _surface(buf, w, h) { if (surfaceSink) surfaceSink(buf, w, h); },
     _ready(mode) { readyMode = mode; if (readyCb) readyCb(mode); },
   };
 })();
@@ -251,6 +256,12 @@ async function startWorkerMode() {
     globalThis._lgEmit = function(name, dataJson) {
       postMessage({t:'emit', name, data: dataJson});
     };
+    // Worker side of the surface bridge — the Go binding hands us a Uint8Array of
+    // RGBA; transfer its ArrayBuffer to the main thread (the [arr.buffer] transfer
+    // list) so the pixels move without a second copy. The main thread blits it.
+    globalThis._lgSurface = function(arr, w, h) {
+      postMessage({t:'surface', w, h, d: arr.buffer}, [arr.buffer]);
+    };
     // Host-eval (worker): the runtime sets globalThis._lgEval, then calls this to
     // announce readiness; relay to the main thread so it can resolve the gate.
     globalThis._lgRuntimeReady = function() {
@@ -326,6 +337,11 @@ async function startWorkerMode() {
     if (e.data.t === 'emit') {
       try { window.LetGoHost._emit(e.data.name, JSON.parse(e.data.data)); }
       catch (err) { console.error('lg emit relay:', err); }
+    }
+    // Surface relay: the worker transferred the RGBA ArrayBuffer; hand it to the
+    // shell's onSurface sink (which putImageDatas it to a canvas).
+    if (e.data.t === 'surface') {
+      window.LetGoHost._surface(e.data.d, e.data.w, e.data.h);
     }
     // Host-request relay: the worker runs the request and posts the JSON string
     // back, matched to its request id. requestImpl is installed here (not at
@@ -445,6 +461,11 @@ async function startMainThreadMode() {
   globalThis._lgEmit = function(name, dataJson) {
     try { window.LetGoHost._emit(name, JSON.parse(dataJson)); }
     catch (err) { console.error('lg emit:', err); }
+  };
+  // Main-thread side of the surface bridge — no worker hop, so pass the
+  // Uint8Array's buffer straight to the shell's onSurface sink.
+  globalThis._lgSurface = function(arr, w, h) {
+    window.LetGoHost._surface(arr.buffer, w, h);
   };
   // Host-request (main thread): the runtime sets window._lgRequest, then calls
   // this to announce readiness. Requests run in-page, so dispatch is a direct call.
