@@ -220,9 +220,12 @@ func installIOBuiltins(ns *vm.Namespace) {
 		if err != nil {
 			return vm.NIL, err
 		}
+		// A String writes its bytes verbatim, and a byte-array writes its raw bytes
+		// (not its #byte-array[…] repr) so binary output works; anything else falls
+		// back to its printed form.
 		var s string
-		if str, ok := vs[1].(vm.String); ok {
-			s = string(str)
+		if b, ok := asBytes(vs[1]); ok {
+			s = string(b)
 		} else {
 			s = vs[1].String()
 		}

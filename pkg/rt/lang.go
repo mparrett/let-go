@@ -274,6 +274,23 @@ func ClearTaps() {
 	tapsMu.Unlock()
 }
 
+// asBytes returns the raw bytes of a String or a byte-array (an ArrayByte
+// TypedArray) for the binary file/stream sinks (spit, write!). A let-go String
+// already holds arbitrary bytes — read-bytes/read-file return one — but there was
+// no way to *write* a byte-array's bytes: it would stringify to its #byte-array[…]
+// repr. This is the inverse of the `bytes` coercion. ok is false for other values.
+func asBytes(v vm.Value) ([]byte, bool) {
+	switch c := v.(type) {
+	case vm.String:
+		return []byte(string(c)), true
+	case *vm.TypedArray:
+		if c.Kind() == vm.ArrayByte {
+			return c.Unbox().([]byte), true
+		}
+	}
+	return nil, false
+}
+
 // nsAliases maps alternative namespace names to canonical names.
 // e.g. "clojure.core" → "core", "clojure.test" → "test", "clojure.string" → "string"
 // Both names resolve to the same *Namespace object.
@@ -3480,11 +3497,11 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("spit expected String")
 		}
-		contents, ok := vs[1].(vm.String)
+		contents, ok := asBytes(vs[1])
 		if !ok {
-			return vm.NIL, fmt.Errorf("spit expected String")
+			return vm.NIL, fmt.Errorf("spit expected String or byte-array")
 		}
-		err := os.WriteFile(string(filename), []byte(contents), 0644)
+		err := os.WriteFile(string(filename), contents, 0644)
 		if err != nil {
 			return vm.NIL, fmt.Errorf("spit failed: %w", err)
 		}
