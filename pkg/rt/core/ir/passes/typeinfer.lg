@@ -81,16 +81,33 @@
     (= t :transient-set) :set
     :else nil))
 
+;; math fns whose result is ALWAYS a float regardless of argument type. This is
+;; exactly the set registered via mathFn1/mathFn2 in pkg/rt/math.go (which return
+;; vm.Float unconditionally); it deliberately EXCLUDES `round` (returns long,
+;; matching Clojure), `abs` (clojure.core-shadowing, int-preserving), and the
+;; *-exact long ops. Typing these :call results :float gives numeric kernels a
+;; float SOURCE: contagion then carries native float64 through the surrounding
+;; arithmetic (e.g. (- b (math/sqrt disc)) becomes native).
+;; NB: keep in sync with pkg/rt/math.go — a drift here only costs a missed
+;; unbox (stays boxed), never miscompiles, since the runtime still returns Float.
+(def ^:private float-returning-math-fns
+  #{"sin" "cos" "tan" "asin" "acos" "atan" "atan2"
+    "sinh" "cosh" "tanh"
+    "exp" "log" "log10" "expm1" "log1p" "pow"
+    "ceil" "floor" "rint" "sqrt" "cbrt" "hypot"
+    "copy-sign" "next-after"})
+
 (defn- call-core-type
-  "Infer result type for a small set of clojure.core builtins whose result
-   kind is structurally known from operand kinds."
+  "Infer result type for a small set of builtins whose result kind is
+   structurally known from operand kinds (clojure.core) or fixed (math)."
   [inst f state]
   (let [refs (ir/refs inst f)]
     (when (seq refs)
       (let [callee (first refs)
             args   (rest refs)]
         (when-let [[ns name] (load-var-ns+name callee f)]
-          (when (= ns "clojure.core")
+          (cond
+            (= ns "clojure.core")
             (cond
               (= name "transient")
               (when (= 1 (count args))
@@ -106,7 +123,14 @@
                   (when (contains? #{:transient-vector :transient-map :transient-set} t)
                     t)))
 
-              :else nil)))))))
+              :else nil)
+
+            ;; math fns register under both "math" (let-go's historical name) and
+            ;; "clojure.math" (what Clojure code uses) — pkg/rt/math.go. Match both.
+            (or (= ns "math") (= ns "clojure.math"))
+            (when (contains? float-returning-math-fns name) :float)
+
+            :else nil))))))
 
 (defn- numeric-type? [t]
   (or (= t :int)

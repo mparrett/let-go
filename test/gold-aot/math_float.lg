@@ -1,0 +1,10 @@
+;; math intrinsics type :float, so their results unbox to native float64 under
+;; -tags gogen_ir and float contagion carries through the surrounding arithmetic.
+;; The values must match the bytecode engine (differential harness). Also guards
+;; the exclusions: round -> long, so it must stay integer, not float.
+(require '[clojure.math :as m])
+(println [(math/sqrt 2.0)          ; float source
+          (+ (math/sqrt 16.0) 1)   ; contagion: float + int -> float (5.0, not 5)
+          (m/floor 3.7)            ; via clojure.math alias -> float
+          (math/pow 2.0 10.0)      ; mathFn2 -> float
+          (math/round 3.6)])       ; round -> long: stays integer (4, not 4.0)
