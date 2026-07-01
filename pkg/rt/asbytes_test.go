@@ -2,6 +2,8 @@ package rt
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -26,5 +28,49 @@ func TestAsBytes(t *testing.T) {
 	// A non-byte typed array is not byte-coercible.
 	if _, ok := asBytes(vm.NewIntArrayFrom([]int64{1, 2})); ok {
 		t.Fatal("int-array should not be byte-coercible")
+	}
+}
+
+func TestSpitWritesByteArrayVerbatim(t *testing.T) {
+	want := []byte{0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xc8}
+	path := filepath.Join(t.TempDir(), "out.bin")
+
+	spit := LookupCoreVar("spit")
+	if spit == nil {
+		t.Fatal("core/spit not found")
+	}
+	if _, err := spit.Invoke([]vm.Value{
+		vm.String(path),
+		vm.NewByteArrayFrom(append([]byte(nil), want...)),
+	}); err != nil {
+		t.Fatalf("spit: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("spit wrote %v, want %v", got, want)
+	}
+}
+
+func TestWriteWritesByteArrayVerbatim(t *testing.T) {
+	want := []byte{0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xc8}
+	var dst bytes.Buffer
+
+	write := LookupCoreVar("write!")
+	if write == nil {
+		t.Fatal("core/write! not found")
+	}
+	if _, err := write.Invoke([]vm.Value{
+		vm.NewBoxed(NewWriterHandle("test", &dst)),
+		vm.NewByteArrayFrom(append([]byte(nil), want...)),
+	}); err != nil {
+		t.Fatalf("write!: %v", err)
+	}
+
+	if got := dst.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("write! wrote %v, want %v", got, want)
 	}
 }
