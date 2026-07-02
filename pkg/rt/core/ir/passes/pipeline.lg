@@ -32,11 +32,22 @@
    [ir.passes.typeinfer :refer [typeinfer]]
    [ir.validate :refer [validate-fn!]]))
 
+;; Fixpoint rounds for the type epoch. A forward typeinfer types float SOURCES
+;; (math/sqrt results, float consts) and propagates contagion; infer-arg-types
+;; then back-constrains params from now-typed siblings; a following typeinfer
+;; propagates those param types forward. Iterating lets float cascade through
+;; multi-step chains (dx:float -> (* dx t):float -> ox:float). Bounded and cheap
+;; (join is monotone, so it converges); 3 rounds covers realistic chains.
+(def ^:private type-epoch-rounds 3)
+
 (defn- run-typeinfra-epoch [f]
   (let [state0 (lat/seed-state-from-inst-types! (lat/new-typeinfra-state f) f)
-        state1 (infer-arg-types f state0)
-        state2 (typeinfer f state1)]
-    (lat/flush-state-types! state2 f)
+        final  (loop [n 0
+                      s (typeinfer f state0)]
+                 (if (< n type-epoch-rounds)
+                   (recur (inc n) (typeinfer f (infer-arg-types f s)))
+                   s))]
+    (lat/flush-state-types! final f)
     f))
 
 (defn optimize-fn [f]

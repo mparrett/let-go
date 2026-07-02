@@ -16,21 +16,41 @@
    [ir.data]
    [ir.lattice :as lat]))
 
-;; Ops that constrain their operands to be :int. Conservative — we don't
-;; try to distinguish :int from :float here; the dominant case in the
-;; bootstrap codebase is integer arithmetic, and forward typeinfer can
-;; still widen later if needed.
-(def ^:private int-constraint-ops
+;; Ops that constrain their operands to a native numeric type. The default is
+;; :int (the dominant case in the integer-heavy bootstrap stdlib), but an op
+;; whose operands include a CONCRETE float literal constrains :float instead —
+;; matching runtime float contagion, so int arithmetic sitting next to a float
+;; const would already be float anyway. Only concrete float consts are seen
+;; here (this pass runs before forward typeinfer, so aget/sqrt results aren't
+;; typed yet); that's enough to seed float-heavy numeric kernels.
+(def ^:private numeric-constraint-ops
   #{:add :sub :mul :inc :dec
     :lt :lte :gt :gte})
 
-(defn- constraint-from-user [user-op]
-  "Type constraint a user op imposes on its operands.
-   :eq accepts any operand types, so returns :unknown.
-   Returns :unknown for ops that don't constrain."
-  (cond
-    (contains? int-constraint-ops user-op) :int
-    :else                                  :unknown))
+(defn- float-typed? [t]
+  "True if a type is a concrete float — bare :float or a [:const :float v]."
+  (or (= t :float)
+      (and (lat/const-type? t) (= :float (second t)))))
+
+(defn- op-has-float-operand? [user-nid f state]
+  "Does any operand of user-nid carry a concrete float type in the state?"
+  (loop [refs (ir/refs user-nid f)]
+    (if (seq refs)
+      (if (float-typed? (lat/state-type state (first refs)))
+        true
+        (recur (rest refs)))
+      false)))
+
+(defn- constraint-from-user [user-nid f state]
+  "Type constraint the user op at user-nid imposes on its operands.
+   Numeric ops constrain :float when a concrete float operand is present,
+   else :int. Non-constraining ops (e.g. :eq, which accepts any) return
+   :unknown."
+  (let [user-op (ir/op user-nid f)]
+    (cond
+      (contains? numeric-constraint-ops user-op)
+        (if (op-has-float-operand? user-nid f state) :float :int)
+      :else :unknown)))
 
 (defn- join-types [a b]
   "Conservative join: if either side is :unknown, return the other.
@@ -43,7 +63,7 @@
     (= a b)        a
     :else          :unknown))
 
-(defn- infer-one-load-arg [f nid]
+(defn- infer-one-load-arg [f nid state]
   "Walk the users of load-arg inst nid; JOIN their op constraints.
    Returns the joined seed type for the shared typeinfra state."
   (let [inst-count (ir/inst-count f)]
@@ -58,7 +78,7 @@
                               (recur (rest remaining)))
                             false))
               joined' (if uses-nid?
-                        (join-types joined (constraint-from-user (ir/op user-nid f)))
+                        (join-types joined (constraint-from-user user-nid f state))
                         joined)]
           (recur (inc user-nid) joined'))
         joined))))
@@ -80,7 +100,7 @@
        (if (seq remaining)
          (let [nid (first remaining)]
            (if (= :load-arg (ir/op nid f))
-             (let [inferred (infer-one-load-arg f nid)
+             (let [inferred (infer-one-load-arg f nid s)
                    s' (if (not= :unknown inferred)
                         (lat/join-inst-type! s nid inferred)
                         s)]

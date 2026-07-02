@@ -1,0 +1,16 @@
+;; Repro for nooga/let-go#357 — AOT lowering: a param used only in float
+;; arithmetic is typed `int`, so lowered Go does `float64 + int` and won't compile.
+(ns repro)
+
+(defn add-to-float [a]
+  (loop [z 1.5]
+    (if (> z 100.0)
+      z
+      (recur (+ z a)))))
+
+;; The escape-time kernel from the issue — cx/cy suffer the same fate.
+(defn escape [cx cy mi]
+  (loop [zx 0.0 zy 0.0 i 0]
+    (let [zx2 (* zx zx) zy2 (* zy zy)]
+      (if (or (>= i mi) (> (+ zx2 zy2) 4.0)) i
+        (recur (+ (- zx2 zy2) cx) (+ (* 2.0 (* zx zy)) cy) (inc i))))))
