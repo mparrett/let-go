@@ -97,7 +97,9 @@ func (n *NreplServer) Start(port int) error {
 
 	fmt.Printf("nREPL server started on port %d on host 127.0.0.1 - nrepl://127.0.0.1:%d\n", port, port)
 
-	n.wg.Go(func() {
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
 		for {
 			select {
 			case <-n.stop:
@@ -115,7 +117,7 @@ func (n *NreplServer) Start(port int) error {
 				go n.handleConn(conn)
 			}
 		}
-	})
+	}()
 	return nil
 }
 
