@@ -10,6 +10,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"math/big"
@@ -7430,6 +7431,71 @@ func installLangNS() {
 		return vm.NIL, fmt.Errorf("bytes expects String or byte-array, got %s", vs[0].Type().Name())
 	})
 	ns.Def("bytes", bytesf)
+
+	// base64-encode — (base64-encode x) → standard padded base64 String. x is a
+	// String or byte-array; pairs with the byte-array sinks and read-bytes.
+	b64encodef, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		data, ok := asBytes(vs[0])
+		if !ok {
+			return vm.NIL, fmt.Errorf("base64-encode expects String or byte-array, got %s", vs[0].Type().Name())
+		}
+		return vm.String(base64.StdEncoding.EncodeToString(data)), nil
+	})
+	ns.Def("base64-encode", b64encodef)
+
+	// base64-decode — (base64-decode s) → byte-array of the decoded bytes.
+	b64decodef, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		s, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("base64-decode expects String")
+		}
+		data, derr := base64.StdEncoding.DecodeString(string(s))
+		if derr != nil {
+			return vm.NIL, fmt.Errorf("base64-decode: %w", derr)
+		}
+		return vm.NewByteArrayFrom(data), nil
+	})
+	ns.Def("base64-decode", b64decodef)
+
+	// base64url-encode — (base64url-encode x) → URL-safe base64 String, no
+	// padding (RFC 4648 §5, the "base64url"/JWT alphabet). Unlike base64-encode,
+	// the output is safe in URL query params, env vars, and filenames: it uses
+	// -_ instead of +/ and omits = padding, so it needs no percent-encoding.
+	b64urlencodef, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		data, ok := asBytes(vs[0])
+		if !ok {
+			return vm.NIL, fmt.Errorf("base64url-encode expects String or byte-array, got %s", vs[0].Type().Name())
+		}
+		return vm.String(base64.RawURLEncoding.EncodeToString(data)), nil
+	})
+	ns.Def("base64url-encode", b64urlencodef)
+
+	// base64url-decode — (base64url-decode s) → byte-array. Inverse of
+	// base64url-encode; decodes the URL-safe, unpadded alphabet only.
+	b64urldecodef, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		}
+		s, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("base64url-decode expects String")
+		}
+		data, derr := base64.RawURLEncoding.DecodeString(string(s))
+		if derr != nil {
+			return vm.NIL, fmt.Errorf("base64url-decode: %w", derr)
+		}
+		return vm.NewByteArrayFrom(data), nil
+	})
+	ns.Def("base64url-decode", b64urldecodef)
 
 	// ints — coerce seq to int-array
 	intsf, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
