@@ -5,7 +5,21 @@
 
 package vm
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
+
+// multiCacheEntry is one monomorphic dispatch-value cache slot: the last
+// dispatch value seen and the method it resolved to (already accounting for the
+// default fallback). Behind an atomic.Pointer so a concurrent invoke sees a
+// consistent (dv, method) pair. No generation tag is needed — a MultiFn's
+// method table is immutable for its lifetime (AddMethod/RemoveMethod build a
+// fresh MultiFn), so an entry can never go stale for the instance holding it.
+type multiCacheEntry struct {
+	dv     Value
+	method Fn
+}
 
 // MultiFn implements Clojure-style multimethods.
 // It holds a dispatch function and a map of dispatch-value → method.
@@ -20,6 +34,19 @@ type MultiFn struct {
 	// defmethod replaces the var's value with an unfrozen one, which is the
 	// signal the generated guard uses to fall back to runtime dispatch.
 	frozen bool
+
+	// cache is a monomorphic dispatch-value cache: it skips the method-table
+	// probe (and the default-fallback probe) when the dispatch value repeats.
+	// It cannot skip the dispatch function itself — that computes dv from args
+	// and must run every call. Only scalar (== -comparable) dispatch values are
+	// cached; see multiCacheableKey.
+	cache atomic.Pointer[multiCacheEntry]
+
+	// mega latches when a second live dispatch value is seen. A single slot
+	// can't serve a polymorphic site, and storing on every miss would allocate
+	// an entry per call — worse than no cache. Once latched we stop caching and
+	// fall back to the table probe. (N-way cache is the fix — future work.)
+	mega atomic.Bool
 }
 
 func NewMultiFn(name string, dispatchFn Fn, defaultVal Value) *MultiFn {
@@ -71,10 +98,29 @@ func (m *MultiFn) Invoke(args []Value) (Value, error) {
 // caller's context rather than the root. Mirrors the Closure/MultiArityFn ec
 // threading.
 func (m *MultiFn) invokeIn(ec *ExecContext, args []Value) (Value, error) {
-	// Call dispatch function
+	// Call dispatch function. Unavoidable: dv is computed from args by user
+	// code, so no cache can skip this — only the method resolution below.
 	dv, err := ec.Invoke(m.dispatchFn, args)
 	if err != nil {
 		return NIL, fmt.Errorf("multimethod %s dispatch failed: %w", m.name, err)
+	}
+
+	// Monomorphic cache, active only while the site stays monomorphic. The
+	// guard is a Value == compare; it never panics because entries are only
+	// stored for comparable-typed dv (an uncomparable dv has a different dynamic
+	// type from the stored key, so == short-circuits to false without comparing
+	// values).
+	if !m.mega.Load() {
+		if e := m.cache.Load(); e != nil {
+			if e.dv == dv {
+				if multiCacheStats.Load() {
+					multiCacheHits.Add(1)
+				}
+				return ec.Invoke(e.method, args)
+			}
+			// A second live dispatch value: give up on the single slot.
+			m.mega.Store(true)
+		}
 	}
 
 	// Look up method for dispatch value
@@ -92,8 +138,35 @@ func (m *MultiFn) invokeIn(ec *ExecContext, args []Value) (Value, error) {
 		return NIL, fmt.Errorf("multimethod '%s' method is not a function", m.name)
 	}
 
+	if !m.mega.Load() && multiCacheableKey(dv) {
+		m.cache.Store(&multiCacheEntry{dv: dv, method: fn})
+	}
+	if multiCacheStats.Load() {
+		multiCacheMisses.Add(1)
+	}
 	return ec.Invoke(fn, args)
 }
+
+// multiCacheableKey reports whether dv can key the inline cache: only scalar
+// Value types whose Go == matches the method table's structural equality, plus
+// ValueType singletons (the (defmulti f class) case). Vectors/maps and other
+// composite or uncomparable dispatch values fall through to the table probe.
+func multiCacheableKey(dv Value) bool {
+	switch dv.(type) {
+	case Int, Float, Boolean, String, Keyword, Symbol, Char:
+		return true
+	}
+	_, ok := dv.(ValueType)
+	return ok
+}
+
+// Multimethod inline-cache instrumentation. Off by default (one predictable
+// branch on the hot path); a test flips it to measure hit rate. Spike-only.
+var (
+	multiCacheStats  atomic.Bool
+	multiCacheHits   atomic.Uint64
+	multiCacheMisses atomic.Uint64
+)
 
 // Methods returns the method map.
 func (m *MultiFn) Methods() *PersistentMap {
