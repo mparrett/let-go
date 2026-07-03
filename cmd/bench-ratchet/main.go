@@ -180,8 +180,21 @@ func main() {
 		format       = flag.String("format", "text", "report format: text (default, ANSI terminal), markdown (GitHub/Slack-friendly table), json (the raw baseline)")
 		full         = flag.Bool("full", false, "run the FULL benchmark profile: pkg/vm fleet under -tags plus jank + IR compile under both VM variants. Slow (~25 min) — for mainline profiling and manual deep-dives.")
 		profile      = flag.String("profile", "", "named benchmark profile (e.g. 'pr-fast'). Mutually exclusive with -packages/-filter/-full. Sets the job list plus default count/benchtime/budget; explicit flags still override.")
+		wasm         = flag.Bool("wasm", false, "run benchmarks under GOOS=js/wasm via the go_js_wasm_exec shim (Node), reporting the machine as js/wasm. Forces -tags off (the wasm bundle ships the bytecode VM, not the lowered-Go path). Slower and noisier than native; for the wasm A/B gate.")
 	)
 	flag.Parse()
+
+	// Wasm mode: resolve the exec shim and pin the reported machine to js/wasm.
+	// The benchmark bundle xsofy ships runs the bytecode interpreter, so drop the
+	// gogen_ir tag — it also sidesteps building the lowered-Go tree under js/wasm.
+	if *wasm {
+		shim, err := resolveWasmExec()
+		if err != nil {
+			die("wasm: %v", err)
+		}
+		wasmExec = shim
+		*tags = ""
+	}
 
 	mode := "check"
 	if flag.NArg() > 0 {
@@ -793,9 +806,18 @@ func captureOnePackage(pkg string, count int, benchtime, timeout, tags string, f
 	if tags != "" {
 		args = append(args, "-tags", tags)
 	}
+	if wasmExec != "" {
+		args = append(args, "-exec", wasmExec)
+	}
 	args = append(args, pkg)
 	cmd := exec.Command("go", args...)
-	if len(env) > 0 {
+	switch {
+	case wasmExec != "":
+		// A GOOS=js run needs a trimmed environment: the shim forwards the whole
+		// env into the wasm sandbox via Node argv, overflowing Node's arg-length
+		// limit when the parent env is large (CI, dev shells).
+		cmd.Env = wasmTestEnv(env)
+	case len(env) > 0:
 		cmd.Env = append(os.Environ(), env...)
 	}
 	stdout, err := cmd.StdoutPipe()
@@ -986,10 +1008,52 @@ func buildCurrentBaseline(results []Result, anchor Result) MachineBaseline {
 	}
 }
 
+// wasmExec is the go_js_wasm_exec shim path when running under -wasm, else "".
+// A package var (not threaded) because capture and machine detection both need
+// it and it is set once at startup.
+var wasmExec string
+
+// resolveWasmExec locates the go_js_wasm_exec shim in the active GOROOT. Go 1.21+
+// ships it under lib/wasm; older toolchains under misc/wasm.
+func resolveWasmExec() (string, error) {
+	out, err := exec.Command("go", "env", "GOROOT").Output()
+	if err != nil {
+		return "", fmt.Errorf("go env GOROOT: %w", err)
+	}
+	goroot := strings.TrimSpace(string(out))
+	for _, rel := range []string{"lib/wasm/go_js_wasm_exec", "misc/wasm/go_js_wasm_exec"} {
+		p := filepath.Join(goroot, rel)
+		if _, statErr := os.Stat(p); statErr == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("go_js_wasm_exec not found under %s (lib/wasm or misc/wasm)", goroot)
+}
+
+// wasmTestEnv builds a minimal environment for a GOOS=js `go test` run, keeping
+// only what the toolchain and the Node shim need. See the call site for why the
+// full environment cannot be forwarded.
+func wasmTestEnv(extra []string) []string {
+	e := []string{"GOOS=js", "GOARCH=wasm"}
+	for _, k := range []string{"HOME", "PATH", "GOROOT", "GOCACHE", "GOMODCACHE", "GOPATH", "TMPDIR"} {
+		if v, ok := os.LookupEnv(k); ok {
+			e = append(e, k+"="+v)
+		}
+	}
+	return append(e, extra...)
+}
+
 func detectMachine() Machine {
+	osName, arch := runtime.GOOS, runtime.GOARCH
+	if wasmExec != "" {
+		// The bench binary is native (it shells `go test`), but the benchmarks
+		// execute under js/wasm — report that, so wasm numbers key to their own
+		// machine profile and never mix with the native baseline.
+		osName, arch = "js", "wasm"
+	}
 	return Machine{
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
+		OS:        osName,
+		Arch:      arch,
 		NumCPU:    runtime.NumCPU(),
 		CPUModel:  detectCPUModel(),
 		GoVersion: runtime.Version(),
