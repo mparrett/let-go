@@ -645,7 +645,7 @@ type profile struct {
 // works from that one job, and leaves out the sub-nanosecond families
 // (StackOps, IsTruthy, ConsCreation) and *Parallel variants, whose runner
 // jitter swamps any real signal.
-const prFastFilter = `^Benchmark(RatchetAnchor|FrameDispatch|FrameAlloc|FuncInvoke|MultiArity|VariadicInvoke|StructToRecord|RecordToStructFastPath|RecordToStructSlowPath|VarDerefRoot|VarDerefBound|MapAssoc|SeqIteration|VectorConj|VectorCreation)$`
+const prFastFilter = `^Benchmark(RatchetAnchor|FrameDispatch|FrameAlloc|FuncInvoke|MultiArity|VariadicInvoke|StructToRecord|RecordToStructFastPath|RecordToStructSlowPath|VarDerefRoot|VarDerefBound|MapAssoc|SeqIteration|VectorConj|VectorCreation|MultiDispatchMono|MultiDispatchBimorphic)$`
 
 var profiles = map[string]profile{
 	"pr-fast": {
