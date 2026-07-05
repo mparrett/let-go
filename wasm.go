@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -122,9 +123,24 @@ func buildWasm(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ou
 	var build *exec.Cmd
 	if useTinyGo {
 		fmt.Println("building wasm with tinygo...")
-		build = exec.Command("tinygo", "build",
+		// -stack-size: TinyGo's wasm target auto-sizes goroutine stacks and falls
+		// back to a 64KB default it can't bound against let-go's unbounded
+		// interpreter recursion (Frame.Run→Func.Invoke→Frame.Run). Deep recursion
+		// overflows the stack into adjacent static memory (the reader's macros map),
+		// which manifested as the "3-minute hang". Override via LETGO_TINYGO_STACK
+		// for sweeping. See docs-xsofy/tiny-let-go-the-stack-overflow-hunt.md.
+		stack := os.Getenv("LETGO_TINYGO_STACK")
+		if stack == "" {
+			stack = "1MB"
+		}
+		tgArgs := []string{"build",
 			"-target=wasm", "-no-debug", "-opt=z", "-panic=trap",
-			"-o", wasmPath, ".")
+			"-stack-size=" + stack}
+		if gc := os.Getenv("LETGO_TINYGO_GC"); gc != "" {
+			tgArgs = append(tgArgs, "-gc="+gc)
+		}
+		tgArgs = append(tgArgs, "-o", wasmPath, ".")
+		build = exec.Command("tinygo", tgArgs...)
 		build.Dir = tmpDir
 		build.Env = os.Environ()
 	} else {
@@ -251,6 +267,44 @@ func mustGetwd() string {
 	return d
 }
 
+// tinygoFdWriteRe matches TinyGo's WASI fd_write import in its wasm_exec.js.
+// TinyGo routes os.Stdout through this (NOT through globalThis.fs), and it
+// line-buffers into logLine, emitting to console.log only on LF — so under our
+// browser host the terminal output never reaches xterm, and xsofy's newline-less
+// ANSI would never flush at all. Non-greedy up to the first `return 0;` (the only
+// one in the function) captures the whole body.
+var tinygoFdWriteRe = regexp.MustCompile(`(?s)fd_write: function\(fd, iovs_ptr, iovs_len, nwritten_ptr\) \{.*?return 0;\s*\},`)
+
+// patchTinyGoStdout rewrites TinyGo's fd_write so fd 1/2 feed the host terminal
+// sink (globalThis.fs.writeSync accumulates into outputBuf; term/flush -> _lgFlush
+// posts it to xterm), writing bytes immediately rather than line-buffering. This
+// is the seam stock Go's wasm_exec.js already honors via globalThis.fs; TinyGo's
+// WASI path bypassed it. See docs-xsofy/tiny-let-go-the-stack-overflow-hunt.md
+// "Sequel (2026-07-05)".
+func patchTinyGoStdout(data []byte) []byte {
+	const replacement = `fd_write: function(fd, iovs_ptr, iovs_len, nwritten_ptr) {
+						let nwritten = 0;
+						if (fd == 1 || fd == 2) {
+							for (let iovs_i = 0; iovs_i < iovs_len; iovs_i++) {
+								let iov_ptr = iovs_ptr + iovs_i*8; // wasm32
+								let ptr = mem().getUint32(iov_ptr + 0, true);
+								let len = mem().getUint32(iov_ptr + 4, true);
+								nwritten += len;
+								if (globalThis.fs && globalThis.fs.writeSync) {
+									globalThis.fs.writeSync(fd, new Uint8Array(mem().buffer, ptr, len));
+								}
+							}
+						}
+						mem().setUint32(nwritten_ptr, nwritten, true);
+						return 0;
+					},`
+	if !tinygoFdWriteRe.Match(data) {
+		fmt.Fprintln(os.Stderr, "warning: could not patch TinyGo fd_write for terminal output (wasm_exec.js layout changed?)")
+		return data
+	}
+	return tinygoFdWriteRe.ReplaceAll(data, []byte(replacement))
+}
+
 func readWasmExecJS() ([]byte, error) {
 	if os.Getenv("LETGO_USE_TINYGO") == "1" {
 		out, err := exec.Command("tinygo", "env", "TINYGOROOT").Output()
@@ -263,7 +317,7 @@ func readWasmExecJS() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tinygo wasm_exec.js not found at %s: %w", src, err)
 		}
-		return data, nil
+		return patchTinyGoStdout(data), nil
 	}
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
