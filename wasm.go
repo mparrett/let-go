@@ -133,8 +133,15 @@ func buildWasm(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ou
 		if stack == "" {
 			stack = "1MB"
 		}
+		// -panic=trap keeps the bundle small (a panic becomes a bare wasm
+		// unreachable). Override with LETGO_TINYGO_PANIC=print while debugging so
+		// the panic message reaches the console instead of a silent trap.
+		panicMode := os.Getenv("LETGO_TINYGO_PANIC")
+		if panicMode == "" {
+			panicMode = "trap"
+		}
 		tgArgs := []string{"build",
-			"-target=wasm", "-no-debug", "-opt=z", "-panic=trap",
+			"-target=wasm", "-no-debug", "-opt=z", "-panic=" + panicMode,
 			"-stack-size=" + stack}
 		if gc := os.Getenv("LETGO_TINYGO_GC"); gc != "" {
 			tgArgs = append(tgArgs, "-gc="+gc)
