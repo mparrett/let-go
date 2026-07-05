@@ -16,6 +16,12 @@ import (
 	"github.com/nooga/let-go/pkg/vm"
 )
 
+// os.go's init() that registers this installer is //go:build !tinygo, so the
+// tinygo build must register its own — without this the os namespace is never
+// installed and os/getenv, os/exit, os/args resolve to nil (e.g. xsofy's
+// seed boot-param crashed "nil is not a function" calling os/getenv).
+func init() { RegisterInstaller(installOsNS) }
+
 func installOsNS() {
 	exitFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
