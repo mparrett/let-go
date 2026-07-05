@@ -1,4 +1,4 @@
-//go:build tinygo
+//go:build tinygo && js
 
 /*
  * Copyright (c) 2026 Matt Parrett
@@ -7,7 +7,9 @@
  * TinyGo hand-written twin of the lginterop-generated interop_xxh3.go
  * (which is //go:build !tinygo). TinyGo's reflect can't box or call typed Go
  * funcs (reflect.Value.Call unimplemented), so the generated file's MustBox
- * path is unusable here. But xxh3's pure-Go implementation IS available under
+ * path is unusable here. Scoped to js/wasm: zeebo/xxh3 has no
+ * purego mode on arm64/amd64 (assembly-only), which TinyGo can't link, so a
+ * NATIVE tinygo build has no xxh3 NS yet (needs a pure-Go xxh3). But xxh3's pure-Go implementation IS available under
  * GOOS=js (no NEON assembly), so we call it directly through Wrap adapters —
  * no reflection. Covers the u64 scalar API (Hash/HashSeed and their String
  * forms) that consumers actually use (xsofy.hash → xxh3/HashSeed). The 128-bit
