@@ -103,25 +103,7 @@ func valueType(value any) *aBoxedType {
 	}
 	t = &aBoxedType{
 		typ:     reflected,
-		methods: nil,
-	}
-	methodc := reflected.NumMethod()
-	if methodc > 0 {
-		t.methods = map[Symbol]*NativeFn{}
-		for i := range methodc {
-			m := reflected.Method(i)
-			me, err := NativeFnType.Box(m.Func.Interface())
-			if err != nil {
-				fmt.Println(reflected.Name(), "boxing method failed", err)
-				continue
-			}
-			mef, ok := me.(*NativeFn)
-			if !ok {
-				fmt.Println(reflected.Name(), "boxed method is not a native fn")
-				continue
-			}
-			t.methods[Symbol(m.Name)] = mef
-		}
+		methods: reflectMethods(reflected),
 	}
 	BoxedTypes[key] = t
 	return t
