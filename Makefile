@@ -215,14 +215,21 @@ install-golangci-lint: $(GO)
 	which golangci-lint || \
 	  GO111MODULE=off go get -u $(GO111MODULE-LINT)
 
-# Register the local git merge driver that resolves pkg/rt/core_compiled.lgb
-# conflicts by regenerating the bundle from the merged .lg sources (see
-# .gitattributes `merge=lgb` and scripts/git-merge-lgb.sh). A merge driver
-# lives in .git/config, which is not shared, so each clone must run this once.
+# Register the local git merge drivers for the generated artifacts (see
+# .gitattributes). Merge drivers live in .git/config, which is not shared, so
+# each clone must run this once.
+#   * lgb   — regenerates pkg/rt/core_compiled.lgb from the merged .lg sources
+#             (scripts/git-merge-lgb.sh).
+#   * sums  — recomputes pkg/rt/generated.sums' digest from the merged sources
+#             (scripts/git-merge-sums.sh) so the signature is never stale.
+# NOTE: git merge drivers only fire on the plain-git merge path. jj does not run
+# them, so under jj both artifacts are reconciled by `make generate` post-rebase.
 install-hooks:
 	git config merge.lgb.name "regenerate core_compiled.lgb from merged .lg sources"
 	git config merge.lgb.driver "scripts/git-merge-lgb.sh %O %A %B %L %P"
-	@echo "Registered the 'lgb' merge driver. core_compiled.lgb conflicts now auto-regenerate."
+	git config merge.sums.name "recompute generated.sums digest from merged sources"
+	git config merge.sums.driver "scripts/git-merge-sums.sh %O %A %B %L %P"
+	@echo "Registered the 'lgb' + 'sums' merge drivers (core_compiled.lgb / generated.sums)."
 
 # Non-mutating front gate: fail before any target has a chance to refresh
 # pkg/rt/generated.sums. This catches the exact drift that a prior go generate
