@@ -321,6 +321,16 @@ jank-stress: build
 	  ./lg scripts/ir-stress.lg lower-go $(JANK_SUITE_DIR) \
 	    $$(cd $(JANK_SUITE_DIR) && ls core_test/*.cljc string_test/*.cljc)
 
+# ITER-0021 lowering-coverage ratchet gate. Runs the ir-stress corpus and fails
+# (exit 1) if native-lowering failures grew vs docs/perf/ir-stress-baseline.edn —
+# a form newly failing to lower (whole-function fallback to bytecode). Reuses the
+# ir-stress fallback census; the ratchet only tightens. Automates BE-2.
+ir-stress-gate: build
+	LG_STRESS_PASSES=1 \
+	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
+	  LG_STRESS_BASELINE=docs/perf/ir-stress-baseline.edn \
+	  ./lg scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+
 # Combined speed + size gates. Both ratchets need the gogen_ir lowered tree, and
 # each would otherwise regenerate it (the dominant cost). `ratchets` regenerates
 # it ONCE via `lowered`, runs the speed gate against it, then runs the size gate
@@ -335,4 +345,4 @@ ratchets-update: build lowered $(GO)
 	./lg scripts/fanout-ratchet.lg update --go "$$(command -v go)" --no-regen
 
 # PHONY targets are for ones that have conflicting files/dirs present:
-.PHONY: test clean clean-lowered
+.PHONY: test clean clean-lowered ir-stress-gate
