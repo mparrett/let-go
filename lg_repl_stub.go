@@ -1,4 +1,4 @@
-//go:build plan9 || js || wasip1
+//go:build (plan9 || js || wasip1) && !runtime_only
 
 /*
  * Copyright (c) 2021 Marcin Gasperowicz <xnooga@gmail.com>
