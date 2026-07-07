@@ -10,7 +10,8 @@
  * No eval / load-string / read-string, no dynamic source require — the deployed
  * artifact can run only bytecode compiled ahead of time by a trusted toolchain.
  *
- *   lg <program.lgb>   run a precompiled program
+ *   lg <program.lgb>   run a precompiled program (file: path_open/fd_read)
+ *   lg -               run a precompiled program read from stdin (fd_read only)
  *   lg                 boot the runtime and exit
  */
 
@@ -19,6 +20,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -48,7 +50,15 @@ func main() {
 		return // booted; nothing to run
 	}
 
-	data, err := os.ReadFile(os.Args[1])
+	// "-" reads the .lgb from stdin (fd_read only — no filesystem imports
+	// needed on the host); any other arg is a file path (path_open/fd_read).
+	var data []byte
+	var err error
+	if os.Args[1] == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(os.Args[1])
+	}
 	if err != nil {
 		fatal("read", err)
 	}
