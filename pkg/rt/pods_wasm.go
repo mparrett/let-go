@@ -1,4 +1,4 @@
-//go:build js && wasm
+//go:build (js && wasm) || wasip1
 
 /*
  * Copyright (c) 2026 Marcin Gasperowicz <xnooga@gmail.com>

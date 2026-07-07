@@ -46,6 +46,44 @@ type ctxState struct {
 	cancel context.CancelFunc
 }
 
+// cancelSig is a goroutine-free context.Context. context.WithCancel pulls a
+// propagateCancel goroutine into the static call graph (which the wasm MVP
+// target can only realize via asyncify — the transpiler wall), even though at
+// runtime it never spawns for Background/*cancelCtx parents. cancelSig avoids
+// it: cancellation is a closed channel, and cascade to children is driven
+// explicitly by the Scope tree (see Cancel/CancelAll), not by context
+// inheritance. Satisfies context.Context so all existing consumers are unchanged.
+type cancelSig struct {
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func newCancelSig() *cancelSig { return &cancelSig{done: make(chan struct{})} }
+
+func (c *cancelSig) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelSig) Done() <-chan struct{}       { return c.done }
+func (c *cancelSig) Value(any) any               { return nil }
+func (c *cancelSig) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+func (c *cancelSig) cancel() {
+	c.mu.Lock()
+	if c.err == nil {
+		c.err = context.Canceled
+		close(c.done)
+	}
+	c.mu.Unlock()
+}
+
+// newCtxState builds a scope context generation backed by cancelSig.
+func newCtxState() *ctxState {
+	sig := newCancelSig()
+	return &ctxState{ctx: sig, cancel: sig.cancel}
+}
+
 type Scope struct {
 	parent *Scope
 	state  atomic.Pointer[ctxState] // own context generation (child of parent)
@@ -63,8 +101,7 @@ var Goroutines = newRootScope()
 
 func newRootScope() *Scope {
 	s := &Scope{}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.state.Store(&ctxState{ctx: ctx, cancel: cancel})
+	s.state.Store(newCtxState())
 	return s
 }
 
@@ -72,10 +109,10 @@ func newRootScope() *Scope {
 // current context. Cancelling this scope (or any ancestor) cancels the
 // child; cancelling the child leaves this scope and its siblings running.
 func (s *Scope) Child() *Scope {
-	parentCtx := s.state.Load().ctx
-	ctx, cancel := context.WithCancel(parentCtx)
+	// Child gets a fresh cancel generation; parent→child cancel cascade is
+	// driven by the scope tree in Cancel/CancelAll, not context inheritance.
 	c := &Scope{parent: s}
-	c.state.Store(&ctxState{ctx: ctx, cancel: cancel})
+	c.state.Store(newCtxState())
 	s.mu.Lock()
 	if s.children == nil {
 		s.children = make(map[*Scope]struct{})
@@ -99,10 +136,11 @@ func (s *Scope) Go(fn func(ctx context.Context)) {
 	ctx := s.state.Load().ctx
 	s.wg.Add(1)
 	s.live.Add(1)
-	// The spawned goroutine's scope association travels with its ExecContext
-	// (the caller seeds a child ec whose .scope is this scope), so there is no
-	// goroutine-id registration to do — only liveness accounting.
-	go func() {
+	// SPIKE (nogoroutine): run synchronously to completion. On the wasm MVP
+	// target the only goroutine mechanism is asyncify (the transpiler wall),
+	// so this variant executes spawned work eagerly instead. Fine for
+	// fork/join spawn+await; a free-running task would block here.
+	func() {
 		defer func() {
 			s.live.Add(-1)
 			s.wg.Done()
@@ -145,6 +183,16 @@ func (s *Scope) Context() context.Context {
 // wait; pair with Await (or use Shutdown).
 func (s *Scope) Cancel() {
 	s.state.Load().cancel()
+	// Cascade to the subtree explicitly (replaces context inheritance).
+	s.mu.Lock()
+	kids := make([]*Scope, 0, len(s.children))
+	for c := range s.children {
+		kids = append(kids, c)
+	}
+	s.mu.Unlock()
+	for _, c := range kids {
+		c.Cancel()
+	}
 }
 
 // CancelAll cancels the current context generation and installs a fresh
@@ -154,36 +202,29 @@ func (s *Scope) Cancel() {
 // fresh generation is swapped in atomically and we cancel whatever we
 // displaced, so concurrent CancelAlls are safe.
 func (s *Scope) CancelAll() {
-	parentCtx := context.Background()
-	if s.parent != nil {
-		parentCtx = s.parent.state.Load().ctx
-	}
-	ctx, cancel := context.WithCancel(parentCtx)
-	old := s.state.Swap(&ctxState{ctx: ctx, cancel: cancel})
+	old := s.state.Swap(newCtxState())
 	old.cancel()
+	// Cascade cancel to children derived from the displaced generation.
+	s.mu.Lock()
+	kids := make([]*Scope, 0, len(s.children))
+	for c := range s.children {
+		kids = append(kids, c)
+	}
+	s.mu.Unlock()
+	for _, c := range kids {
+		c.Cancel()
+	}
 }
 
 // Await blocks until every goroutine in this scope AND its subtree has
 // exited, or timeout elapses. Returns true if fully drained, false on
 // timeout. A non-positive timeout waits indefinitely.
 func (s *Scope) Await(timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		s.awaitTree()
-		close(done)
-	}()
-	if timeout <= 0 {
-		<-done
-		return true
-	}
-	t := time.NewTimer(timeout)
-	defer t.Stop()
-	select {
-	case <-done:
-		return true
-	case <-t.C:
-		return false
-	}
+	// SPIKE (nogoroutine): with synchronous Go, all spawned work has already
+	// completed, so awaitTree() returns immediately. No timer goroutine needed.
+	_ = timeout
+	s.awaitTree()
+	return true
 }
 
 func (s *Scope) awaitTree() {

@@ -9,8 +9,6 @@ package rt
 import (
 	"fmt"
 	"runtime"
-	"sync"
-	"sync/atomic"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
@@ -75,24 +73,15 @@ func parallelMapV(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		workers = 1
 	}
 
-	var next int64 = -1
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				i := int(atomic.AddInt64(&next, 1))
-				if i >= n {
-					return
-				}
-				r, err := fn.Invoke([]vm.Value{items[i]})
-				results[i] = r
-				errs[i] = err
-			}
-		}()
+	// SPIKE (nogoroutine): sequential — on wasip1 there are no threads, so a
+	// worker pool gives no parallelism anyway; running in order is equivalent
+	// and lets the module build with -scheduler=none (no asyncify gowrapper).
+	_ = workers
+	for i := 0; i < n; i++ {
+		r, err := fn.Invoke([]vm.Value{items[i]})
+		results[i] = r
+		errs[i] = err
 	}
-	wg.Wait()
 
 	for _, err := range errs {
 		if err != nil {
