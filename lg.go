@@ -125,6 +125,16 @@ func runLGB(filename string) error {
 	return err
 }
 
+// runScript dispatches a positional script to the .lgb loader or the source
+// runner. Split out so the caller's error/exit-code handling stays flat rather
+// than nesting the format-dispatch inside it.
+func runScript(ctx *compiler.Context, script string) error {
+	if filepath.Ext(script) == ".lgb" {
+		return runLGB(script)
+	}
+	return runFile(ctx, script)
+}
+
 // checkBundledLGB checks if the current executable has an appended payload.
 // Returns the LGB bytecode, the gzipped resource archive (for a v2/v3 bundle),
 // and the baked storage store id (v3 only). The latter two are empty for a
@@ -625,16 +635,11 @@ func runMain() int {
 	// Script mode: treat only the first positional as the script to run.
 	// Any further positionals belong to the script (it reads os/args).
 	ranSomething := false
+	runFailed := false
 	if len(files) >= 1 {
-		script := files[0]
-		if filepath.Ext(script) == ".lgb" {
-			if err := runLGB(script); err != nil {
-				fmt.Print(vm.FormatError(err))
-			}
-		} else {
-			if err := runFile(context, script); err != nil {
-				fmt.Print(vm.FormatError(err))
-			}
+		if err := runScript(context, files[0]); err != nil {
+			fmt.Print(vm.FormatError(err))
+			runFailed = true
 		}
 		ranSomething = true
 	}
@@ -644,6 +649,7 @@ func runMain() int {
 		val, err := runForm(context, expr)
 		if err != nil {
 			fmt.Print(vm.FormatError(err))
+			runFailed = true
 		} else {
 			fmt.Println(val)
 		}
@@ -663,6 +669,11 @@ func runMain() int {
 	}
 
 	stopProfiling()
+	// A failed script or -e expression exits nonzero, but an interactive
+	// session (-r) that recovered in the REPL still exits clean.
+	if runFailed && !runREPL {
+		return 1
+	}
 	return 0
 }
 
