@@ -2503,21 +2503,64 @@ func installLangNS() {
 		return b.Chunk().(vm.Value), nil
 	})
 
+	// rangeInt coerces a range bound: Int passes through; anything
+	// else is a graceful error (a raw .(vm.Int) assertion panics).
+	rangeInt := func(v vm.Value, what string) (vm.Int, error) {
+		if n, ok := v.(vm.Int); ok {
+			return n, nil
+		}
+		return 0, fmt.Errorf("range %s must be an integer, got %s",
+			what, v.Type().Name())
+	}
 	rangef, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) == 0 {
 			// Infinite range: (range) -> lazy seq 0, 1, 2, ...
 			return vm.NewInfiniteRange(0, 1), nil
 		}
-		if len(vs) == 1 {
-			return vm.NewRange(0, vs[0].(vm.Int), 1), nil
+		if len(vs) > 3 {
+			return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
 		}
-		if len(vs) == 2 {
-			return vm.NewRange(vs[0].(vm.Int), vs[1].(vm.Int), 1), nil
+		var start, end, step vm.Int
+		step = 1
+		var err error
+		var endArg vm.Value
+		switch len(vs) {
+		case 1:
+			endArg = vs[0]
+		case 2:
+			endArg = vs[1]
+			if start, err = rangeInt(vs[0], "start"); err != nil {
+				return vm.NIL, err
+			}
+		case 3:
+			endArg = vs[1]
+			if start, err = rangeInt(vs[0], "start"); err != nil {
+				return vm.NIL, err
+			}
+			if step, err = rangeInt(vs[2], "step"); err != nil {
+				return vm.NIL, err
+			}
 		}
-		if len(vs) == 3 {
-			return vm.NewRange(vs[0].(vm.Int), vs[1].(vm.Int), vs[2].(vm.Int)), nil
+		// A float end still yields integers, like the JVM: infinite
+		// for ##Inf toward the step, else every int short of the end
+		// ((range 2 5.29) => 2 3 4 5).
+		if f, ok := endArg.(vm.Float); ok {
+			if math.IsInf(float64(f), 0) {
+				if (f > 0 && step > 0) || (f < 0 && step < 0) {
+					return vm.NewInfiniteRange(int(start), int(step)), nil
+				}
+				return vm.NewRange(0, 0, 1), nil
+			}
+			if step > 0 {
+				endArg = vm.Int(math.Ceil(float64(f)))
+			} else {
+				endArg = vm.Int(math.Floor(float64(f)))
+			}
 		}
-		return vm.NIL, fmt.Errorf("wrong number of arguments %d", len(vs))
+		if end, err = rangeInt(endArg, "end"); err != nil {
+			return vm.NIL, err
+		}
+		return vm.NewRange(start, end, step), nil
 	})
 
 	keyword, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
@@ -4002,10 +4045,14 @@ func installLangNS() {
 				return vm.NIL, fmt.Errorf("sort expected a Collection")
 			}
 		}
-		temp := make([]vm.Value, coll.RawCount())
+		// Stop at the end of the seq as well as at RawCount: a
+		// String's RawCount is bytes but its Seq yields runes, so
+		// multibyte content overran the seq (nil deref).
+		n := coll.RawCount()
+		temp := make([]vm.Value, 0, n)
 		seq := coll.(vm.Sequable).Seq()
-		for i := range temp {
-			temp[i] = seq.First()
+		for i := 0; i < n && !vm.SeqIsEmpty(seq); i++ {
+			temp = append(temp, seq.First())
 			seq = seq.Next()
 		}
 		var err error
@@ -4762,16 +4809,13 @@ func installLangNS() {
 		case *vm.PersistentMap, vm.Map, *vm.SortedMap:
 			return vm.NIL, fmt.Errorf("shuffle not supported on map")
 		}
-		// Collect into slice
+		// Collect into slice. forceSeq realizes lazy seqs first, so
+		// an empty lazy seq yields [] rather than [nil].
 		s, err := seqOf(vs[0])
 		if err != nil {
 			return vm.NIL, err
 		}
-		var vals []vm.Value
-		for s != nil {
-			vals = append(vals, s.First())
-			s = s.Next()
-		}
+		vals := appendSeqValues(nil, forceSeq(s))
 		// Fisher-Yates shuffle
 		rngShuffle(len(vals), func(i, j int) {
 			vals[i], vals[j] = vals[j], vals[i]
@@ -5316,13 +5360,23 @@ func installLangNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("re-seq expected String")
 		}
-		all := re.FindAllString(string(s), -1)
+		// Like Clojure (and re-find above): a groupless pattern yields
+		// the match string, capture groups yield [full g1 g2 ...].
+		all := re.FindAllStringSubmatch(string(s), -1)
 		if all == nil {
 			return vm.EmptyList, nil
 		}
 		vals := make([]vm.Value, len(all))
-		for i, m := range all {
-			vals[i] = vm.String(m)
+		for i, matches := range all {
+			if len(matches) == 1 {
+				vals[i] = vm.String(matches[0])
+				continue
+			}
+			groups := make(vm.ArrayVector, len(matches))
+			for j, m := range matches {
+				groups[j] = vm.String(m)
+			}
+			vals[i] = groups
 		}
 		return vm.ListType.Box(vals)
 	})
