@@ -65,9 +65,6 @@ func (wasiKeySource) ReadKey() (string, error) {
 	drainStdin()
 	keyMu.Lock()
 	defer keyMu.Unlock()
-	if keyDbg {
-		fmt.Fprintf(os.Stderr, "[keydbg] ReadKey buf=%q\n", string(keyBuf))
-	}
 	if len(keyBuf) == 0 {
 		return "", nil // nothing buffered — read-key nil contract
 	}
@@ -83,20 +80,11 @@ func (wasiKeySource) ReadKey() (string, error) {
 	return s, nil
 }
 
-var kpDbgCount = 0
-
 func (wasiKeySource) KeyPending() bool {
 	drainStdin()
 	keyMu.Lock()
 	defer keyMu.Unlock()
-	r := completeKeyLocked()
-	if keyDbg {
-		kpDbgCount++
-		if kpDbgCount <= 5 || r || len(keyBuf) > 0 {
-			fmt.Fprintf(os.Stderr, "[keydbg] KeyPending #%d buf=%q -> %v\n", kpDbgCount, string(keyBuf), r)
-		}
-	}
-	return r
+	return completeKeyLocked()
 }
 
 // termSize returns a fixed 80x24, overridable via the COLUMNS / LINES env vars
