@@ -40,12 +40,14 @@
 (defn read-all [path]
   (read-string (str "(do " (slurp path) "\n)")))
 
-(defn single-arity-defn? [f] (boolean (some vector? (drop 2 f))))
-
 (defn lowerable? [f]
+  ;; Multi-arity defns lower too: the pipeline splits arities into
+  ;; independent per-arity units (<Name>_<arity> Go funcs, per-arity
+  ;; direct-call registry entries, and a len(args)-switch override
+  ;; adapter when every arity is uniform vm.Value).
   (and (seq? f)
        (let [h (first f)]
-         (or (and (or (= h 'defn) (= h 'defn-)) (single-arity-defn? f))
+         (or (= h 'defn) (= h 'defn-)
              (= h 'defmulti) (= h 'defmethod)))))
 
 (defn find-ns-name [forms]

@@ -1533,14 +1533,30 @@
         (some (fn [dns] (resolve-registry-entry registry dns name-str arity))
               referred-default-ns-syms))))
 
-(defn- coerce-arg-to-type
-  "Emit a Go expression that produces a value of `target-type` from
-   arg id `rid`. If typeinfer already typed rid as the matching Go
-   type, pass the value through unchanged; otherwise wrap with the
-   appropriate `<type>(arg.(vm.<Boxed>))` unbox.
+(def ^:private scalar-guard-specs
+  ;; target-spec -> [assert-type conversion] for the guarded coercion
+  ;; of an unproven vm.Value into a typed scalar param. bool uses a
+  ;; guarded vm.Boolean assert (NOT vm.IsTruthy): strictly
+  ;; conservative: a non-Boolean falls to the trampoline instead of
+  ;; silently becoming truthy.
+  {"int"     ["vm.Int"     "int"]
+   "int64"   ["vm.Int"     "int64"]
+   "float64" ["vm.Float"   "float64"]
+   "string"  ["vm.String"  "string"]
+   "bool"    ["vm.Boolean" "bool"]})
 
-   Returns nil when target-type is outside the supported set —
-   call-assign-stmts uses that to fall back to the trampoline."
+(defn- coerce-arg-to-type
+  "Coercion descriptor producing a value of `target-type` from arg id
+   `rid`:
+     {:expr e}    emit e directly (proven/boxable, as before)
+     {:guard {:boxed b :assert-spec s :conv c}}
+                  unproven vm.Value into a typed scalar: the caller
+                  must emit a comma-ok type assert on b and guard the
+                  static call, falling back to the trampoline when
+                  the runtime type does not match (preserving the
+                  bytecode path's dynamic semantics)
+     nil          whole-call bail; call-assign-stmts falls back to
+                  the trampoline as before."
   [f closed-exprs rid target-type]
   (let [src-spec (go-type-spec (ir/type-of rid f))
         bare     (value-expr f closed-exprs rid)
@@ -1548,20 +1564,22 @@
     (cond
       (nil? bare) nil
       (= target-type "vm.Value")
-      boxed
+      {:expr boxed}
       (= src-spec target-type)
       ;; typeinfer landed on the same Go type already — pass through.
-      bare
+      {:expr bare}
       ;; *T (deftype) — devirtualized constructor/method calls prove the dtype
       ;; upstream, so the pointer assert is sound.
       (and (string? target-type) (pos? (count target-type)) (= \* (nth target-type 0)))
-      (gogen/type-assert boxed (gogen/type target-type))
-      ;; A typed SCALAR param (int/int64/float64/bool/string) is only sound to
-      ;; pass when the arg is PROVEN that type — handled by the src==target
-      ;; pass-through above. An unchecked unbox-assert on an unproven vm.Value
-      ;; would change dynamic semantics (runtime panic vs the bytecode path's
-      ;; graceful handling), so fall back to the trampoline (return nil) instead
-      ;; of emitting `int(x.(vm.Int))` against an unproven value.
+      {:expr (gogen/type-assert boxed (gogen/type target-type))}
+      ;; Unproven vm.Value into a typed scalar param: guarded runtime
+      ;; coercion. The assert is only legal Go when the source expr is
+      ;; interface-typed, i.e. src-spec vm.Value; a proven-mismatched
+      ;; scalar (concrete Go type) still bails below.
+      (and (= src-spec "vm.Value") (contains? scalar-guard-specs target-type))
+      (let [[assert-spec conv] (get scalar-guard-specs target-type)]
+        {:guard {:boxed boxed :assert-spec assert-spec :conv conv}})
+      ;; Proven-mismatched scalars etc.: fall back to the trampoline.
       :else nil)))
 
 (defn- box-result-from-type
@@ -1620,19 +1638,14 @@
                                   nil)]
     [assign err-check]))
 
-(defn- emit-typed-direct-call
-  "Direct-call emit with per-arg coercion + result boxing. Branches on
-   the call entry's typed signature (param-specs + result-spec). Falls
-   back gracefully (returns nothing) when any arg can't be coerced —
-   call-assign-stmts then skips this branch and the next cond handles
-   the trampoline path."
-  [f closed-exprs nid target refs entry]
-  (let [arg-rids   (rest refs)
-        param-specs (vec (:param-specs entry))
-        result-spec (:result-spec entry)
-        coerced    (mapv (fn [rid spec] (coerce-arg-to-type f closed-exprs rid spec))
-                         arg-rids
-                         param-specs)
+(defn- typed-call-result-stmts
+  "The static-call statement sequence for one direct call, given the
+   already-coerced arg expressions: builds the call and handles the
+   four result shapes. Registers tr<nid>/te<nid> function-scoped
+   temps as a side effect (goto-CFG safety, see *typed-call-temps*),
+   so call it only when the statements WILL be emitted."
+  [f nid target entry arg-exprs]
+  (let [result-spec (:result-spec entry)
         ;; A :go-pkg means the callee lives in ANOTHER Go package — a native
         ;; module (:native?) OR a cross-ns lowered sibling — so qualify the call
         ;; `pkg.Fn` and import that package. Intra-ns lowered siblings (no
@@ -1642,57 +1655,130 @@
                          (gogen/ident (pkg-alias-from (:go-pkg entry)))
                          (:go-name entry))
                        (gogen/ident (:go-name entry)))
+        ;; A direct call to another LOWERED let-go fn (intra- OR cross-ns) passes
+        ;; ec as its first arg; native Go-module fns (:native?) are context-free.
+        call-args (if (:native? entry)
+                    arg-exprs
+                    (into [(gogen/ident "ec")] arg-exprs))
+        raw-call (gogen/call callee-ident call-args)]
+    (cond
+      ;; (vm.Value, error) — current shape. Keep the existing
+      ;; assign + err-check path.
+      (and (= result-spec "vm.Value") (:needs-error? entry))
+      (emit-call-stmts f target raw-call)
+      ;; Typed result + no error: result := <call>; target = vm.<Box>(result)
+      (and (not (:needs-error? entry))
+           (not= result-spec "vm.Value"))
+      (let [boxed (box-result-from-type raw-call result-spec)]
+        [(gogen/assign "=" target boxed)])
+      ;; Typed result + error: tr<nid>, te<nid> = <call>; if err return;
+      ;; target = vm.<Box>(tr<nid>). The intermediate result+err vars are
+      ;; FUNCTION-scoped (registered via register-typed-call-temp! and
+      ;; emitted as `var` in the prologue), assigned here with `=` — NOT an
+      ;; inline `:=`. The body is a goto-CFG, and a goto that jumps over an
+      ;; in-scope `:=` declaration is illegal Go ("goto jumps over
+      ;; declaration"); function-scope `var` + `=` is goto-safe, matching
+      ;; every other temp. Names are keyed by the node's Indexed-RPN
+      ;; position nid (positional → stable + unique across regens).
+      (and (:needs-error? entry)
+           (not= result-spec "vm.Value"))
+      (let [res-id (gogen/ident (str "tr" nid))
+            err-id (gogen/ident (str "te" nid))
+            _ (register-typed-call-temp! (str "tr" nid) result-spec)
+            _ (register-typed-call-temp! (str "te" nid) "error")
+            assign (gogen/multi-assign "=" [res-id err-id] [raw-call])
+            zero-expr (case (function-return-spec f)
+                        "bool"    (gogen/ident "false")
+                        "int"     (gogen/int-lit 0)
+                        "float64" (gogen/float-lit 0.0)
+                        "string"  (gogen/string-lit "")
+                        (gogen/ident "nil"))
+            err-check (gogen/if-stmt nil
+                                     (gogen/binary "!=" err-id (gogen/ident "nil"))
+                                     [(gogen/return-stmt [zero-expr err-id])]
+                                     nil)
+            boxed (box-result-from-type res-id result-spec)
+            box-assign (gogen/assign "=" target boxed)]
+        [assign err-check box-assign])
+      ;; vm.Value result, no error: target = <call>
+      (= result-spec "vm.Value")
+      [(gogen/assign "=" target raw-call)]
+      :else nil)))
+
+(declare trampoline-call-stmts)
+
+(defn- emit-typed-direct-call
+  "Direct-call emit with per-arg coercion + result boxing. Branches on
+   the call entry's typed signature (param-specs + result-spec).
+
+   Proven args emit the flat static call exactly as before. An
+   UNPROVEN vm.Value arg into a typed scalar param emits a GUARDED
+   call: comma-ok type asserts on the boxed args, the static call
+   when every assert holds, and the identical trampoline fallback
+   (same statements the caller would otherwise emit) when a runtime
+   type does not match, so dynamic semantics are unchanged and the
+   typed native callee becomes reachable from runtime values.
+
+   Falls back gracefully (returns nothing) when any arg can't be
+   coerced at all — call-assign-stmts then handles the trampoline."
+  [f closed-exprs nid target refs entry]
+  (let [arg-rids    (rest refs)
+        param-specs (vec (:param-specs entry))
+        descs       (mapv (fn [rid spec]
+                            (coerce-arg-to-type f closed-exprs rid spec))
+                          arg-rids
+                          param-specs)
+        tmp-name    (fn [i] (str "tg" nid "_" i))
+        ok-name     (fn [i] (str "tk" nid "_" i))
         stmts
-        (when (every? identity coerced)
-          ;; A direct call to another LOWERED let-go fn (intra- OR cross-ns) passes
-          ;; ec as its first arg; native Go-module fns (:native?) are context-free.
-          (let [call-args (if (:native? entry)
-                            coerced
-                            (into [(gogen/ident "ec")] coerced))
-                raw-call (gogen/call callee-ident call-args)]
-            (cond
-              ;; (vm.Value, error) — current shape. Keep the existing
-              ;; assign + err-check path.
-              (and (= result-spec "vm.Value") (:needs-error? entry))
-              (emit-call-stmts f target raw-call)
-              ;; Typed result + no error: result := <call>; target = vm.<Box>(result)
-              (and (not (:needs-error? entry))
-                   (not= result-spec "vm.Value"))
-              (let [boxed (box-result-from-type raw-call result-spec)]
-                [(gogen/assign "=" target boxed)])
-              ;; Typed result + error: tr<nid>, te<nid> = <call>; if err return;
-              ;; target = vm.<Box>(tr<nid>). The intermediate result+err vars are
-              ;; FUNCTION-scoped (registered via register-typed-call-temp! and
-              ;; emitted as `var` in the prologue), assigned here with `=` — NOT an
-              ;; inline `:=`. The body is a goto-CFG, and a goto that jumps over an
-              ;; in-scope `:=` declaration is illegal Go ("goto jumps over
-              ;; declaration"); function-scope `var` + `=` is goto-safe, matching
-              ;; every other temp. Names are keyed by the node's Indexed-RPN
-              ;; position nid (positional → stable + unique across regens).
-              (and (:needs-error? entry)
-                   (not= result-spec "vm.Value"))
-              (let [res-id (gogen/ident (str "tr" nid))
-                    err-id (gogen/ident (str "te" nid))
-                    _ (register-typed-call-temp! (str "tr" nid) result-spec)
-                    _ (register-typed-call-temp! (str "te" nid) "error")
-                    assign (gogen/multi-assign "=" [res-id err-id] [raw-call])
-                    zero-expr (case (function-return-spec f)
-                                "bool"    (gogen/ident "false")
-                                "int"     (gogen/int-lit 0)
-                                "float64" (gogen/float-lit 0.0)
-                                "string"  (gogen/string-lit "")
-                                (gogen/ident "nil"))
-                    err-check (gogen/if-stmt nil
-                                             (gogen/binary "!=" err-id (gogen/ident "nil"))
-                                             [(gogen/return-stmt [zero-expr err-id])]
-                                             nil)
-                    boxed (box-result-from-type res-id result-spec)
-                    box-assign (gogen/assign "=" target boxed)]
-                [assign err-check box-assign])
-              ;; vm.Value result, no error: target = <call>
-              (= result-spec "vm.Value")
-              [(gogen/assign "=" target raw-call)]
-              :else nil)))]
+        (when (every? identity descs)
+          (let [guard-idx (filterv (fn [i] (:guard (nth descs i)))
+                                   (range (count descs)))
+                arg-exprs (vec (map-indexed
+                                 (fn [i d]
+                                   (if-let [g (:guard d)]
+                                     (gogen/call (gogen/ident (:conv g))
+                                                 [(gogen/ident (tmp-name i))])
+                                     (:expr d)))
+                                 descs))]
+            (if (empty? guard-idx)
+              ;; No guards: today's flat emission, byte-identical.
+              (typed-call-result-stmts f nid target entry arg-exprs)
+              ;; Guarded: build the fallback FIRST, then the static
+              ;; branch, and only register the guard temps once both
+              ;; are known non-nil; registering earlier would leak
+              ;; unused function-scoped var decls (Go compile error).
+              (let [fallback (trampoline-call-stmts f closed-exprs nid
+                                                    target refs)]
+                (when fallback
+                  (let [then (typed-call-result-stmts f nid target
+                                                      entry arg-exprs)]
+                    (when then
+                      (doseq [i guard-idx]
+                        (let [g (:guard (nth descs i))]
+                          (register-typed-call-temp!
+                            (tmp-name i) (:assert-spec g))
+                          (register-typed-call-temp!
+                            (ok-name i) "bool")))
+                      (let [asserts
+                            (mapv (fn [i]
+                                    (let [g (:guard (nth descs i))]
+                                      (gogen/multi-assign "="
+                                        [(gogen/ident (tmp-name i))
+                                         (gogen/ident (ok-name i))]
+                                        [(gogen/type-assert
+                                           (:boxed g)
+                                           (gogen/type (:assert-spec g)))])))
+                                  guard-idx)
+                            cond-e
+                            (reduce (fn [a i]
+                                      (gogen/binary
+                                        "&&" a (gogen/ident (ok-name i))))
+                                    (gogen/ident (ok-name (first guard-idx)))
+                                    (rest guard-idx))]
+                        (conj asserts
+                              (gogen/if-stmt nil cond-e
+                                             then fallback))))))))))]
     (when stmts
       ;; Record the callee's Go import only now that emission has actually
       ;; produced statements. Doing it in lookup-direct-callable (before
@@ -2958,13 +3044,17 @@
                         (conj decls0 (gogen/var-decl "callErr" (gogen/type "error") nil))
                         decls0)
                ;; Function-scope `var` decls for typed direct-call result/error
-               ;; temps (tr<nid>/te<nid>), collected during body build. Emitting
-               ;; them at the top (not inline `:=`) keeps gotos that jump over the
-               ;; call site legal — see *typed-call-temps*.
+               ;; temps (tr<nid>/te<nid> and guard temps tg/tk<nid>_<i>),
+               ;; collected during body build. Emitting them at the top (not
+               ;; inline `:=`) keeps gotos that jump over the call site legal;
+               ;; see *typed-call-temps*. distinct: the structured attempt and
+               ;; the goto rebuild both run under one binding, so a call
+               ;; lowered in both attempts registers its temps twice, which
+               ;; would emit duplicate (redeclared) var decls.
                decls1 (reduce (fn [acc [nm go-type]]
                                 (conj acc (gogen/var-decl nm (gogen/type go-type) nil)))
                               decls1
-                              @*typed-call-temps*)
+                              (distinct @*typed-call-temps*))
                [arg-decls arg-inits] (if needs-tail-call?
                                        (arg-local-decls f)
                                        [[] []])

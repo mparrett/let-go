@@ -1078,7 +1078,21 @@
                                  (conj acc (assoc (:result entry) :multi-arity? true))
                                  (:fn entry)
                                  (conj acc {:status :lowered :decl (:fn entry) :imports []})
-                                 :else acc))
+                                 :else
+                                 ;; A fallen-back arity has neither :result
+                                 ;; nor :fn; warn like the single-arity
+                                 ;; branch below instead of dropping it with
+                                 ;; no trace.
+                                 (do
+                                   (println (str "WARNING: not lowered ("
+                                                 (pr-str (:status entry))
+                                                 ") for arity of "
+                                                 (pr-str (try (second form)
+                                                              (catch _ form)))
+                                                 (if (:reason entry)
+                                                   (str ": " (:reason entry))
+                                                   "")))
+                                   acc)))
                              []
                              (:fns result))]
             (recur (rest remaining) (into out flat)))

@@ -1,0 +1,12 @@
+;; Typed direct-call boundary semantics. tfib's body types its param
+;; int, so a lowered caller passing an opaque vm.Value goes through
+;; the guarded coercion: static native call when the runtime value is
+;; a vm.Int, identical trampoline fallback otherwise. Both engines
+;; must agree on all three cases: int (guard hit), keyword (guard
+;; miss, bytecode type error, caught), float (guard miss, bytecode
+;; float arithmetic).
+(defn tfib [n] (if (< n 2) n (+ (tfib (- n 1)) (tfib (- n 2)))))
+(defn tfib-opaque [x] (tfib x))
+(println (tfib-opaque 20))
+(println (try (tfib-opaque :kw) (catch e "type-error")))
+(println (tfib-opaque 2.5))
