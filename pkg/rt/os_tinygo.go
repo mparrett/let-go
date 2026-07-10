@@ -35,14 +35,29 @@ func installOsNS() {
 		return vm.NIL, nil
 	})
 
-	getenvStub, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
-		return vm.String(""), nil
+	// os.Getenv itself works under TinyGo (it's reflect-free); only the Box
+	// registration path doesn't. Wrap it by hand so env-driven boot params
+	// (XSOFY_SEED / XSOFY_REPLAY) work in wasi builds.
+	getenvFn, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("os/getenv expects 1 arg")
+		}
+		name, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("os/getenv expected String")
+		}
+		return vm.String(os.Getenv(string(name))), nil
 	})
+
+	args := make([]vm.Value, len(os.Args))
+	for i, a := range os.Args {
+		args[i] = vm.String(a)
+	}
 
 	ns := vm.NewNamespace("os")
 	ns.Def("exit", exitFn)
-	ns.Def("getenv", getenvStub)
-	ns.Def("args", vm.NewPersistentVector(nil))
+	ns.Def("getenv", getenvFn)
+	ns.Def("args", vm.NewPersistentVector(args))
 	RegisterNS(ns)
 }
 
