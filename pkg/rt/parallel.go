@@ -73,15 +73,11 @@ func parallelMapV(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
 		workers = 1
 	}
 
-	// SPIKE (nogoroutine): sequential — on wasip1 there are no threads, so a
-	// worker pool gives no parallelism anyway; running in order is equivalent
-	// and lets the module build with -scheduler=none (no asyncify gowrapper).
-	_ = workers
-	for i := 0; i < n; i++ {
+	runIndexed(n, workers, func(i int) {
 		r, err := fn.Invoke([]vm.Value{items[i]})
 		results[i] = r
 		errs[i] = err
-	}
+	})
 
 	for _, err := range errs {
 		if err != nil {

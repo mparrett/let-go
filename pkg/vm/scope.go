@@ -136,17 +136,18 @@ func (s *Scope) Go(fn func(ctx context.Context)) {
 	ctx := s.state.Load().ctx
 	s.wg.Add(1)
 	s.live.Add(1)
-	// SPIKE (nogoroutine): run synchronously to completion. On the wasm MVP
-	// target the only goroutine mechanism is asyncify (the transpiler wall),
-	// so this variant executes spawned work eagerly instead. Fine for
-	// fork/join spawn+await; a free-running task would block here.
-	func() {
+	// The spawned goroutine's scope association travels with its ExecContext
+	// (the caller seeds a child ec whose .scope is this scope), so there is no
+	// goroutine-id registration to do — only liveness accounting. spawn is a
+	// build-tagged seam: a real goroutine normally, synchronous under the
+	// nogoroutine tag (TinyGo -scheduler=none — see spawn_nogoroutine.go).
+	spawn(func() {
 		defer func() {
 			s.live.Add(-1)
 			s.wg.Done()
 		}()
 		fn(ctx)
-	}()
+	})
 }
 
 // Live reports how many goroutines are running directly in this scope
@@ -220,11 +221,7 @@ func (s *Scope) CancelAll() {
 // exited, or timeout elapses. Returns true if fully drained, false on
 // timeout. A non-positive timeout waits indefinitely.
 func (s *Scope) Await(timeout time.Duration) bool {
-	// SPIKE (nogoroutine): with synchronous Go, all spawned work has already
-	// completed, so awaitTree() returns immediately. No timer goroutine needed.
-	_ = timeout
-	s.awaitTree()
-	return true
+	return awaitWithTimeout(s.awaitTree, timeout)
 }
 
 func (s *Scope) awaitTree() {

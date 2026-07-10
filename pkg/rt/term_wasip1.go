@@ -8,14 +8,10 @@
 package rt
 
 import (
-	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"sync"
-	"syscall"
-	"time"
 	"unicode/utf8"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -35,47 +31,16 @@ import (
 
 func init() { RegisterInstaller(installTermNS) }
 
-// A background goroutine drains stdin into keyBuf so read-key / key-pending?
-// never park the game loop. Under an interactive host (paserati with
-// PASERATI_STDIN_NONBLOCK, or a real terminal under wasmtime) the blocking
-// os.Stdin.Read parks on the poller between keystrokes and yields to the poll
-// loop; keyBuf makes key-pending? a non-blocking check.
+// Stdin bytes are drained into keyBuf so read-key / key-pending? never park
+// the game loop. How the drain runs is a build-tagged seam (drainStdin): a
+// background pump goroutine normally (term_keypump_default.go), a synchronous
+// non-blocking read pass under the nogoroutine tag for TinyGo -scheduler=none
+// (term_keypump_nogoroutine.go).
 var (
 	keyMu  sync.Mutex
 	keyBuf []byte
 	keyEOF bool
-	keyOn  sync.Once
 )
-
-func startKeyPump() {
-	keyOn.Do(func() {
-		go func() {
-			b := make([]byte, 256)
-			for {
-				n, err := os.Stdin.Read(b)
-				if n > 0 {
-					keyMu.Lock()
-					keyBuf = append(keyBuf, b[:n]...)
-					keyMu.Unlock()
-				}
-				if err != nil {
-					// Interactive host returns EAGAIN when no key is ready. If
-					// the Go runtime surfaces it here (rather than parking on the
-					// poller), don't treat it as EOF — back off and retry so the
-					// pump keeps draining as keys arrive.
-					if errors.Is(err, syscall.EAGAIN) {
-						time.Sleep(2 * time.Millisecond)
-						continue
-					}
-					keyMu.Lock()
-					keyEOF = true
-					keyMu.Unlock()
-					return
-				}
-			}
-		}()
-	})
-}
 
 // wasiKeySource hands out keys buffered by the pump, one token per call. It
 // runs keyBuf through the shared scanKey tokenizer (key_tokenizer.go), so a
@@ -97,7 +62,7 @@ func completeKeyLocked() bool {
 }
 
 func (wasiKeySource) ReadKey() (string, error) {
-	startKeyPump()
+	drainStdin()
 	keyMu.Lock()
 	defer keyMu.Unlock()
 	if len(keyBuf) == 0 {
@@ -116,11 +81,7 @@ func (wasiKeySource) ReadKey() (string, error) {
 }
 
 func (wasiKeySource) KeyPending() bool {
-	startKeyPump()
-	// The game's poll loop is a single guest goroutine that otherwise never
-	// yields, so the stdin pump would starve (wasm has no async preemption).
-	// Yield here so the scheduler runs the poller and the pump drains input.
-	runtime.Gosched()
+	drainStdin()
 	keyMu.Lock()
 	defer keyMu.Unlock()
 	return completeKeyLocked()
