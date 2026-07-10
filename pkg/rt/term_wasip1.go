@@ -8,9 +8,14 @@
 package rt
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
+	"sync"
+	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nooga/let-go/pkg/vm"
@@ -30,29 +35,96 @@ import (
 
 func init() { RegisterInstaller(installTermNS) }
 
-// wasiKeySource reads keypresses from stdin (fd 0) via a blocking fd_read.
-// Unlike the native source it does no raw-mode tokenization: WASI stdin is
-// cooked, so a read returns whatever the host hands over (typically a whole
-// line). One read's worth of bytes is returned as a single key string; callers
-// that only need "any key" (title/continue prompts) work, richer key decoding
-// does not.
-type wasiKeySource struct{}
+// A background goroutine drains stdin into keyBuf so read-key / key-pending?
+// never park the game loop. Under an interactive host (paserati with
+// PASERATI_STDIN_NONBLOCK, or a real terminal under wasmtime) the blocking
+// os.Stdin.Read parks on the poller between keystrokes and yields to the poll
+// loop; keyBuf makes key-pending? a non-blocking check.
+var (
+	keyMu  sync.Mutex
+	keyBuf []byte
+	keyEOF bool
+	keyOn  sync.Once
+)
 
-func (wasiKeySource) ReadKey() (string, error) {
-	var buf [256]byte
-	n, err := os.Stdin.Read(buf[:])
-	if n > 0 {
-		return string(buf[:n]), nil
-	}
-	if err != nil {
-		return "", nil // EOF / no input available — the read-key nil contract
-	}
-	return "", nil
+func startKeyPump() {
+	keyOn.Do(func() {
+		go func() {
+			b := make([]byte, 256)
+			for {
+				n, err := os.Stdin.Read(b)
+				if n > 0 {
+					keyMu.Lock()
+					keyBuf = append(keyBuf, b[:n]...)
+					keyMu.Unlock()
+				}
+				if err != nil {
+					// Interactive host returns EAGAIN when no key is ready. If
+					// the Go runtime surfaces it here (rather than parking on the
+					// poller), don't treat it as EOF — back off and retry so the
+					// pump keeps draining as keys arrive.
+					if errors.Is(err, syscall.EAGAIN) {
+						time.Sleep(2 * time.Millisecond)
+						continue
+					}
+					keyMu.Lock()
+					keyEOF = true
+					keyMu.Unlock()
+					return
+				}
+			}
+		}()
+	})
 }
 
-// KeyPending always reports false: WASI gives no non-blocking peek at stdin,
-// so poll loops must drive off their own timers rather than key-pending?.
-func (wasiKeySource) KeyPending() bool { return false }
+// wasiKeySource hands out keys buffered by the pump, one token per call. It
+// runs keyBuf through the shared scanKey tokenizer (key_tokenizer.go), so a
+// burst like "llll" yields four "l" and a multi-byte escape sequence
+// ("\x1b[A" for the up arrow, SGR mouse reports) stays a single key — the same
+// contract native/browser read-key honor, which is what the game's key tables
+// match against.
+type wasiKeySource struct{}
+
+// completeKeyLocked reports whether keyBuf holds at least one full key token.
+// A partial escape sequence (keyNeedMore) is only "complete" at EOF, where
+// there are no more bytes coming and we emit best-effort. Caller holds keyMu.
+func completeKeyLocked() bool {
+	if len(keyBuf) == 0 {
+		return false
+	}
+	status, n := scanKey(keyBuf)
+	return keyEOF || (status == keyReady && n > 0)
+}
+
+func (wasiKeySource) ReadKey() (string, error) {
+	startKeyPump()
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	if len(keyBuf) == 0 {
+		return "", nil // nothing buffered — read-key nil contract
+	}
+	status, n := scanKey(keyBuf)
+	if status == keyNeedMore && !keyEOF {
+		return "", nil // partial escape sequence — wait for the rest
+	}
+	if n == 0 {
+		return "", nil
+	}
+	s := string(keyBuf[:n])
+	keyBuf = keyBuf[n:]
+	return s, nil
+}
+
+func (wasiKeySource) KeyPending() bool {
+	startKeyPump()
+	// The game's poll loop is a single guest goroutine that otherwise never
+	// yields, so the stdin pump would starve (wasm has no async preemption).
+	// Yield here so the scheduler runs the poller and the pump drains input.
+	runtime.Gosched()
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	return completeKeyLocked()
+}
 
 // termSize returns a fixed 80x24, overridable via the COLUMNS / LINES env vars
 // (WASI has no TIOCGWINSZ, so there is nothing to query).
