@@ -170,6 +170,18 @@ jobs:
           path: ${{ runner.temp }}/comment.md
           if-no-files-found: error
 
+      # Noise-floor probe: keep the full 53-row report + raw base capture so the
+      # per-family delta distribution can be reconstructed off-CI. Throwaway,
+      # rides with the noop-noise-floor branch only.
+      - name: Upload full report + base capture (noise-floor probe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-pr-full
+          path: |
+            ${{ runner.temp }}/report.md
+            ${{ runner.temp }}/base.json
+          if-no-files-found: warn
+
   comment:
     needs: bench
     if: needs.bench.result == 'success'
