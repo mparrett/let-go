@@ -1,0 +1,120 @@
+name: Perf PR (repeat A/B)
+
+# PROTOTYPE — variance-reduced same-runner A/B. A single-shot base-vs-head A/B on
+# shared CI runners is too heavy-tailed to gate on (~1 in 4 runs blows a memory-
+# bound cluster to 25-40% while the register-only anchor stays flat). This runs N
+# INTERLEAVED base/head snapshots across two pre-built worktrees, then aggregates:
+#   strategy 1 median-of-N  — gate if |median delta| > budget
+#   strategy 2 confirm K-of-N — gate only if a regression REPRODUCES on >=K runs
+# Interleaving (base,head,base,head,...) also cancels slow time-separation drift.
+#
+# Dispatch-only so it never collides with the `perf` label that drives perf-pr.yml.
+
+# Opt-in via the `perf-repeat` label (same-repo PRs run the workflow from the PR
+# branch, so this need not live on the default branch). workflow_dispatch is kept
+# for the eventual upstream form, where it will sit on main.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'scripts/ab_repeat.py'
+      - '.github/workflows/perf-pr-repeat.yml'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to benchmark'
+        required: true
+      n:
+        description: 'repeat count (interleaved cycles)'
+        default: '5'
+      budget:
+        description: 'gate budget %'
+        default: '8'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-pr-repeat-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'perf-repeat')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve base and head
+        id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_FROM_EVENT: ${{ github.event.pull_request.number }}
+          PR_FROM_INPUT: ${{ github.event.inputs.pr }}
+          BASE_FROM_EVENT: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            PR="$PR_FROM_INPUT"
+            [[ "$PR" =~ ^[0-9]+$ ]] || { echo "pr must be numeric" >&2; exit 1; }
+            base_ref="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq .base.ref)"
+          else
+            PR="$PR_FROM_EVENT"
+            base_ref="$BASE_FROM_EVENT"
+          fi
+          git fetch --no-tags origin "$base_ref" "refs/pull/${PR}/head:pr-head"
+          head_sha="$(git rev-parse pr-head)"
+          base_sha="$(git merge-base "origin/${base_ref}" pr-head)"
+          echo "base=${base_sha}" >> "$GITHUB_OUTPUT"
+          echo "head=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "Base (merge-base): ${base_sha}"
+          echo "Head:              ${head_sha}"
+
+      - name: Build base and head worktrees
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          set -euo pipefail
+          git worktree add --force ../wt-base "$BASE"
+          git worktree add --force ../wt-head "$HEAD"
+          # lowered (gogen_ir) tree must exist in each worktree before bench.
+          ( cd ../wt-base && git submodule update --init --recursive && make lowered )
+          ( cd ../wt-head && git submodule update --init --recursive && make lowered )
+
+      - name: Interleaved repeat A/B
+        env:
+          N: ${{ github.event.inputs.n || '5' }}
+          BUDGET: ${{ github.event.inputs.budget || '8' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ab_repeat.py \
+            --base ../wt-base --head ../wt-head \
+            --n "$N" --budget "$BUDGET" --confirm-k 2 \
+            --out "${RUNNER_TEMP}/ab-out" | tee "${RUNNER_TEMP}/ab-report.txt"
+          {
+            echo '## Repeat A/B (variance-reduced) — same-code probe'
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/ab-report.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload aggregate
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-pr-repeat
+          path: ${{ runner.temp }}/ab-out/aggregate.json
+          if-no-files-found: warn
