@@ -8625,6 +8625,7 @@ func installClojureCompatAliases(ns *vm.Namespace) {
 
 	installJVMStatics(ns)
 	installCoreCompatFns(ns)
+	installJVMStubs(ns)
 }
 
 func longCompatValue(v int64) vm.Value {
