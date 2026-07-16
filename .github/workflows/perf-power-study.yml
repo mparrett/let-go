@@ -27,13 +27,13 @@ on:
       n:
         description: 'interleaved cycles per magnitude'
         default: '7'
-      # Default sweep is FrameDispatch-only: it's the fast, low-noise compute
-      # family. VectorConj is memory-bound and (esp. the /1000 sizes, O(n²) build)
-      # slow enough that a full sweep blows the timeout — run it separately via
-      # dispatch with a size-limited filter and shorter benchtimes.
+      # Default sweep is FrameDispatch-only: the fast, low-noise compute family.
+      # VectorConj is memory-bound and (esp. the /1000 sizes, O(n²) build) slow
+      # enough that a full sweep blows the timeout — run it with a size-limited
+      # filter and shorter benchtimes (see the sweep step's comment).
       filter:
-        description: 'benchmark name regex (must include the anchor)'
-        default: '^Benchmark(RatchetAnchor|FrameDispatch)$'
+        description: 'family benchmark regex (anchor is added separately)'
+        default: '^BenchmarkFrameDispatch$'
       injected:
         description: 'name prefixes carrying an injection call site'
         default: 'BenchmarkFrameDispatch'
@@ -61,26 +61,25 @@ jobs:
           go-version-file: go.mod
 
       - name: Injected-regression sweep
-        # Current labeled-run config: VectorConj (memory-bound), sizes /10+/100
-        # only (the /1000 sizes are O(n²) and blow the timeout). The anchor is
-        # measured under its own filter now, so this is family-only. VectorConj is
-        # slow per invocation (O(n²) per-iteration build), so this run uses cheaper
-        # benchtimes and 4 magnitudes — an earlier run at 500ms/5-mag hit ~30
-        # min/magnitude and timed out. Flip back to FrameDispatch
-        # ('^BenchmarkFrameDispatch$', spins 0,75,150,230,460, and drop the
-        # BENCH/GT overrides so it uses the script defaults) for the compute run.
+        # Default labeled-run config: FrameDispatch (compute, low-noise) at the
+        # script's default benchtimes — a full 5-magnitude sweep lands in ~9 min.
+        # To run the memory-bound family instead, dispatch (or edit here) with:
+        #   filter    '^BenchmarkVectorConj$/^(ArrayVector|PersistentVector)$/^(10|100)$'
+        #   injected  'BenchmarkVectorConj'
+        #   magnitudes '0,1500,3000,6000'
+        # and add '--benchtime 250ms --count 2 --gt-benchtime 250ms --gt-count 3
+        # --gt-reps 2' to the sweep command — VectorConj is O(n²) per iteration and
+        # times out at the default benchtimes / the /1000 sizes.
         env:
-          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,1500,3000,6000' }}
+          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,75,150,230,460' }}
           N: ${{ github.event.inputs.n || '7' }}
-          FILTER: ${{ github.event.inputs.filter || '^BenchmarkVectorConj$/^(ArrayVector|PersistentVector)$/^(10|100)$' }}
-          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkVectorConj' }}
+          FILTER: ${{ github.event.inputs.filter || '^BenchmarkFrameDispatch$' }}
+          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkFrameDispatch' }}
         run: |
           set -euo pipefail
           python3 scripts/inject_sweep.py --worktree . \
             --magnitudes "$MAGNITUDES" --n "$N" \
             --filter "$FILTER" --injected "$INJECTED" \
-            --benchtime 250ms --count 2 \
-            --gt-benchtime 250ms --gt-count 3 --gt-reps 2 \
             --out "${RUNNER_TEMP}/inject-out" | tee "${RUNNER_TEMP}/sweep.txt"
           {
             echo '## Injected-regression power study'
