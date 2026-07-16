@@ -27,12 +27,16 @@ on:
       n:
         description: 'interleaved cycles per magnitude'
         default: '7'
+      # Default sweep is FrameDispatch-only: it's the fast, low-noise compute
+      # family. VectorConj is memory-bound and (esp. the /1000 sizes, O(n²) build)
+      # slow enough that a full sweep blows the timeout — run it separately via
+      # dispatch with a size-limited filter and shorter benchtimes.
       filter:
         description: 'benchmark name regex (must include the anchor)'
-        default: '^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$'
+        default: '^Benchmark(RatchetAnchor|FrameDispatch)$'
       injected:
         description: 'name prefixes carrying an injection call site'
-        default: 'BenchmarkFrameDispatch,BenchmarkVectorConj'
+        default: 'BenchmarkFrameDispatch'
 
 permissions:
   contents: read
@@ -60,8 +64,8 @@ jobs:
         env:
           MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,75,150,230,460' }}
           N: ${{ github.event.inputs.n || '7' }}
-          FILTER: ${{ github.event.inputs.filter || '^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$' }}
-          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkFrameDispatch,BenchmarkVectorConj' }}
+          FILTER: ${{ github.event.inputs.filter || '^Benchmark(RatchetAnchor|FrameDispatch)$' }}
+          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkFrameDispatch' }}
         run: |
           set -euo pipefail
           python3 scripts/inject_sweep.py --worktree . \

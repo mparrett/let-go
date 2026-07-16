@@ -60,8 +60,10 @@ def main():
     ap.add_argument("--n", type=int, default=7, help="interleaved cycles per magnitude")
     ap.add_argument("--benchtime", default="500ms")
     ap.add_argument("--count", type=int, default=3, help="samples per snapshot")
-    ap.add_argument("--gt-count", type=int, default=8, help="ground-truth samples")
-    ap.add_argument("--gt-benchtime", default="1s")
+    ap.add_argument("--gt-count", type=int, default=4, help="ground-truth samples")
+    ap.add_argument("--gt-benchtime", default="500ms")
+    ap.add_argument("--gt-reps", type=int, default=3,
+                    help="paired GT passes to median over (guards one drifty pass)")
     ap.add_argument("--budgets", default="6,8,10")
     ap.add_argument("--filter", default=r"^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$",
                     help="benchmark name regex; must include the anchor")
@@ -85,12 +87,11 @@ def main():
     results = []
     for K in spins:
         print(f"::group::magnitude spin={K}", flush=True)
-        # Ground truth: anchor-normalized spin0 vs spinK, median of GT_REPS paired
+        # Ground truth: anchor-normalized spin0 vs spinK, median of --gt-reps paired
         # passes so a single thermal-drift pass can't skew the reference (a single
         # pass went non-monotonic across magnitudes in local testing).
-        GT_REPS = 3
         g0, gk = {}, {}
-        for _ in range(GT_REPS):
+        for _ in range(args.gt_reps):
             r0, _ = ratios(binpath, filt, args.gt_benchtime, args.gt_count, 0)
             rk, _ = ratios(binpath, filt, args.gt_benchtime, args.gt_count, K)
             for f in set(r0) & set(rk):
