@@ -12,6 +12,7 @@ package rt
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
@@ -58,6 +59,15 @@ func installOsNS() {
 	ns.Def("exit", exitFn)
 	ns.Def("getenv", getenvFn)
 	ns.Def("args", vm.NewPersistentVector(args))
+
+	// os-name / arch are reflect-free too; xsofy's platform branches
+	// ((= (os/os-name) "js") etc.) need them on every lane.
+	ns.Def("os-name", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.String(runtime.GOOS), nil
+	}))
+	ns.Def("arch", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.String(runtime.GOARCH), nil
+	}))
 	RegisterNS(ns)
 }
 

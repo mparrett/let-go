@@ -19,7 +19,6 @@ import (
 
 	"github.com/nooga/let-go/pkg/vm"
 	"golang.org/x/sys/unix"
-	"golang.org/x/term"
 )
 
 // SIGWINCH wake-byte plumbing for term/read-key.
@@ -91,7 +90,10 @@ func fdFromHandle(v vm.Value) (int, error) {
 	return -1, fmt.Errorf("expected IOHandle, got %T", b.Unbox())
 }
 
-var termOldState *term.State
+// termOldState / the term* helpers below go through the terminal sysdep seam
+// (term_sysdep_default.go wraps x/term; term_sysdep_tinygo_darwin.go uses raw
+// syscalls because TinyGo can't link x/sys' darwin trampolines).
+var termOldState *termState
 
 // nativeKeySource is the native *keys* binding: term/read-key and key-pending?
 // read from stdin, with the SIGWINCH wake-byte self-pipe (setupWinch) breaking
@@ -190,7 +192,7 @@ func (nativeKeySource) readRaw() ([]byte, error) {
 	// both interrupt the blocking poll(2). Pre-PR os.Stdin.Read got
 	// transparent EINTR retry via Go's ignoringEINTR; preserve that here.
 	for {
-		_, err := unix.Poll(fds, -1)
+		_, err := termPoll(fds, -1)
 		if err == unix.EINTR {
 			continue
 		}
@@ -320,7 +322,7 @@ func installTermNS() {
 			if err != nil {
 				return vm.NIL, fmt.Errorf("raw-mode!: %w", err)
 			}
-			old, err := term.MakeRaw(fd)
+			old, err := termMakeRaw(fd)
 			if err != nil {
 				return vm.NIL, fmt.Errorf("raw-mode!: %w", err)
 			}
@@ -329,7 +331,7 @@ func installTermNS() {
 		if termOldState != nil {
 			return vm.TRUE, nil // already in raw mode
 		}
-		old, err := term.MakeRaw(int(os.Stdin.Fd()))
+		old, err := termMakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
 			return vm.NIL, nil // not a TTY
 		}
@@ -351,11 +353,11 @@ func installTermNS() {
 			if !ok {
 				return vm.NIL, fmt.Errorf("restore-mode!: expected saved-state")
 			}
-			st, ok := b.Unbox().(*term.State)
+			st, ok := b.Unbox().(*termState)
 			if !ok {
 				return vm.NIL, fmt.Errorf("restore-mode!: expected saved-state, got %T", b.Unbox())
 			}
-			if err := term.Restore(fd, st); err != nil {
+			if err := termRestore(fd, st); err != nil {
 				return vm.NIL, fmt.Errorf("restore-mode!: %w", err)
 			}
 			return vm.TRUE, nil
@@ -363,7 +365,7 @@ func installTermNS() {
 		if termOldState == nil {
 			return vm.NIL, nil
 		}
-		err := term.Restore(int(os.Stdin.Fd()), termOldState)
+		err := termRestore(int(os.Stdin.Fd()), termOldState)
 		termOldState = nil
 		if err != nil {
 			return vm.NIL, fmt.Errorf("restore-mode!: %w", err)
@@ -427,7 +429,7 @@ func installTermNS() {
 			}
 			fd = f
 		}
-		w, h, err := term.GetSize(fd)
+		w, h, err := termGetSize(fd)
 		if err != nil {
 			return vm.NIL, nil // not a TTY
 		}
@@ -468,7 +470,7 @@ func installTermNS() {
 		if err != nil {
 			return vm.NIL, fmt.Errorf("tty?: %w", err)
 		}
-		if term.IsTerminal(fd) {
+		if termIsTerminal(fd) {
 			return vm.TRUE, nil
 		}
 		return vm.FALSE, nil
