@@ -32,6 +32,7 @@ func BenchmarkFrameDispatch(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		f := NewFrame(chunk, nil)
 		f.Run()
+		perfInjectSpin() // power-study injection; no-op unless PERF_INJECT_SPIN set
 	}
 }
 

@@ -90,6 +90,7 @@ func BenchmarkVectorConj(b *testing.B) {
 				for j := range size {
 					vec = vec.Conj(Int(j))
 				}
+				perfInjectSpin() // power-study injection; no-op unless PERF_INJECT_SPIN set
 			}
 		})
 
@@ -103,6 +104,7 @@ func BenchmarkVectorConj(b *testing.B) {
 				for j := range size {
 					vec = vec.Conj(Int(j))
 				}
+				perfInjectSpin() // power-study injection; no-op unless PERF_INJECT_SPIN set
 			}
 		})
 	}

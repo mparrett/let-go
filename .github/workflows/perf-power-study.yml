@@ -1,0 +1,85 @@
+name: Perf power study (injected regression)
+
+# Detection-power study for the repeat-A/B perf gate (nooga/let-go#445). Injects
+# a KNOWN regression into known families via a test-only env-scaled spin
+# (perfInjectSpin / PERF_INJECT_SPIN) and measures whether median-of-N flags it,
+# at what budget, and whether the recovered median matches the ground truth.
+# base = spin 0 and head = spin K on the SAME compiled binary, so the only
+# difference is the injected cost.
+#
+# This is the sensitivity companion to perf-pr-repeat.yml's specificity data:
+# the no-op runs show the false-positive rate, this shows the detection rate.
+# Opt-in via the `perf-power` label (the injection lives on this branch's
+# pkg/vm, so it runs from the PR branch and need not sit on the default branch).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'pkg/vm/**'
+      - 'scripts/inject_sweep.py'
+      - '.github/workflows/perf-power-study.yml'
+  workflow_dispatch:
+    inputs:
+      magnitudes:
+        description: 'PERF_INJECT_SPIN sweep (0 = null)'
+        default: '0,75,150,230,460'
+      n:
+        description: 'interleaved cycles per magnitude'
+        default: '7'
+      filter:
+        description: 'benchmark name regex (must include the anchor)'
+        default: '^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$'
+      injected:
+        description: 'name prefixes carrying an injection call site'
+        default: 'BenchmarkFrameDispatch,BenchmarkVectorConj'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-power-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  study:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'perf-power')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Injected-regression sweep
+        env:
+          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,75,150,230,460' }}
+          N: ${{ github.event.inputs.n || '7' }}
+          FILTER: ${{ github.event.inputs.filter || '^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$' }}
+          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkFrameDispatch,BenchmarkVectorConj' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/inject_sweep.py --worktree . \
+            --magnitudes "$MAGNITUDES" --n "$N" \
+            --filter "$FILTER" --injected "$INJECTED" \
+            --out "${RUNNER_TEMP}/inject-out" | tee "${RUNNER_TEMP}/sweep.txt"
+          {
+            echo '## Injected-regression power study'
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/sweep.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sweep
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-power-study
+          path: ${{ runner.temp }}/inject-out/
+          if-no-files-found: warn
