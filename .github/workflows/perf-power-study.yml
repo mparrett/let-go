@@ -63,11 +63,14 @@ jobs:
       - name: Injected-regression sweep
         # Current labeled-run config: VectorConj (memory-bound), sizes /10+/100
         # only (the /1000 sizes are O(n²) and blow the timeout). The anchor is
-        # measured under its own filter now, so this is family-only. Flip back to
-        # FrameDispatch ('^BenchmarkFrameDispatch$', spins 0,75,150,230,460) for
-        # the compute run.
+        # measured under its own filter now, so this is family-only. VectorConj is
+        # slow per invocation (O(n²) per-iteration build), so this run uses cheaper
+        # benchtimes and 4 magnitudes — an earlier run at 500ms/5-mag hit ~30
+        # min/magnitude and timed out. Flip back to FrameDispatch
+        # ('^BenchmarkFrameDispatch$', spins 0,75,150,230,460, and drop the
+        # BENCH/GT overrides so it uses the script defaults) for the compute run.
         env:
-          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,1000,2000,3000,5000' }}
+          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,1500,3000,6000' }}
           N: ${{ github.event.inputs.n || '7' }}
           FILTER: ${{ github.event.inputs.filter || '^BenchmarkVectorConj$/^(ArrayVector|PersistentVector)$/^(10|100)$' }}
           INJECTED: ${{ github.event.inputs.injected || 'BenchmarkVectorConj' }}
@@ -76,6 +79,8 @@ jobs:
           python3 scripts/inject_sweep.py --worktree . \
             --magnitudes "$MAGNITUDES" --n "$N" \
             --filter "$FILTER" --injected "$INJECTED" \
+            --benchtime 250ms --count 2 \
+            --gt-benchtime 250ms --gt-count 3 --gt-reps 2 \
             --out "${RUNNER_TEMP}/inject-out" | tee "${RUNNER_TEMP}/sweep.txt"
           {
             echo '## Injected-regression power study'
