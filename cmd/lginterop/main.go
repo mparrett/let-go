@@ -37,6 +37,7 @@ func main() {
 	out := flag.String("out", ".lg-interop", "output directory for generated Go files")
 	packagesFlag := flag.String("packages", "", "comma-separated list of packages (overrides deps.edn :gointerop)")
 	smartFlag := flag.Bool("smart", false, "generate explicit wrappers with type-specific unboxing/boxing")
+	opaqueFlag := flag.Bool("opaque-structs", false, "skip vm.RegisterStruct: struct types stay boxed and dispatch methods reflectively")
 	skeletonFlag := flag.Bool("skeleton", false, "generate let-go skeleton files with defn- stubs for hand customization")
 	primitivesDir := flag.String("primitives", "", "directory containing //lg:-annotated Go sources (generates zz_primitives_generated.go)")
 	primitivesOut := flag.String("primitives-out", "pkg/rt/zz_primitives_generated.go", "output file for generated primitives")
@@ -55,7 +56,7 @@ func main() {
 	var entries []interopEntry
 	if *packagesFlag != "" {
 		for pkg := range strings.SplitSeq(*packagesFlag, ",") {
-			entries = append(entries, interopEntry{pkg: strings.TrimSpace(pkg), smart: *smartFlag})
+			entries = append(entries, interopEntry{pkg: strings.TrimSpace(pkg), smart: *smartFlag, opaque: *opaqueFlag})
 		}
 	} else {
 		var err error
@@ -63,6 +64,9 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "lginterop: %v\n", err)
 			os.Exit(1)
+		}
+		for i := range entries {
+			entries[i].opaque = *opaqueFlag
 		}
 	}
 
@@ -86,6 +90,21 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lginterop: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Output filenames derive from the alias; two entries sharing one would
+	// silently clobber each other's interop_<alias>.go. Refuse up front.
+	seenAlias := map[string]string{}
+	for _, ent := range entries {
+		alias := ent.alias
+		if alias == "" {
+			alias = defaultAlias(ent.pkg)
+		}
+		if prev, dup := seenAlias[alias]; dup {
+			fmt.Fprintf(os.Stderr, "lginterop: alias %q used by both %s and %s — outputs would collide; set a distinct alias\n", alias, prev, ent.pkg)
+			os.Exit(1)
+		}
+		seenAlias[alias] = ent.pkg
 	}
 
 	okCount := 0
@@ -206,14 +225,28 @@ func findRepoRoot() (string, error) {
 }
 
 func ensureLgBinary(repoRoot string) (string, error) {
+	// Always build (incremental, so cheap when nothing changed): a stat
+	// fast-path silently reuses a STALE ./lg, which regenerates interop
+	// files with old emitter behavior — the drift class the round-trip
+	// golden test exists to catch. Building into a unique temp name and
+	// renaming keeps concurrent invocations safe (parallel test packages
+	// each rename a complete binary; last rename wins) without locking.
 	lgPath := filepath.Join(repoRoot, "lg")
-	if _, err := os.Stat(lgPath); err == nil {
-		return lgPath, nil
+	tmp, err := os.CreateTemp(repoRoot, "lg-build-*")
+	if err != nil {
+		return "", fmt.Errorf("build lg binary: %w", err)
 	}
-	cmd := exec.Command("go", "build", "-o", "lg", ".")
+	tmpPath := tmp.Name()
+	tmp.Close()
+	cmd := exec.Command("go", "build", "-o", tmpPath, ".")
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(tmpPath)
 		return "", fmt.Errorf("build lg binary: %w\n%s", err, output)
+	}
+	if err := os.Rename(tmpPath, lgPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("build lg binary: %w", err)
 	}
 	return lgPath, nil
 }
@@ -320,9 +353,10 @@ func parseInteropItem(item vm.Value) interopEntry {
 }
 
 type interopEntry struct {
-	pkg   string
-	alias string
-	smart bool
+	pkg    string
+	alias  string
+	smart  bool
+	opaque bool // skip vm.RegisterStruct: structs stay Boxed, methods dispatch reflectively
 }
 
 type export struct {
@@ -377,16 +411,19 @@ func generatePackage(repoRoot, lgBin string, ent interopEntry, outDir string, sk
 		return exports[i].name < exports[j].name
 	})
 
-	fileName := goPackageToFileName(pkgName) + ".go"
+	fileName := "interop_" + goPackageToFileName(alias) + ".go"
 	outPath := filepath.Join(outDir, fileName)
 
 	// Write the Lisp script that drives gogen codegen.
-	scriptPath, err := writeGenScript(repoRoot, pkgName, alias, exports, outPath, ent.smart)
+	scriptPath, err := writeGenScript(repoRoot, pkgName, alias, exports, outPath, ent.smart, ent.opaque)
 	if err != nil {
 		return fmt.Errorf("write script: %w", err)
 	}
-	// DEBUG: keep temp script for inspection
-	// defer os.Remove(scriptPath)
+	if os.Getenv("LGINTEROP_KEEP_SCRIPT") != "" {
+		fmt.Printf("lginterop: keeping temp script %s\n", scriptPath)
+	} else {
+		defer os.Remove(scriptPath)
+	}
 
 	cmd := exec.Command(lgBin, "-source-paths", filepath.Join(repoRoot, "scripts"), scriptPath)
 	cmd.Dir = repoRoot
@@ -415,7 +452,7 @@ func generatePackage(repoRoot, lgBin string, ent interopEntry, outDir string, sk
 
 // --- Lisp script generation -----------------------------------------------
 
-func writeGenScript(repoRoot, pkgName, alias string, exports []export, outPath string, smart bool) (string, error) {
+func writeGenScript(repoRoot, pkgName, alias string, exports []export, outPath string, smart, opaque bool) (string, error) {
 	macroPath := filepath.Join(repoRoot, "scripts", "lginterop.lg")
 	macroLib, err := os.ReadFile(macroPath)
 	if err != nil {
@@ -428,8 +465,9 @@ func writeGenScript(repoRoot, pkgName, alias string, exports []export, outPath s
 	b.WriteString("(def exports ")
 	b.WriteString(serializeExports(exports))
 	b.WriteString(")\n")
-	fmt.Fprintf(&b, "(lginterop/generate %s %s exports %s %s)\n",
-		strconv.Quote(pkgName), strconv.Quote(alias), strconv.Quote(outPath), strconv.FormatBool(smart))
+	fmt.Fprintf(&b, "(lginterop/generate %s %s exports %s %s %s)\n",
+		strconv.Quote(pkgName), strconv.Quote(alias), strconv.Quote(outPath),
+		strconv.FormatBool(smart), strconv.FormatBool(opaque))
 
 	tmpFile, err := os.CreateTemp("", "lginterop-*.lg")
 	if err != nil {
