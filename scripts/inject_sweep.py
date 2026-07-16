@@ -39,9 +39,17 @@ def run_bench(binpath, filt, benchtime, count, spin):
     return {k: statistics.median(v) for k, v in samples.items()}
 
 
-def ratios(binpath, filt, benchtime, count, spin):
-    """One snapshot: family ns normalized to the anchor measured in the same run."""
+def ratios(binpath, filt, anchor_filt, benchtime, count, spin):
+    """One snapshot: family ns normalized to the anchor.
+
+    The anchor is run under its own filter and merged, so the family filter can
+    be a depth-3 pattern that size-limits sub-benchmarks (e.g. VectorConj /10,/100
+    but not the O(n²) /1000) — Go's -bench won't match the depth-1 anchor against a
+    depth-3 pattern. bench-ratchet measures anchor and families sequentially too,
+    so a second invocation is no less faithful.
+    """
     ns = run_bench(binpath, filt, benchtime, count, spin)
+    ns.update(run_bench(binpath, anchor_filt, benchtime, count, spin))
     anchor = ns.get(ANCHOR)
     if not anchor:
         raise RuntimeError(f"anchor {ANCHOR} not measured (spin={spin})")
@@ -65,9 +73,11 @@ def main():
     ap.add_argument("--gt-reps", type=int, default=3,
                     help="paired GT passes to median over (guards one drifty pass)")
     ap.add_argument("--budgets", default="6,8,10")
-    ap.add_argument("--filter", default=r"^Benchmark(RatchetAnchor|FrameDispatch|VectorConj)$",
-                    help="benchmark name regex; must include the anchor")
-    ap.add_argument("--injected", default="BenchmarkFrameDispatch,BenchmarkVectorConj",
+    ap.add_argument("--filter", default=r"^BenchmarkFrameDispatch$",
+                    help="family benchmark regex (the anchor is added separately)")
+    ap.add_argument("--anchor-filter", default=r"^BenchmarkRatchetAnchor$",
+                    help="anchor benchmark regex, measured and merged per snapshot")
+    ap.add_argument("--injected", default="BenchmarkFrameDispatch",
                     help="comma-separated name prefixes carrying an injection call site")
     ap.add_argument("--out", default="inject-out")
     args = ap.parse_args()
@@ -75,6 +85,7 @@ def main():
     budgets = [float(b) for b in args.budgets.split(",")]
     spins = [int(s) for s in args.magnitudes.split(",")]
     filt = args.filter
+    anchor_filt = args.anchor_filter
     injected = args.injected.split(",")
 
     binpath = os.path.join(args.out, "vm.test")
@@ -92,8 +103,8 @@ def main():
         # pass went non-monotonic across magnitudes in local testing).
         g0, gk = {}, {}
         for _ in range(args.gt_reps):
-            r0, _ = ratios(binpath, filt, args.gt_benchtime, args.gt_count, 0)
-            rk, _ = ratios(binpath, filt, args.gt_benchtime, args.gt_count, K)
+            r0, _ = ratios(binpath, filt, anchor_filt, args.gt_benchtime, args.gt_count, 0)
+            rk, _ = ratios(binpath, filt, anchor_filt, args.gt_benchtime, args.gt_count, K)
             for f in set(r0) & set(rk):
                 if r0[f]:
                     g0.setdefault(f, []).append(r0[f])
@@ -105,11 +116,11 @@ def main():
         deltas, anchors = {}, []
         for i in range(1, args.n + 1):
             if i % 2 == 1:
-                b, ba = ratios(binpath, filt, args.benchtime, args.count, 0)
-                h, ha = ratios(binpath, filt, args.benchtime, args.count, K)
+                b, ba = ratios(binpath, filt, anchor_filt, args.benchtime, args.count, 0)
+                h, ha = ratios(binpath, filt, anchor_filt, args.benchtime, args.count, K)
             else:
-                h, ha = ratios(binpath, filt, args.benchtime, args.count, K)
-                b, ba = ratios(binpath, filt, args.benchtime, args.count, 0)
+                h, ha = ratios(binpath, filt, anchor_filt, args.benchtime, args.count, K)
+                b, ba = ratios(binpath, filt, anchor_filt, args.benchtime, args.count, 0)
             anchors.append((ba, ha))
             for f in set(b) & set(h):
                 if b[f]:

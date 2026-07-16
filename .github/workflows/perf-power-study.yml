@@ -61,11 +61,16 @@ jobs:
           go-version-file: go.mod
 
       - name: Injected-regression sweep
+        # Current labeled-run config: VectorConj (memory-bound), sizes /10+/100
+        # only (the /1000 sizes are O(n²) and blow the timeout). The anchor is
+        # measured under its own filter now, so this is family-only. Flip back to
+        # FrameDispatch ('^BenchmarkFrameDispatch$', spins 0,75,150,230,460) for
+        # the compute run.
         env:
-          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,75,150,230,460' }}
+          MAGNITUDES: ${{ github.event.inputs.magnitudes || '0,1000,2000,3000,5000' }}
           N: ${{ github.event.inputs.n || '7' }}
-          FILTER: ${{ github.event.inputs.filter || '^Benchmark(RatchetAnchor|FrameDispatch)$' }}
-          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkFrameDispatch' }}
+          FILTER: ${{ github.event.inputs.filter || '^BenchmarkVectorConj$/^(ArrayVector|PersistentVector)$/^(10|100)$' }}
+          INJECTED: ${{ github.event.inputs.injected || 'BenchmarkVectorConj' }}
         run: |
           set -euo pipefail
           python3 scripts/inject_sweep.py --worktree . \
