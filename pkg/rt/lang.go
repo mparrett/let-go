@@ -328,7 +328,14 @@ type NSLoader interface {
 	Load(string) *vm.Namespace
 }
 
+// NSLoaderWithError optionally preserves loader failures for RequireNS while
+// NSLoader retains its original Go API for embedders.
+type NSLoaderWithError interface {
+	LoadWithError(string) (*vm.Namespace, error)
+}
+
 var nsLoader NSLoader
+var nsLoadErrors = map[string]error{}
 
 func SetNSLoader(loader NSLoader) {
 	nsLoader = loader
@@ -441,8 +448,6 @@ func NS(name string) *vm.Namespace {
 	return LookupOrRegisterNS(resolveNSAlias(name))
 }
 
-// RequireNS loads/materializes a namespace and reports an error when a loader
-// is configured but the namespace could not be loaded.
 // RequireNS loads/materializes a namespace and reports an error if a loader
 // is configured but the namespace could not be loaded. Returns nil namespace
 // on error (no half-initialized placeholder is leaked).
@@ -452,6 +457,7 @@ func RequireNS(name string) (*vm.Namespace, error) {
 
 	nsMu.RLock()
 	needsLoad := nsNeedsLoad[canonical]
+	loadErr := nsLoadErrors[canonical]
 	nsMu.RUnlock()
 
 	if nsLoader != nil && needsLoad {
@@ -459,7 +465,11 @@ func RequireNS(name string) (*vm.Namespace, error) {
 		// Back out the placeholder registration so retry is clean.
 		nsMu.Lock()
 		delete(nsRegistry, canonical)
+		delete(nsLoadErrors, canonical)
 		nsMu.Unlock()
+		if loadErr != nil {
+			return nil, loadErr
+		}
 		return nil, fmt.Errorf("unable to load namespace %s", name)
 	}
 	return ns, nil
@@ -567,7 +577,20 @@ func LookupOrRegisterNS(name string) *vm.Namespace {
 		delete(nsNeedsLoad, name)
 		nsMu.Unlock()
 
-		loadedNS := nsLoader.Load(name)
+		var loadedNS *vm.Namespace
+		var loadErr error
+		if loader, ok := nsLoader.(NSLoaderWithError); ok {
+			loadedNS, loadErr = loader.LoadWithError(name)
+		} else {
+			loadedNS = nsLoader.Load(name)
+		}
+		nsMu.Lock()
+		if loadErr == nil {
+			delete(nsLoadErrors, name)
+		} else {
+			nsLoadErrors[name] = loadErr
+		}
+		nsMu.Unlock()
 		if loadedNS != nil {
 			nsMu.Lock()
 			nsRegistry[name] = loadedNS
@@ -577,6 +600,11 @@ func LookupOrRegisterNS(name string) *vm.Namespace {
 			// (e.g. clojure.string/upper-case) — restore them.
 			reapplyGeneratedPrimitives(name, loadedNS)
 			return loadedNS
+		}
+		if loadErr != nil {
+			nsMu.Lock()
+			nsNeedsLoad[name] = true
+			nsMu.Unlock()
 		}
 
 		// Loader returned nil. Check if in-ns side-effected the registry.
@@ -6652,6 +6680,18 @@ func installLangNS() {
 	CurrentNS = ns.Def("*ns*", ns)
 	ns.Def("*compiling-aot*", vm.FALSE)
 	ns.Def("*in-wasm*", vm.FALSE)
+	uncheckedMath := ns.Def("*unchecked-math*", vm.FALSE)
+	uncheckedMath.SetDynamic()
+	uncheckedMath.SetMeta(vm.NewPersistentMap([]vm.Value{
+		vm.Keyword("dynamic"), vm.TRUE,
+		vm.Keyword("doc"), vm.String("Compatibility var for Clojure's unchecked arithmetic mode; accepted but has no code-generation effect."),
+	}))
+	warnOnReflection := ns.Def("*warn-on-reflection*", vm.FALSE)
+	warnOnReflection.SetDynamic()
+	warnOnReflection.SetMeta(vm.NewPersistentMap([]vm.Value{
+		vm.Keyword("dynamic"), vm.TRUE,
+		vm.Keyword("doc"), vm.String("Warns once per source site when let-go misses a known static host/direct/native dispatch path; this is not JVM reflection."),
+	}))
 	// The user's command-line arguments — the positionals after the script —
 	// as a seq of strings, or nil when there are none. Set by lg at startup
 	// (see commandLineArgsValue in lg.go); os/args remains the full process
@@ -8038,6 +8078,17 @@ func installLangNS() {
 		return vs[1], nil
 	})
 	ns.Def("-copy-form-source!", copyFormSource)
+
+	warnReflection := vm.NewCtxNativeFn("-warn-reflection!", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 3 {
+			return vm.NIL, fmt.Errorf("-warn-reflection! expects source, kind, and reason")
+		}
+		kind := strings.TrimPrefix(vs[1].String(), ":")
+		reason := strings.Trim(vs[2].String(), "\"")
+		emitReflectionWarningValue(ec, vs[0], kind, reason)
+		return vm.NIL, nil
+	})
+	ns.Def("-warn-reflection!", warnReflection)
 
 	// macroexpand — expand a macro form once
 	macroexpandf := vm.NewCtxNativeFn("macroexpand", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
