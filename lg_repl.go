@@ -170,10 +170,11 @@ func repl(ctx *compiler.Context) {
 		inputCtx := ctx.ChildForEval()
 		inputCtx.SetSource("REPL")
 		val, err := runForm(inputCtx, line)
+		if err == nil {
+			err = printResult(val)
+		}
 		if err != nil {
 			fmt.Print(vm.FormatError(err))
-		} else {
-			fmt.Println(val.String())
 		}
 	}
 }
