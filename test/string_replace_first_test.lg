@@ -1,7 +1,8 @@
 ;; clojure.string/replace-first: first-occurrence replacement, String and Regex.
 (ns test.string-replace-first-test
-  (:require [string :as str]
-            [test :refer :all]))
+  (:require
+   [string :as str]
+   [test :refer :all]))
 
 (deftest replace-first-string-match
   (testing "replaces only the FIRST literal occurrence"
@@ -17,3 +18,44 @@
     (is (= "Smith John" (str/replace-first "John Smith" #"(\w+)\s(\w+)" "$2 $1"))))
   (testing "returns the string unchanged when the pattern does not match"
     (is (= "abc" (str/replace-first "abc" #"[0-9]" "X")))))
+
+(deftest positive-lookahead-regex-match
+  (testing "terminal positive lookahead constrains without consuming"
+    (is (= "insert into" (str/replace "insert-into" #"(\w)-(?=\w)" "$1 ")))
+    (is (= "a b c" (str/replace "a-b-c" #"(\w)-(?=\w)" "$1 ")))
+    (is (= "<a->b" (str/replace "a-b" #"(\w)-(?=\w)" "<$0>")))
+    (is (= "a b c"
+           (str/replace "a-b-c" #"(\w)-(?=\w)"
+                        (fn [[_ letter]] (str letter " ")))))
+    (is (= "-leading trailing-"
+           (str/replace "-leading trailing-" #"(\w)-(?=\w)" "$1 ")))
+    (is (= ["a-" "a"] (re-find #"(\w)-(?=\w)" "a-b")))
+    (is (= '(["a-" "a"] ["b-" "b"])
+           (re-seq #"(\w)-(?=\w)" "a-b-c")))))
+
+(deftest lookahead-anchor-and-group-semantics
+  (testing "^ anchors to the true string start, not every resume point"
+    ;; Java: one empty match at position 0. The slice-based resume used to
+    ;; re-anchor ^ at each offset and yield ("" "").
+    (is (= '("") (re-seq #"^(?=a)" "aa")))
+    (is (= ["ab" "a"] (re-find #"^(a)b(?=c)" "abc")))
+    (is (nil? (re-find #"^(?=b)" "ab"))))
+  (testing "(?m) ^ anchors at line starts only"
+    (is (= '("a-" "b-")
+           (map first (re-seq #"(?m)^(\w)-(?=\w)" "a-b\nb-c")))))
+  (testing "a nonexistent $n group reference fails loud (Clojure parity)"
+    ;; #"(a)(?=b)" has ONE user group: the lookahead is an assertion, not a
+    ;; group, and its synthetic implementation group is not addressable. Java
+    ;; throws IndexOutOfBoundsException for $2; silent empty expansion would
+    ;; produce a plausible-looking wrong answer.
+    (is (= :threw (try (str/replace "ab" #"(a)(?=b)" "$2")
+                       (catch Exception _ :threw))))
+    (is (= :threw (try (str/replace "ab" #"(a)b" "$2")
+                       (catch Exception _ :threw))))
+    (is (= :threw (try (str/replace-first "ab" #"(a)b" "$2")
+                       (catch Exception _ :threw))))
+    (is (= :threw (try (str/replace "ab" #"(?P<x>a)b" "${y}")
+                       (catch Exception _ :threw))))
+    (is (= "[a]b" (str/replace "ab" #"(a)(?=b)" "[$1]")))
+    (is (= "Xb" (str/replace "ab" #"(?P<x>a)" "X")))
+    (is (= "$b" (str/replace "ab" #"(a)" "$$")))))
