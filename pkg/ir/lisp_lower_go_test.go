@@ -164,6 +164,82 @@ func TestLowerGoStrictMixedIntFloatInfersNativeFloat(t *testing.T) {
 	}
 }
 
+// Regression for #534: a mixed concrete int/float arithmetic op (int param
+// times a float literal) lowers to a NATIVE float op — but Go rejects `int *
+// float64`, and an untyped float constant against an int operand is a hard
+// compile error ("0.0625 truncated to int"). The int operand must be widened
+// with float64(...) so the emitted Go actually compiles.
+func TestLowerGoStrictMixedIntFloatArithWidensIntOperand(t *testing.T) {
+	ensureLoader()
+
+	fn := buildLispIR(t, `(defn cx [col] (* 0.0625 col))`)
+	seedArgTypes(t, fn, "[:int]")
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for mixed int/float arithmetic, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "float64(") {
+		t.Fatalf("expected the int operand widened to float64 (else the untyped float const truncates to int), got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "MulValue") {
+		t.Fatalf("expected native float multiply, not a boxed rt.MulValue helper, got:\n%s", rendered)
+	}
+}
+
+// Regression for #534: the same int→float widening is required in a mixed
+// int/float COMPARISON — `col < 0.5` with an int param is `int < float64`,
+// which Go likewise rejects. The int side must be widened.
+func TestLowerGoStrictMixedIntFloatComparisonWidensIntOperand(t *testing.T) {
+	ensureLoader()
+
+	fn := buildLispIR(t, `(defn lt [col] (< col 0.5))`)
+	seedArgTypes(t, fn, "[:int]")
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for mixed int/float comparison, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "float64(") {
+		t.Fatalf("expected the int operand widened to float64 in the comparison, got:\n%s", rendered)
+	}
+}
+
+// Regression for #534: the int→float widening is sound for arithmetic and
+// ordering, but NOT for `=`. Clojure `=` is category-sensitive across the
+// numeric tower — (= 1 1.0) is false — whereas widening the int to float64 and
+// comparing with native Go == makes `(= col 1.0)` return true at col=1,
+// diverging from the bytecode VM. A mixed concrete int/float `=` must route to
+// rt.EqValue (which delegates to vm.ValueEquals), not native ==.
+func TestLowerGoStrictMixedIntFloatEqUsesEqValueNotNativeEq(t *testing.T) {
+	ensureLoader()
+
+	fn := buildLispIR(t, `(defn eqf [col] (= col 1.0))`)
+	seedArgTypes(t, fn, "[:int]")
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for mixed int/float =, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "EqValue") {
+		t.Fatalf("expected a mixed int/float = to route to rt.EqValue (Clojure value-equality), got:\n%s", rendered)
+	}
+	// A native `==` here would be the divergence: float64(col) == 1.0 is true at
+	// col=1, but Clojure (= 1 1.0) is false.
+	if strings.Contains(rendered, "==") {
+		t.Fatalf("expected NO native == for a cross-type = (it would violate Clojure's category-sensitive =), got:\n%s", rendered)
+	}
+}
+
 // Regression for PR #235 review (robustness): a genuinely ambiguous :number
 // result — e.g. (+ x x) where x is only known to be {int,float} — has no native
 // Go type, so go-type-spec must give it a lowering target (vm.Value) instead of
