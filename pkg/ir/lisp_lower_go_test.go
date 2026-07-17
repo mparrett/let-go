@@ -9,6 +9,8 @@ package ir_test
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -237,6 +239,180 @@ func TestLowerGoStrictMixedIntFloatEqUsesEqValueNotNativeEq(t *testing.T) {
 	// col=1, but Clojure (= 1 1.0) is false.
 	if strings.Contains(rendered, "==") {
 		t.Fatalf("expected NO native == for a cross-type = (it would violate Clojure's category-sensitive =), got:\n%s", rendered)
+	}
+}
+
+// #357: a ^double param hint routes to :arg-types so the param lowers to a
+// native float64 — without any explicit seedArgTypes. Before this, the AOT
+// arg-pattern matcher threw "unsupported arg pattern" on a :tag-annotated param,
+// and op-based backward inference typed a float-used param :int (float64 + int,
+// which doesn't compile — and truncates coordinates if it did).
+func TestLowerGoDoubleHintLowersToFloat64Param(t *testing.T) {
+	ensureLoader()
+
+	fn := buildLispIR(t, `(defn addf [^double a] (+ a 1.5))`)
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for a ^double-hinted param, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "arg0 float64") {
+		t.Fatalf("expected ^double param to lower to a native float64 param, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "vm.Value") {
+		t.Fatalf("expected no boxing for a ^double-hinted param, got:\n%s", rendered)
+	}
+}
+
+// #530 review: the authoritative-hint guard (assert-hint-agrees-with-inference!)
+// must stay inert when op-based inference AGREES with a numeric hint or is silent.
+// A ^double param used in arithmetic infers :int through the backward pass, which
+// is numeric and so no contradiction — the param keeps its float64 hint and lowers
+// natively, no throw. (The guard fires only on a concrete NON-numeric inferred
+// type, which the current numeric-only inference can't produce; this is the
+// negative case proving it doesn't over-fire on the motivating escape-style code.)
+func TestLowerGoNumericHintGuardInertWhenInferenceAgrees(t *testing.T) {
+	ensureLoader()
+
+	// `cx` is ^double but used in `< cx 4.0` and `+ cx 1.0`, which the backward
+	// pass constrains to :int — numeric, so the guard leaves the hint alone.
+	fn := buildLispIR(t, `(defn step [^double cx] (if (< cx 4.0) (+ cx 1.0) cx))`)
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status (guard must not fire on a numeric-agreeing hint), got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "arg0 float64") {
+		t.Fatalf("expected the ^double hint to survive inference and lower to float64, got:\n%s", rendered)
+	}
+}
+
+// #357: multi-arity hint routing. The AOT :go path rebuilds each arity as a
+// single-arity defn through build-fn (pipeline lower-ns-to-go), so ^double hints
+// flow to every arity — each lowers to its own native float64-param func
+// (Scale_1 / Scale_2). Drives the ns-lowering seam, not build-fn directly:
+// build-fn's own multi-arity path produces the :multi-fn-template CLOSURE, a
+// different (boxed) representation the AOT path doesn't use.
+func TestLowerNsMultiArityDoubleHintLowersToFloat64Params(t *testing.T) {
+	ensureLoader()
+
+	v := runLispExpr(t, `(ir.passes.pipeline/lower-ns-to-go "scalepkg" (quote core)
+	  (quote [(defn scale
+	            ([^double a] (* a 2.0))
+	            ([^double a ^double b] (+ (* a 2.0) b)))]))`)
+	s, ok := v.(vm.String)
+	if !ok {
+		t.Fatalf("expected rendered Go string, got %T: %v", v, v)
+	}
+	rendered := string(s)
+
+	for _, want := range []string{
+		"Scale_1(ec *vm.ExecContext, arg0 float64)",
+		"Scale_2(ec *vm.ExecContext, arg0 float64, arg1 float64)",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("multi-arity ^double hint missing %q:\n--- rendered Go ---\n%s", want, rendered)
+		}
+	}
+}
+
+// captureLetGoOut runs fn with let-go's *out* rebound to a pipe and returns what
+// it wrote. let-go's println (the lowering's WARNING emitter) resolves *out*
+// dynamically via WriteToOut, and its root IOHandle captured os.Stdout at init —
+// so swapping os.Stdout doesn't intercept it; rebinding the *out* var does.
+func captureLetGoOut(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	ns := rt.NS(rt.NameCoreNS)
+	ns.Def("*out*", vm.NewBoxed(rt.NewIOHandle(w)))
+	defer ns.Def("*out*", vm.NewBoxed(rt.NewIOHandle(os.Stdout)))
+	fn()
+	w.Close()
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
+// #530 review: a recognized but non-numeric hint (^String, a class) has no native
+// param type. It must not crash and must not mis-route to a numeric param — it
+// stays vm.Value (boxed); and build-fn must WARN rather than drop the hint
+// silently (the actual subject of the review).
+func TestLowerGoNonNumericHintStaysBoxed(t *testing.T) {
+	ensureLoader()
+
+	var fn vm.Value
+	out := captureLetGoOut(t, func() {
+		fn = buildLispIR(t, `(defn takes-str [^String s] s)`)
+	})
+	if !strings.Contains(out, "ignoring unsupported param type hint ^String") {
+		t.Fatalf("expected a warning for the non-numeric ^String hint; stdout:\n%s", out)
+	}
+
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for a ^String-hinted param, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "arg0 vm.Value") {
+		t.Fatalf("expected non-numeric ^String hint to leave the param boxed (vm.Value), got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "arg0 float64") || strings.Contains(rendered, "arg0 int") {
+		t.Fatalf("non-numeric hint must not mis-route to a native numeric param, got:\n%s", rendered)
+	}
+}
+
+// #357: a ^long hint lowers to a native int param (the :int branch of the
+// hint→arg-type map, the peer of the ^double/:float case above).
+func TestLowerGoLongHintLowersToIntParam(t *testing.T) {
+	ensureLoader()
+
+	fn := buildLispIR(t, `(defn addl [^long a] (+ a 1))`)
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered status for a ^long-hinted param, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "arg0 int") {
+		t.Fatalf("expected ^long param to lower to a native int param, got:\n%s", rendered)
+	}
+}
+
+// #530 review follow-up: a non-Named tag shape (^{:tag [long]}) has no name, so
+// tag->arg-type's guard must let it warn-and-box rather than throw on (name t).
+func TestLowerGoNonNamedHintWarnsAndBoxes(t *testing.T) {
+	ensureLoader()
+
+	var fn vm.Value
+	out := captureLetGoOut(t, func() {
+		fn = buildLispIR(t, `(defn tv [^{:tag [long]} x] x)`)
+	})
+	if !strings.Contains(out, "ignoring unsupported param type hint") {
+		t.Fatalf("expected a warning for a non-Named tag shape; stdout:\n%s", out)
+	}
+
+	optimizeLispIR(t, fn)
+	result := lowerGo(t, fn, ":strict")
+	if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+		t.Fatalf("expected :lowered (not a throw) for a non-Named tag, got %v (reason=%v)",
+			got, result.ValueAt(vm.Keyword("reason")))
+	}
+	rendered := bindAndRenderGoDecl(t, result)
+	if !strings.Contains(rendered, "arg0 vm.Value") {
+		t.Fatalf("expected non-Named tag to leave the param boxed, got:\n%s", rendered)
 	}
 }
 
