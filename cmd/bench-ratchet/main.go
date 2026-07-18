@@ -79,8 +79,10 @@ const (
 	// gate. These metrics are deterministic (no CPU-dependent noise), so the
 	// budget is tight — it only absorbs rare boundary effects (e.g. a map
 	// resize landing one element differently).
-	allocBudget      = 0.02
-	defaultCount     = 1
+	allocBudget = 0.02
+	// 4 reps minimum: the first is discarded as warmup by reduceSamples,
+	// leaving >=3 for a meaningful median (a median of 2 doesn't exist).
+	defaultCount     = 4
 	defaultBenchtime = "1s"
 	defaultTimeout   = "10m"
 	defaultTags      = "gogen_ir"
@@ -678,7 +680,7 @@ var profiles = map[string]profile{
 		// Sized for fast PR feedback, not absolute precision: ~53 cases ×
 		// count 3 × 500ms keeps a two-pass A/B well under the old full-fleet
 		// runtime, and the 12% budget sits above the residual sub-µs jitter.
-		count:     3,
+		count:     4,
 		benchtime: "500ms",
 		budget:    0.12,
 		jobs: func(tags string) ([]captureJob, error) {
@@ -731,12 +733,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: tags, filter: filterRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -765,12 +767,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: "", filter: anchorRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -927,9 +929,35 @@ func captureOnePackage(pkg string, count int, benchtime, timeout, tags string, f
 	return written, nil
 }
 
+// reduceSamples collapses chronological per-rep measurements into one
+// robust value, hyperfine-style: with more than one rep, the FIRST is
+// discarded as warmup (cold caches, first-touch var resolution, and
+// CPU clock ramp make it the systematically slowest — the suite bench
+// visibly climbs across in-process reps), and the median of the rest
+// is taken. Median, not mean: a single contention spike or GC pause
+// skews an average straight into the stored baseline, which is how a
+// concurrently-running pass once manufactured six phantom regressions.
+// With one rep (legacy captures, -count 1) the value passes through.
+func reduceSamples(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	if len(vals) > 1 {
+		vals = vals[1:]
+	}
+	s := append([]float64(nil), vals...)
+	sort.Float64s(s)
+	if n := len(s); n%2 == 1 {
+		return s[n/2]
+	} else {
+		return (s[n/2-1] + s[n/2]) / 2
+	}
+}
+
 // aggregateFromFile reads a .jsonl of StreamRecord lines and returns
-// a Baseline computed from them. Same-named records (e.g. multiple
-// -count repetitions) are averaged.
+// a Baseline computed from them. Same-named records (multiple -count
+// repetitions, in capture order) reduce via reduceSamples: first rep
+// discarded as warmup, median of the remainder.
 func aggregateFromFile(path string) (MachineBaseline, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -938,12 +966,11 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 	defer f.Close()
 
 	type accum struct {
-		pkg                       string
-		name                      string
-		count                     int
-		nsSum, bytesSum, allocSum float64
-		iters                     int64
-		samples                   []BenchmarkSample
+		pkg               string
+		name              string
+		ns, bytes, allocs []float64
+		iters             int64
+		samples           []BenchmarkSample
 	}
 	byName := map[string]*accum{}
 	dec := json.NewDecoder(f)
@@ -958,10 +985,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			a = &accum{pkg: rec.Package, name: rec.Name}
 			byName[key] = a
 		}
-		a.count++
-		a.nsSum += rec.NSPerOp
-		a.bytesSum += float64(rec.BytesPerOp)
-		a.allocSum += float64(rec.AllocsPerOp)
+		a.ns = append(a.ns, rec.NSPerOp)
+		a.bytes = append(a.bytes, float64(rec.BytesPerOp))
+		a.allocs = append(a.allocs, float64(rec.AllocsPerOp))
 		if rec.Iterations > a.iters {
 			a.iters = rec.Iterations
 		}
@@ -974,9 +1000,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			Package:     a.pkg,
 			Name:        a.name,
 			Iterations:  a.iters,
-			NSPerOp:     a.nsSum / float64(a.count),
-			BytesPerOp:  int64(a.bytesSum / float64(a.count)),
-			AllocsPerOp: int64(a.allocSum / float64(a.count)),
+			NSPerOp:     reduceSamples(a.ns),
+			BytesPerOp:  int64(reduceSamples(a.bytes)),
+			AllocsPerOp: int64(reduceSamples(a.allocs)),
 			Samples:     append([]BenchmarkSample(nil), a.samples...),
 		})
 	}
@@ -1401,6 +1427,20 @@ func compareAndReport(baseline, current MachineBaseline, budget float64, format 
 		anchorDrift := (current.Anchor.NSPerOp - baseline.Anchor.NSPerOp) / baseline.Anchor.NSPerOp
 		fmt.Printf("anchor: baseline %.3f ns/op, current %.3f ns/op (%+.1f%%)\n",
 			baseline.Anchor.NSPerOp, current.Anchor.NSPerOp, anchorDrift*100)
+		// The anchor is the divisor for EVERY normalized ratio: on identical
+		// hardware+toolchain it should be stable to a few percent. A large
+		// drift means the anchor ran in a different CPU regime on one side
+		// (P-core vs E-core scheduling, thermal throttle, a concurrent
+		// load) — and every REGRESSION/ok verdict below is scaled by the
+		// same bogus factor. Observed in practice as a bimodal ~1.06 vs
+		// ~1.85 ns anchor on an M3 manufacturing phantom +38% regressions.
+		if anchorDrift < -0.15 || anchorDrift > 0.15 {
+			fmt.Printf("WARNING: anchor moved %+.1f%% on the same machine class — normalized\n", anchorDrift*100)
+			fmt.Printf("  ratios below are scaled by this factor and NOT trustworthy. Likely a\n")
+			fmt.Printf("  polluted capture (CPU scheduling/thermal/concurrent load) on one side;\n")
+			fmt.Printf("  re-run on a quiet machine, and if the drift persists recapture the\n")
+			fmt.Printf("  baseline (bench-ratchet update -force) from a clean checkout.\n")
+		}
 	}
 	fmt.Println()
 

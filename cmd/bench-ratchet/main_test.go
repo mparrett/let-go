@@ -16,11 +16,17 @@ func TestAggregateFromFileRetainsSamples(t *testing.T) {
 		t.Fatal(err)
 	}
 	enc := json.NewEncoder(f)
+	// Reduction semantics: first rep per benchmark is warmup (discarded),
+	// remainder medians. Anchor [10,20] -> 20; BenchmarkA ns [30,60,40,50]
+	// -> median(60,40,50) = 50; bytes [100,200,120,160] -> 160;
+	// allocs [1,3,5,7] -> 5. Raw samples all retained.
 	records := []StreamRecord{
 		{Package: anchorPackage, Name: anchorName, Iterations: 100, NSPerOp: 10, CapturedAt: "2026-06-01T00:00:00Z"},
 		{Package: anchorPackage, Name: anchorName, Iterations: 90, NSPerOp: 20, CapturedAt: "2026-06-01T00:00:01Z"},
 		{Package: "pkg", Name: "BenchmarkA", Iterations: 50, NSPerOp: 30, BytesPerOp: 100, AllocsPerOp: 1, CapturedAt: "2026-06-01T00:00:02Z"},
 		{Package: "pkg", Name: "BenchmarkA", Iterations: 60, NSPerOp: 60, BytesPerOp: 200, AllocsPerOp: 3, CapturedAt: "2026-06-01T00:00:03Z"},
+		{Package: "pkg", Name: "BenchmarkA", Iterations: 55, NSPerOp: 40, BytesPerOp: 120, AllocsPerOp: 5, CapturedAt: "2026-06-01T00:00:04Z"},
+		{Package: "pkg", Name: "BenchmarkA", Iterations: 58, NSPerOp: 50, BytesPerOp: 160, AllocsPerOp: 7, CapturedAt: "2026-06-01T00:00:05Z"},
 	}
 	for _, rec := range records {
 		if err := enc.Encode(rec); err != nil {
@@ -39,23 +45,44 @@ func TestAggregateFromFileRetainsSamples(t *testing.T) {
 		t.Fatalf("anchor samples = %d, want 2", len(baseline.Anchor.Samples))
 	}
 	entry := baseline.Benchmarks["pkg.BenchmarkA"]
-	if entry.NSPerOp != 45 {
-		t.Fatalf("ns/op = %v, want 45", entry.NSPerOp)
+	if entry.NSPerOp != 50 {
+		t.Fatalf("ns/op = %v, want 50 (median of post-warmup reps)", entry.NSPerOp)
 	}
-	if entry.BytesPerOp != 150 {
-		t.Fatalf("bytes/op = %d, want 150", entry.BytesPerOp)
+	if entry.BytesPerOp != 160 {
+		t.Fatalf("bytes/op = %d, want 160", entry.BytesPerOp)
 	}
-	if entry.AllocsPerOp != 2 {
-		t.Fatalf("allocs/op = %d, want 2", entry.AllocsPerOp)
+	if entry.AllocsPerOp != 5 {
+		t.Fatalf("allocs/op = %d, want 5", entry.AllocsPerOp)
 	}
-	if len(entry.Samples) != 2 {
-		t.Fatalf("samples = %d, want 2", len(entry.Samples))
+	if len(entry.Samples) != 4 {
+		t.Fatalf("samples = %d, want 4 (raw reps all retained)", len(entry.Samples))
 	}
-	if entry.Samples[0].RatioToAnchor != 2 {
-		t.Fatalf("first sample ratio = %v, want 2", entry.Samples[0].RatioToAnchor)
+	// Per-sample ratios are raw values against the REDUCED anchor (20).
+	if entry.Samples[0].RatioToAnchor != 1.5 {
+		t.Fatalf("first sample ratio = %v, want 1.5", entry.Samples[0].RatioToAnchor)
 	}
-	if entry.Samples[1].RatioToAnchor != 4 {
-		t.Fatalf("second sample ratio = %v, want 4", entry.Samples[1].RatioToAnchor)
+	if entry.Samples[1].RatioToAnchor != 3 {
+		t.Fatalf("second sample ratio = %v, want 3", entry.Samples[1].RatioToAnchor)
+	}
+}
+
+func TestReduceSamplesWarmupAndMedian(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []float64
+		want float64
+	}{
+		{"empty", nil, 0},
+		{"single passes through", []float64{7}, 7},
+		{"two drops warmup", []float64{100, 40}, 40},
+		{"odd median after warmup", []float64{100, 60, 40, 50}, 50},
+		{"even median after warmup", []float64{100, 10, 20, 30, 40}, 25},
+		{"warmup spike ignored", []float64{9999, 10, 11, 12}, 11},
+	}
+	for _, c := range cases {
+		if got := reduceSamples(c.in); got != c.want {
+			t.Errorf("%s: reduceSamples(%v) = %v, want %v", c.name, c.in, got, c.want)
+		}
 	}
 }
 
@@ -134,9 +161,12 @@ func TestEffectiveCountPrefersJobOverride(t *testing.T) {
 	}
 }
 
-// The full + fast profiles run the Clojure test suite once per execution mode
-// (count=1): a single suite pass takes minutes and run-to-run variance is
-// negligible, so 3 samples would just triple wall time. The cheap,
+// The full + fast profiles run the Clojure test suite 4x per execution mode:
+// the first rep is discarded as warmup by reduceSamples and the remaining 3
+// median (the minimum for a meaningful median). The old count=1 pin assumed
+// run-to-run variance was negligible; in practice single cold samples plus
+// anchor drift manufactured phantom +38% regressions (2026-07-18), and the
+// suite bench visibly climbs across in-process reps. The cheap,
 // benchtime-bounded vm/ir jobs keep the CLI default (count=0 → -count flag).
 //
 // There are exactly three suite modes, distinguished by the LG_SUITE_IR env
@@ -144,7 +174,7 @@ func TestEffectiveCountPrefersJobOverride(t *testing.T) {
 //   - bytecode    : *ir-compile* off, untagged
 //   - ir_bytecode : *ir-compile* on  (LG_SUITE_IR=1), untagged
 //   - aot_native  : *ir-compile* on  (LG_SUITE_IR=1), -tags gogen_ir
-func TestSuiteJobsPinCountToOne(t *testing.T) {
+func TestSuiteJobsPinCountToFour(t *testing.T) {
 	hasEnv := func(env []string, want string) bool {
 		for _, e := range env {
 			if e == want {
@@ -162,8 +192,8 @@ func TestSuiteJobsPinCountToOne(t *testing.T) {
 		total := map[string]captureJob{}
 		for _, j := range jobs {
 			if j.pkg == suitePackage {
-				if j.count != 1 {
-					t.Errorf("full=%v: suite job [%s] count = %d, want 1", full, j.variant, j.count)
+				if j.count != 4 {
+					t.Errorf("full=%v: suite job [%s] count = %d, want 4", full, j.variant, j.count)
 				}
 				switch j.filter.String() {
 				case suiteFilter:
