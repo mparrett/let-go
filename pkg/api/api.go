@@ -17,11 +17,12 @@ type Option func(*config)
 
 // config collects the resolved option values. Pure data, no behavior.
 type config struct {
-	stdout io.Writer
-	stderr io.Writer
-	emit   func(name, dataJSON string)
-	keys   rt.KeySource
-	store  rt.Storage
+	stdout  io.Writer
+	stderr  io.Writer
+	emit    func(name, dataJSON string)
+	keys    rt.KeySource
+	store   rt.Storage
+	surface rt.Surface
 }
 
 // WithStdout configures the runtime to route output written via *out*
@@ -89,6 +90,21 @@ func WithKeySource(ks rt.KeySource) Option {
 	return func(c *config) { c.keys = ks }
 }
 
+// WithSurface routes surface/present and surface/available? through s for this
+// instance, the graphics dual of WithEmit. An embedder or test supplies a frame
+// sink — capturing presented frames headlessly, or binding a native
+// terminal-image encoder (RGBA -> PNG -> iTerm2 IIP, etc.). s is an rt.Surface
+// (Present + Available); see pkg/rt/surface.go.
+//
+// Implementation: each Run pushes s as a dynamic binding on *surface*, popped
+// on return. Same process-global-binding-stack concurrency caveat as WithStdout.
+//
+// Default: no-op (the *surface* root nopSurface; surface/present is dropped,
+// surface/available? is false).
+func WithSurface(s rt.Surface) Option {
+	return func(c *config) { c.surface = s }
+}
+
 // WithStorage routes the storage namespace through store for this instance.
 // The store receives app-local logical keys; callers should not encode host
 // filesystem or browser-origin details into those keys.
@@ -121,11 +137,12 @@ type LetGo struct {
 	// stdoutHandle/stderrHandle are pre-constructed Boxed IOHandles, or
 	// nil when no option was supplied. Run pushes them as dynamic
 	// bindings on *out*/*err* and pops on return.
-	stdoutHandle vm.Value
-	stderrHandle vm.Value
-	emitHandle   vm.Value
-	keysHandle   vm.Value
-	storeHandle  vm.Value
+	stdoutHandle  vm.Value
+	stderrHandle  vm.Value
+	emitHandle    vm.Value
+	keysHandle    vm.Value
+	storeHandle   vm.Value
+	surfaceHandle vm.Value
 }
 
 // NewLetGo constructs a runtime. With no options, behavior is exactly
@@ -165,6 +182,9 @@ func NewLetGo(ns string, opts ...Option) (*LetGo, error) {
 	}
 	if cfg.store != nil {
 		ret.storeHandle = vm.NewBoxed(cfg.store)
+	}
+	if cfg.surface != nil {
+		ret.surfaceHandle = vm.NewBoxed(cfg.surface)
 	}
 
 	return ret, nil
@@ -221,6 +241,12 @@ func (l *LetGo) Run(expr string) (vm.Value, error) {
 	if l.storeHandle != nil {
 		if v := rt.LookupCoreVar("*storage*"); v != nil {
 			v.PushBinding(l.storeHandle)
+			defer v.PopBinding()
+		}
+	}
+	if l.surfaceHandle != nil {
+		if v := rt.LookupCoreVar("*surface*"); v != nil {
+			v.PushBinding(l.surfaceHandle)
 			defer v.PopBinding()
 		}
 	}

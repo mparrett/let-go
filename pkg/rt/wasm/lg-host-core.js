@@ -99,7 +99,10 @@ window.LetGoHost = (function() {
       if (outputBuffer.length) { for (const s of outputBuffer.splice(0)) cb(s); }
     },
     onEmit(cb) { emitSink = cb; },
-    onSurface(cb) { surfaceSink = cb; },
+    // Wiring a sink flips surface/available? true for the guest. _lgSurfaceNotify
+    // is defined per mode below (main thread sets the flag directly; worker mode
+    // relays it to the worker's globalThis, where the Go binding reads it).
+    onSurface(cb) { surfaceSink = cb; if (globalThis._lgSurfaceNotify) globalThis._lgSurfaceNotify(!!cb); },
     sendInput(s) { return window._lgKey ? window._lgKey(s) : false; },
     setSize(c, r) { return window._lgSetSize ? window._lgSetSize(c, r) : undefined; },
     // Internal — invoked by the runtime/relay code below.
@@ -268,6 +271,10 @@ async function startWorkerMode() {
       postMessage({t:'host-eval-ready'});
     };
     onmessage = async (e) => {
+      // Surface readiness relay: the main thread tells the worker when the shell
+      // wires (or drops) an onSurface sink, so HostSurface.Available() in the
+      // worker's Go reads the real main-thread state.
+      if (e.data.t === 'surface-ready') { globalThis._lgSurfaceReady = e.data.v; }
       if (e.data.t === 'request') {
         // Runs synchronously even while the program is parked on go.run: an
         // async onmessage doesn't block the worker, and the _lgRequest FuncOf
@@ -330,6 +337,10 @@ async function startWorkerMode() {
 
   const blob = new Blob([workerCode], { type: 'application/javascript' });
   const worker = new Worker(URL.createObjectURL(blob));
+
+  // Worker mode: relay onSurface sink attach/detach to the worker, where the Go
+  // HostSurface.Available() reads globalThis._lgSurfaceReady.
+  globalThis._lgSurfaceNotify = (ready) => worker.postMessage({ t: 'surface-ready', v: ready });
 
   worker.onmessage = (e) => {
     if (e.data.t === 'out') window.LetGoHost._output(e.data.d);
@@ -467,6 +478,9 @@ async function startMainThreadMode() {
   globalThis._lgSurface = function(arr, w, h) {
     window.LetGoHost._surface(arr.buffer, w, h);
   };
+  // Main-thread mode: Go and the sink share globalThis, so set the readiness
+  // flag directly when the shell wires (or drops) onSurface.
+  globalThis._lgSurfaceNotify = (ready) => { globalThis._lgSurfaceReady = ready; };
   // Host-request (main thread): the runtime sets window._lgRequest, then calls
   // this to announce readiness. Requests run in-page, so dispatch is a direct call.
   globalThis._lgRuntimeReady = function() {
