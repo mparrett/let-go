@@ -3,9 +3,14 @@ name: Perf Timeline
 on:
   push:
     branches: [main]
+    # Skip commits that cannot change measured performance: a docs-only
+    # commit has byte-identical code to its parent, so its snapshot would
+    # cost a full bench run (~65 min/leg) to record the parent's numbers
+    # under a new sha. The timeline tolerates the gap — the explorer plots
+    # by commit time, and backfill can densify any range on demand.
     paths-ignore:
-      - 'docs/perf/index.html'
-      - 'docs/perf/timeline/**'
+      - 'docs/**'
+      - '**.md'
   # Manual backfill: dispatch once per historical commit to fill the timeline
   # gap. Snapshot identity is derived from the checked-out HEAD (name, sha,
   # commit time), so the rest of the job is already commit-agnostic.
@@ -19,23 +24,19 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: perf-timeline-main
-  cancel-in-progress: false
-  # Retain every queued run (FIFO, up to 100) instead of the default
-  # queue: single, which keeps only the latest pending run. The backfill
-  # dispatches one run per historical commit; under queue: single all but
-  # the last would supersede each other and be canceled.
-  queue: max
+# Concurrency lives at the JOB level, one group per runner OS — see below.
+# A single workflow-level group serialized the two legs behind each other,
+# and macos-14 runner starvation then dammed the whole queue: one run's
+# macos leg sat queued for >24h (GitHub cancels it there), while every
+# newer run — including cheap, instantly-runnable ubuntu legs — waited
+# FIFO behind it. Per-OS groups let the amd64 timeline advance at ubuntu
+# speed no matter what the macos runner pool is doing.
 
 jobs:
   profile:
     if: github.actor != 'github-actions[bot]'
     strategy:
       fail-fast: false
-      # Serialize the legs: both push to the single perf-data branch, so
-      # running them in parallel would race on the branch ref.
-      max-parallel: 1
       matrix:
         # amd64 (GitHub Linux runner) + Apple-Silicon arm64 (macos-14). With
         # the machine-profile-partitioned ratchet these coexist cleanly; the
@@ -43,6 +44,18 @@ jobs:
         os: [ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    concurrency:
+      # Per-OS FIFO queue: legs of the same OS stay serialized (snapshot
+      # commits land in commit order), but the two OSes never wait on each
+      # other. The cross-leg perf-data push race this reintroduces is
+      # handled by the fetch/rebase/retry loop in the publish step.
+      group: perf-timeline-${{ matrix.os }}
+      cancel-in-progress: false
+      # Retain every queued job (FIFO, up to 100) instead of the default
+      # queue: single, which keeps only the latest pending one. The backfill
+      # dispatches one run per historical commit; under queue: single all but
+      # the last would supersede each other and be canceled.
+      queue: max
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,9 +126,13 @@ jobs:
           snapshot_tmp="${RUNNER_TEMP}/${snapshot_name}"
           raw_tmp="${RUNNER_TEMP}/${snapshot_name%.json}.jsonl"
 
+          # -count 4 matches bench-ratchet's warmup-discarding median sampling
+          # (#561): rep 1 is discarded, leaving a median of 3. A count of 3
+          # would reduce to an average of 2 there; under pre-#561 mean
+          # aggregation it's simply one more sample. Safe in either merge order.
           go run ./cmd/bench-ratchet \
             -full \
-            -count 3 \
+            -count 4 \
             -benchtime 2s \
             -timeout 30m \
             -out "${raw_tmp}" \
@@ -163,4 +180,19 @@ jobs:
           # workflow_dispatch github.sha is the branch tip, not the backfilled
           # commit). snapshot_name embeds the correct short sha + commit time.
           git -C "$wt" commit -m "perf: record timeline snapshot ${snapshot_name}"
-          git -C "$wt" push "$remote" HEAD:perf-data
+          # The two OS legs run in independent concurrency groups (see the
+          # profile job), so their pushes can race on the branch ref. Each
+          # leg adds a distinct file (the machine key is in the filename),
+          # so a rebase always replays cleanly — retry a few times and give
+          # the ref a moment to settle between attempts.
+          for attempt in 1 2 3 4 5; do
+            if git -C "$wt" push "$remote" HEAD:perf-data; then
+              exit 0
+            fi
+            echo "push rejected (attempt ${attempt}) — rebasing on remote perf-data"
+            sleep $((attempt * 5))
+            git -C "$wt" fetch "$remote" perf-data
+            git -C "$wt" rebase FETCH_HEAD
+          done
+          echo "failed to push snapshot after 5 attempts" >&2
+          exit 1
