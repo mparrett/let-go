@@ -1,14 +1,9 @@
+# PROBE BRANCH (fork-only): times one full leg at #561's new sampling
+# counts. dispatch-only, ubuntu-only, publish disabled, timeout raised so
+# the true duration is measured instead of hitting the 90-min kill.
 name: Perf Timeline
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/perf/index.html'
-      - 'docs/perf/timeline/**'
-  # Manual backfill: dispatch once per historical commit to fill the timeline
-  # gap. Snapshot identity is derived from the checked-out HEAD (name, sha,
-  # commit time), so the rest of the job is already commit-agnostic.
   workflow_dispatch:
     inputs:
       ref:
@@ -17,7 +12,7 @@ on:
         default: 'main'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: perf-timeline-main
@@ -37,12 +32,10 @@ jobs:
       # running them in parallel would race on the branch ref.
       max-parallel: 1
       matrix:
-        # amd64 (GitHub Linux runner) + Apple-Silicon arm64 (macos-14). With
-        # the machine-profile-partitioned ratchet these coexist cleanly; the
-        # explorer then shows both an amd64 and an Apple-M line per benchmark.
-        os: [ubuntu-latest, macos-14]
+        # Probe: ubuntu only — the macos-14 pool is the scarce one.
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,9 +108,9 @@ jobs:
 
           go run ./cmd/bench-ratchet \
             -full \
-            -count 3 \
+            -count 4 \
             -benchtime 2s \
-            -timeout 30m \
+            -timeout 60m \
             -out "${raw_tmp}" \
             -baseline "${snapshot_tmp}" \
             snapshot
@@ -133,6 +126,7 @@ jobs:
       # holding only docs/perf/timeline/*.json. The live "Are we fast yet?"
       # page (pages.yml) reads the timeline from this branch at deploy time.
       - name: Publish snapshot to perf-data branch
+        if: ${{ false }}  # probe: timing only, never publish
         run: |
           set -euo pipefail
           snapshot_tmp="${{ steps.perf.outputs.snapshot_tmp }}"
