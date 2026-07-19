@@ -95,6 +95,14 @@
          ;; IR mutator by volume) used to copy the whole 6-element inst tuple +
          ;; the :insts spine per call; the side table is mutated in place.
          :source-info (transient [])
+         ;; Inferred types live OFF the inst tuple too, same shape as
+         ;; :source-info. set-type! was the top typeinfer cost: the epoch
+         ;; flush wrote every inferred type via swap! + assoc-in (both
+         ;; interpreted) — ~94µs/write at 3.5k insts, more than the whole
+         ;; worklist drain. Tuple slot 5 keeps the construction-time
+         ;; :unknown and acts as the read fallback for nids the table
+         ;; doesn't cover.
+         :types     (transient [])
          :blocks    [{:id 0 :params [] :insts [] :preds [] :term nil}]
          :uses-cache nil
          :uses-dirty? true}))
@@ -134,14 +142,25 @@
 ;; Inst layout: positional vector [op refs aux block source-infos type].
 ;; Indices 0..5; access via `nth` rather than keyword-as-fn to skip
 ;; the Keyword.Invoke + hashUnencodedChars hot path.
+;; NB slot 5 holds only the construction-time :unknown — inferred types live
+;; in the :types side table (see new-fn / set-type!); slot 5 is type-of's
+;; fallback for nids the table doesn't cover. Slot 4 (source-infos) is
+;; likewise superseded by the :source-info side table.
 (defn op       [nid f] (nth (nth (:insts @f) nid) 0))
 (defn refs     [nid f] (nth (nth (:insts @f) nid) 1))
 (defn aux      [nid f] (nth (nth (:insts @f) nid) 2))
 (defn block-of [nid f] (nth (nth (:insts @f) nid) 3))
 
 (defn type-of [nid f]
-  (let [t (nth (nth (:insts @f) nid) 5)]
-    (if (nil? t) :unknown t)))
+  ;; Side table first (where set-type! writes), tuple slot 5 as fallback
+  ;; (construction-time default). A nil in either place reads as :unknown.
+  (let [s   @f
+        tys (:types s)
+        side (when (< nid (count tys)) (nth tys nid))]
+    (if (nil? side)
+      (let [t (nth (nth (:insts s) nid) 5)]
+        (if (nil? t) :unknown t))
+      side)))
 
 (defn source-infos [nid f]
   ;; Positional read from the side table (see new-fn). Bounds-checked: a nid
@@ -422,8 +441,29 @@
 (defn set-aux! [f nid aux-val]
   (swap! f assoc-in [:insts nid 2] aux-val))
 
+(defn- ensure-types! [f nid]
+  ;; Grow the types side table so index nid is addressable, then return the
+  ;; transient. Same shape as ensure-si!; typeinfer's flush walks nids in
+  ;; order, so this appends ~1 slot amortized.
+  ;; NB the discarded conj! return is deliberate: let-go's TransientVector
+  ;; mutates in place and returns the same pointer, unlike Clojure-proper
+  ;; transients where the return value must be threaded.
+  (let [tys (:types @f)]
+    (loop []
+      (when (<= (count tys) nid)
+        (conj! tys nil)
+        (recur)))
+    tys))
+
 (defn set-type! [f nid t]
-  (swap! f assoc-in [:insts nid 5] t))
+  ;; In-place positional update — no inst-tuple copy, no :insts spine copy,
+  ;; no swap! (mirrors add-source-info!; this was typeinfer's #1 cost: the
+  ;; flush paid ~94µs per interpreted swap!+assoc-in write).
+  ;; Contract: this bypasses the Function atom — no CAS, and atom watches
+  ;; will NOT fire. Safe because compilation is single-threaded per Function
+  ;; (the same assumption :source-info's add-source-info! already relies on);
+  ;; concurrent mutation of one Function was never supported.
+  (assoc! (ensure-types! f nid) nid t))
 
 (defn cond-target-set-true! [ct bt]
   (assoc ct :true-target bt))
@@ -516,6 +556,14 @@
     (let [src-sis (source-infos nid f)]
       (when (seq src-sis)
         (assoc! (ensure-si! f new-id) new-id src-sis)))
+    ;; Same for the inferred type: it lives in the :types side table now, and
+    ;; the copied tuple only carries the construction-time :unknown in slot 5.
+    ;; Without this carry a clone of a typed inst would silently read :unknown
+    ;; (conservative de-optimization, not a miscompile — but a perf trap).
+    (let [tys (:types @f)
+          src-t (when (< nid (count tys)) (nth tys nid))]
+      (when (some? src-t)
+        (assoc! (ensure-types! f new-id) new-id src-t)))
     (invalidate-uses-state! f)
     new-id))
 
