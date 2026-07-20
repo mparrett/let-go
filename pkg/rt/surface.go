@@ -28,6 +28,10 @@ import (
 	"github.com/nooga/let-go/pkg/vm"
 )
 
+// surfaceMaxDim caps frame width/height. 16384 matches common browser canvas
+// limits; anything larger is a geometry bug, not a real frame.
+const surfaceMaxDim = 16384
+
 // Surface is the host seam for (surface/present ...): a sink for RGBA frames the
 // guest blits to its host. The binary dual of the *emit* Emitter — like it,
 // fire-and-forget; unlike it, carries a buffer, not a JSON string.
@@ -69,8 +73,13 @@ func resolveSurfaceVar(ec *vm.ExecContext, varName string) Surface {
 }
 
 // PresentVia dispatches through the current *surface* binding. No-op when
-// unbound (early boot, or a host that never installed a surface).
+// unbound (early boot, or a host that never installed a surface). A panicking
+// sink drops the frame instead of unwinding into the guest: frames are
+// fire-and-forget, so silent drop is the correct failure mode — this is what
+// keeps a throwing JS callback (via HostSurface) or a faulty embedder Surface
+// from taking down the runtime.
 func PresentVia(ec *vm.ExecContext, rgba []byte, w, h int) {
+	defer func() { _ = recover() }()
 	if s := resolveSurfaceVar(ec, "*surface*"); s != nil {
 		s.Present(rgba, w, h)
 	}
@@ -97,17 +106,30 @@ func installSurfaceNS() {
 		if len(vs) != 3 {
 			return vm.NIL, fmt.Errorf("surface/present expects 3 args (rgba width height), got %d", len(vs))
 		}
-		data, ok := asBytes(vs[0])
-		if !ok {
+		// Strictly a byte-array: a String would coerce through asBytes but
+		// contradicts the documented contract (and ImageData semantics), so it
+		// is rejected rather than reinterpreted.
+		ta, ok := vs[0].(*vm.TypedArray)
+		if !ok || ta.Kind() != vm.ArrayByte {
 			return vm.NIL, fmt.Errorf("surface/present expects a byte-array for rgba")
 		}
+		data := ta.Unbox().([]byte)
 		w, ok1 := vs[1].(vm.Int)
 		h, ok2 := vs[2].(vm.Int)
 		if !ok1 || !ok2 {
 			return vm.NIL, fmt.Errorf("surface/present width and height must be Int")
 		}
-		if len(data) < int(w)*int(h)*4 {
-			return vm.NIL, fmt.Errorf("surface/present rgba too small: have %d, need %d", len(data), int(w)*int(h)*4)
+		// Bounding the dimensions before the multiply keeps w*h*4 far from
+		// overflow (surfaceMaxDim²·4 = 2³⁰) and rejects zero/negative sizes.
+		if w <= 0 || h <= 0 || w > surfaceMaxDim || h > surfaceMaxDim {
+			return vm.NIL, fmt.Errorf("surface/present dimensions out of range: %dx%d (must be 1..%d)", int64(w), int64(h), surfaceMaxDim)
+		}
+		// Exact, not minimum: an RGBA frame with explicit width and height is
+		// w*h*4 bytes (ImageData semantics); a mismatch means the caller's
+		// geometry is wrong, and blitting it would render garbage or throw
+		// host-side.
+		if need := int(w) * int(h) * 4; len(data) != need {
+			return vm.NIL, fmt.Errorf("surface/present rgba length %d does not match %dx%d (need exactly %d)", len(data), int(w), int(h), need)
 		}
 		PresentVia(ec, data, int(w), int(h))
 		return vm.NIL, nil

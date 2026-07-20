@@ -263,7 +263,8 @@ async function startWorkerMode() {
     // RGBA; transfer its ArrayBuffer to the main thread (the [arr.buffer] transfer
     // list) so the pixels move without a second copy. The main thread blits it.
     globalThis._lgSurface = function(arr, w, h) {
-      postMessage({t:'surface', w, h, d: arr.buffer}, [arr.buffer]);
+      try { postMessage({t:'surface', w, h, d: arr.buffer}, [arr.buffer]); }
+      catch (err) { console.error('lg surface:', err); }
     };
     // Host-eval (worker): the runtime sets globalThis._lgEval, then calls this to
     // announce readiness; relay to the main thread so it can resolve the gate.
@@ -351,8 +352,12 @@ async function startWorkerMode() {
     }
     // Surface relay: the worker transferred the RGBA ArrayBuffer; hand it to the
     // shell's onSurface sink (which putImageDatas it to a canvas).
+    // Guarded like the emit relay: this runs on a separate main-thread event,
+    // so an exception here (a throwing shell sink, a bad ImageData) can never
+    // be caught by Go-side recovery in the worker — the frame drops instead.
     if (e.data.t === 'surface') {
-      window.LetGoHost._surface(e.data.d, e.data.w, e.data.h);
+      try { window.LetGoHost._surface(e.data.d, e.data.w, e.data.h); }
+      catch (err) { console.error('lg surface relay:', err); }
     }
     // Host-request relay: the worker runs the request and posts the JSON string
     // back, matched to its request id. requestImpl is installed here (not at
@@ -476,7 +481,8 @@ async function startMainThreadMode() {
   // Main-thread side of the surface bridge — no worker hop, so pass the
   // Uint8Array's buffer straight to the shell's onSurface sink.
   globalThis._lgSurface = function(arr, w, h) {
-    window.LetGoHost._surface(arr.buffer, w, h);
+    try { window.LetGoHost._surface(arr.buffer, w, h); }
+    catch (err) { console.error('lg surface:', err); }
   };
   // Main-thread mode: Go and the sink share globalThis, so set the readiness
   // flag directly when the shell wires (or drops) onSurface.
