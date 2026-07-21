@@ -1,0 +1,64 @@
+name: Recapture v1.8.0 per-tier reference
+
+# THROWAWAY workflow (let-go#597). v1.8.0 predates the bench-ratchet system and
+# the suite benchmark (#119), so its perf can't be captured natively. This
+# branch grafts the current anchor + suite harness (+ a 4-line RemoveNS) onto
+# the v1.8.0 tag and captures the anchor + end-to-end suite (bytecode lane) on
+# whatever GitHub-hosted runner the job draws. Dispatch it several times so the
+# runner rotation spreads captures across the CI CPU tiers (EPYC 7763/9V74,
+# Xeons); download the artifacts and merge them with:
+#   bench-ratchet -baseline docs/perf/historical/v1.8.0.json merge-historical <artifacts...>
+# Delete this branch afterward — the graft must never land on a durable branch.
+
+# Triggered by push (each commit = one capture run) so it works from this
+# non-default branch without registering on the fork's default branch. Empty
+# commits fan out captures across the runner rotation. workflow_dispatch kept
+# for manual re-runs once/if the file ever lands on a default branch.
+on:
+  push:
+    branches: [throwaway/v18-pertier-recap]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # pulls test/clojure-test-suite corpus
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Capture anchor + suite (bytecode lane), matching timeline sampling
+        run: |
+          set -euo pipefail
+          machine_key="$(go run ./cmd/bench-ratchet machine-key)"
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          out="v1.8.0-${machine_key}-${stamp}.json"
+          echo "runner tier: ${machine_key}"
+          # -count 3 -benchtime 2s mirrors perf-timeline.yml so the reference is
+          # sampled like the timeline it will anchor. No -tags gogen_ir / -full:
+          # pkg/ir and the aot_native lane never existed at v1.8.0.
+          go run ./cmd/bench-ratchet \
+            -packages "github.com/nooga/let-go/pkg/vm github.com/nooga/let-go/test" \
+            -filter 'RatchetAnchor|ClojureTestSuite$' \
+            -tags '' \
+            -count 3 \
+            -benchtime 2s \
+            -timeout 30m \
+            -sha "$(git rev-parse --short HEAD)" \
+            -baseline "${out}" \
+            snapshot
+          echo "wrote ${out}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v18-ref-${{ github.run_id }}-${{ github.run_attempt }}
+          path: v1.8.0-*.json
+          if-no-files-found: error

@@ -332,6 +332,25 @@ func getCounters(v vm.Value) (pass, fail int) {
 	return getInt("pass"), getInt("fail")
 }
 
+// getCountersFull extracts all four run-tests tallies. The benchmark needs
+// :error and :test too — under the IR variants, assertions that throw land in
+// :error (caught by run-tests' runner), so pass+fail alone undercounts what
+// actually ran.
+func getCountersFull(v vm.Value) (pass, fail, errs, tests int) {
+	m, ok := v.(*vm.PersistentMap)
+	if !ok {
+		return 0, 0, 0, 0
+	}
+	getInt := func(k string) int {
+		val := m.ValueAtOr(vm.Keyword(k), vm.MakeInt(0))
+		if n, ok := val.(vm.Int); ok {
+			return int(n)
+		}
+		return 0
+	}
+	return getInt("pass"), getInt("fail"), getInt("error"), getInt("test")
+}
+
 func formatCounters(v vm.Value) string {
 	m, ok := v.(*vm.PersistentMap)
 	if !ok {
