@@ -153,6 +153,21 @@ func TestBuildAnchorPayloadsSkewAndMachine(t *testing.T) {
 	}
 }
 
+func TestBuildChartSetsOnePerAnchorNewestFirst(t *testing.T) {
+	dir := t.TempDir()
+	writeMachineBaseline(t, filepath.Join(dir, "v1.9.0.json"), "arm64", "Apple M2", map[string]float64{"pkg.BenchmarkA": 100})
+	writeMachineBaseline(t, filepath.Join(dir, "v1.10.0.json"), "arm64", "Apple M2", map[string]float64{"pkg.BenchmarkA": 90})
+
+	sets := buildChartSets(nil, dir, defaultBudgetFraction)
+	if len(sets) != 2 {
+		t.Fatalf("chart sets = %d, want 2", len(sets))
+	}
+	// Newest first, and numeric — not the string order that puts v1.9.0 last.
+	if sets[0].Anchor != "v1.10.0" || sets[1].Anchor != "v1.9.0" {
+		t.Fatalf("order = %q,%q; want v1.10.0,v1.9.0", sets[0].Anchor, sets[1].Anchor)
+	}
+}
+
 func TestBuildCharts(t *testing.T) {
 	timeline := []Snapshot{
 		makeSnapshot("a", Baseline{

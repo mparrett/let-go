@@ -161,11 +161,14 @@ type PageData struct {
 	TopSlowdowns      []ChangeRow
 	RecentlyTightened []BenchmarkRow
 
-	// Anchors is every historical baseline the "Largest changes" section can be
-	// compared against; AnchorsJSON is the same data embedded for the
-	// client-side switcher. ReferenceName is the initially selected one.
+	// Anchors is every historical baseline the page can be compared against;
+	// AnchorsJSON is the same data embedded for the client-side switcher.
+	// ChartSets holds the timeline charts precomputed against each anchor (the
+	// relative charts are anchor-dependent geometry). ReferenceName is the
+	// initially selected one.
 	Anchors     []AnchorPayload
 	AnchorsJSON template.JS
+	ChartSets   []ChartSet
 
 	// ExplorerURL is where the page fetches the tidy explorer data
 	// ({date, cpu, bench, metric, value} rows) at load time — written as a
@@ -346,6 +349,7 @@ func main() {
 	page := buildPage(current, reference, referenceName, timeline, logo)
 	page.ExplorerURL = *explorerURL
 	page.Anchors = buildAnchorPayloads(current, *historicalPath)
+	page.ChartSets = buildChartSets(timeline, *historicalPath, defaultBudgetFraction)
 	if js, err := json.Marshal(page.Anchors); err == nil {
 		page.AnchorsJSON = template.JS(js)
 	}
@@ -672,22 +676,44 @@ func toAnchorChanges(rows []ChangeRow) []AnchorChange {
 	return out
 }
 
-// buildAnchorPayloads enumerates every historical/*.json and computes its
-// comparison against current, including the benchmark-set skew (how many
-// benchmarks were added since / are absent now) and whether the anchor was
-// captured on the same CPU. Unreadable anchors are skipped, not fatal — a
-// malformed snapshot shouldn't blank the whole page.
-func buildAnchorPayloads(current Baseline, dir string) []AnchorPayload {
+// namedBaseline pairs a historical baseline with its file stem.
+type namedBaseline struct {
+	Name     string
+	Baseline Baseline
+}
+
+// orderedHistorical loads every historical/*.json (skipping unreadable ones —
+// a malformed snapshot shouldn't blank the page) and returns them newest-version
+// first. Version stems (vMAJOR.MINOR.PATCH) don't sort correctly as plain
+// strings once MINOR reaches two digits ("v1.9.0" > "v1.10.0"), so
+// versionLess compares component-wise.
+func orderedHistorical(dir string) []namedBaseline {
 	paths, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil {
 		return nil
 	}
-	var out []AnchorPayload
+	var out []namedBaseline
 	for _, path := range paths {
 		ref, err := loadBaseline(path)
 		if err != nil {
 			continue
 		}
+		out = append(out, namedBaseline{
+			Name:     strings.TrimSuffix(filepath.Base(path), ".json"),
+			Baseline: ref,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return versionLess(out[j].Name, out[i].Name) })
+	return out
+}
+
+// buildAnchorPayloads computes each historical baseline's comparison against
+// current, including the benchmark-set skew (how many benchmarks were added
+// since / are absent now) and whether the anchor was captured on the same CPU.
+func buildAnchorPayloads(current Baseline, dir string) []AnchorPayload {
+	var out []AnchorPayload
+	for _, nb := range orderedHistorical(dir) {
+		ref := nb.Baseline
 		imp, slow := topChanges(current, ref, 8)
 		added, missing := 0, 0
 		for k := range current.Benchmarks {
@@ -701,7 +727,7 @@ func buildAnchorPayloads(current Baseline, dir string) []AnchorPayload {
 			}
 		}
 		out = append(out, AnchorPayload{
-			Name:         strings.TrimSuffix(filepath.Base(path), ".json"),
+			Name:         nb.Name,
 			CPUModel:     ref.Machine.CPUModel,
 			SameMachine:  ref.Machine.CPUModel == current.Machine.CPUModel,
 			Added:        added,
@@ -710,10 +736,27 @@ func buildAnchorPayloads(current Baseline, dir string) []AnchorPayload {
 			Slowdowns:    toAnchorChanges(slow),
 		})
 	}
-	// Newest first. Version stems (vMAJOR.MINOR.PATCH) don't sort correctly as
-	// plain strings once MINOR reaches two digits ("v1.9.0" > "v1.10.0"), so
-	// compare component-wise.
-	sort.Slice(out, func(i, j int) bool { return versionLess(out[j].Name, out[i].Name) })
+	return out
+}
+
+// ChartSet is the timeline charts computed against one historical anchor. The
+// relative charts plot every point as a fraction of the anchor value, so the
+// series geometry itself is anchor-dependent — the page renders a set per
+// anchor and shows only the selected one, reflowing the charts on switch
+// without regenerating.
+type ChartSet struct {
+	Anchor string
+	Charts []Chart
+}
+
+func buildChartSets(timeline []Snapshot, dir string, budget float64) []ChartSet {
+	var out []ChartSet
+	for _, nb := range orderedHistorical(dir) {
+		out = append(out, ChartSet{
+			Anchor: nb.Name,
+			Charts: buildCharts(timeline, nb.Baseline, nb.Name, budget),
+		})
+	}
 	return out
 }
 
@@ -1836,6 +1879,9 @@ const pageTemplate = `<!doctype html>
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
     }
+    /* [hidden] loses to .chart-grid's display:grid on specificity; restore it
+       so an unselected anchor's chart set is actually hidden. */
+    .chart-set[hidden] { display: none; }
     .chart {
       background: var(--paper);
       border: 1px solid var(--line);
@@ -2165,7 +2211,7 @@ const pageTemplate = `<!doctype html>
         <p class="note">benchmarks currently at 0 allocs/op</p>
       </article>
       <article class="card">
-        <p class="label">Since {{.ReferenceName}}</p>
+        <p class="label">Since <span id="since-anchor">{{.ReferenceName}}</span></p>
         <p class="value">{{pct .Summary.MedianDelta}}</p>
         <p class="note">median anchor-relative delta across {{.Summary.Common}} shared benches</p>
       </article>
@@ -2179,10 +2225,16 @@ const pageTemplate = `<!doctype html>
     <section>
       <div class="section-head">
         <h2>Timeline</h2>
-        <p>{{len .Timeline}} snapshot(s). CI snapshots graph real runs; seed points use committed historical/current JSON until the timeline fills in.</p>
+        <p>{{len .Timeline}} snapshot(s). CI snapshots graph real runs; seed points use committed historical/current JSON until the timeline fills in.{{if gt (len .Anchors) 1}}
+          <label class="anchor-pick">baseline
+            <select id="anchor-select" data-current-cpu="{{.Current.Machine.CPUModel}}">
+              {{range .Anchors}}<option value="{{.Name}}"{{if eq .Name $.ReferenceName}} selected{{end}}>{{.Name}}{{if not .SameMachine}} ({{.CPUModel}}){{end}}</option>{{end}}
+            </select>
+          </label>{{end}}</p>
       </div>
-      {{if .Charts}}
-      <div class="chart-grid">
+      {{if .ChartSets}}
+      {{range .ChartSets}}
+      <div class="chart-grid chart-set" data-anchor="{{.Anchor}}"{{if ne .Anchor $.ReferenceName}} hidden{{end}}>
         {{range .Charts}}
         <article class="chart">
           <div class="chart-head">
@@ -2226,6 +2278,7 @@ const pageTemplate = `<!doctype html>
         </article>
         {{end}}
       </div>
+      {{end}}
       {{else}}
       <div class="empty">No timeline-capable benchmarks found yet.</div>
       {{end}}
@@ -2250,13 +2303,7 @@ const pageTemplate = `<!doctype html>
     <section>
       <div class="section-head">
         <h2>Largest changes</h2>
-        <p>Current ratchet compared with <span id="anchor-label">{{.ReferenceName}}</span>.{{if gt (len .Anchors) 1}}
-          <label class="anchor-pick">baseline
-            <select id="anchor-select" data-current-cpu="{{.Current.Machine.CPUModel}}">
-              {{range .Anchors}}<option value="{{.Name}}"{{if eq .Name $.ReferenceName}} selected{{end}}>{{.Name}}{{if not .SameMachine}} ({{.CPUModel}}){{end}}</option>{{end}}
-            </select>
-          </label>{{end}}
-        </p>
+        <p>Current ratchet compared with <span id="anchor-label">{{.ReferenceName}}</span>. Pick a baseline from the Timeline section above.</p>
         <p id="anchor-skew" class="anchor-skew"></p>
       </div>
       <div class="grid-2">
@@ -2298,7 +2345,9 @@ const pageTemplate = `<!doctype html>
         var improve = document.getElementById('improve-body');
         var slower = document.getElementById('slower-body');
         var label = document.getElementById('anchor-label');
+        var since = document.getElementById('since-anchor');
         var skew = document.getElementById('anchor-skew');
+        var chartSets = document.querySelectorAll('.chart-set');
         var curCPU = sel.getAttribute('data-current-cpu') || 'this machine';
         function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
         function fill(tbody, list, cls, empty) {
@@ -2314,6 +2363,8 @@ const pageTemplate = `<!doctype html>
           var a = data[name];
           if (!a) return;
           if (label) label.textContent = a.name;
+          if (since) since.textContent = a.name;
+          chartSets.forEach(function (el) { el.hidden = el.getAttribute('data-anchor') !== name; });
           fill(improve, a.improvements, 'good', 'No historical improvements found.');
           fill(slower, a.slowdowns, 'bad', 'No historical slowdowns found.');
           var notes = [];
