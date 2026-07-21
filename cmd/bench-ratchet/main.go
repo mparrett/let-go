@@ -79,8 +79,10 @@ const (
 	// gate. These metrics are deterministic (no CPU-dependent noise), so the
 	// budget is tight — it only absorbs rare boundary effects (e.g. a map
 	// resize landing one element differently).
-	allocBudget      = 0.02
-	defaultCount     = 1
+	allocBudget = 0.02
+	// 4 reps minimum: the first is discarded as warmup by reduceSamples,
+	// leaving >=3 for a meaningful median (a median of 2 doesn't exist).
+	defaultCount     = 4
 	defaultBenchtime = "1s"
 	defaultTimeout   = "10m"
 	defaultTags      = "gogen_ir"
@@ -202,9 +204,9 @@ func main() {
 		mode = flag.Arg(0)
 	}
 	switch mode {
-	case "check", "update", "show", "capture", "aggregate", "snapshot", "machine-key", "merge-historical":
+	case "check", "update", "show", "capture", "aggregate", "snapshot", "machine-key":
 	default:
-		die("unknown mode %q (want check / update / show / capture / aggregate / snapshot / machine-key / merge-historical)", mode)
+		die("unknown mode %q (want check / update / show / capture / aggregate / snapshot / machine-key)", mode)
 	}
 
 	// machine-key: print the canonical machine token ("<arch>-<cpumodel>",
@@ -216,18 +218,6 @@ func main() {
 	// exact "<arch>/<CPUModel>" partition the timeline groups snapshots by.
 	if mode == "machine-key" {
 		fmt.Println(machineKey())
-		return
-	}
-
-	// merge-historical: union one or more single-tier snapshot files (as emitted
-	// by `snapshot`, or the timeline snapshots on the perf-data branch) into a
-	// machine-partitioned v2 reference at -baseline. Runs NO benchmarks — it's
-	// the aggregation half of building a per-tier release reference. Repeated
-	// invocations accumulate tiers into the same file: a CI job that captures a
-	// fixed tag on whatever runner it drew merges its one tier in, and over a
-	// few dispatches the reference fills across the CI CPU fleet. See let-go#597.
-	if mode == "merge-historical" {
-		mergeHistorical(*baselinePath, flag.Args()[1:])
 		return
 	}
 
@@ -301,6 +291,16 @@ func main() {
 		}
 	}
 
+	// The reduction needs at least 3 reps for a true median (count >= 4 gets
+	// warmup-discard + median, count 3 a plain median-of-3). Below that it
+	// degenerates to a single sample; runs that accept the tradeoff for
+	// wall-clock reasons still work, but the degradation must never be silent.
+	if effCount < 3 && mode != "show" {
+		fmt.Fprintf(os.Stderr, "bench-ratchet: WARNING: -count %d cannot form a median; "+
+			"use -count >= 3 (>= 4 adds a discarded warmup rep). Results are more outlier-sensitive.\n",
+			effCount)
+	}
+
 	if *outPath == "" {
 		*outPath = defaultRunPath()
 	}
@@ -363,58 +363,6 @@ func writeSnapshot(path string, current MachineBaseline) {
 		die("write snapshot: %v", err)
 	}
 	fmt.Printf("\nwrote snapshot → %s (%d benchmarks for %s)\n", path, len(current.Benchmarks), key)
-}
-
-// mergeHistorical unions the per-tier snapshot inputs (and any existing
-// content at outPath) into one machine-partitioned v2 reference. Within a tier,
-// the newer capture wins (CapturedAt is RFC3339, so a lexicographic compare is
-// chronological). It never runs benchmarks — the inputs are already-captured
-// snapshots. This is the aggregation step behind a per-tier release reference:
-// each CI runner contributes its own tier, so the timeline can later compare
-// tip-on-X against reference-on-X instead of against one foreign machine.
-func mergeHistorical(outPath string, inputs []string) {
-	if outPath == "" || outPath == defaultBaselinePath {
-		die("merge-historical writes the reference at -baseline; pass an explicit\n" +
-			"  path such as -baseline docs/perf/historical/v1.8.0.json")
-	}
-	if len(inputs) == 0 {
-		die("merge-historical needs at least one snapshot JSON to merge\n" +
-			"  usage: bench-ratchet -baseline <ref.json> merge-historical <snap1.json> [snap2.json ...]")
-	}
-
-	merged := Baseline{Version: schemaVersion, Machines: map[string]MachineBaseline{}}
-	// Seed from the existing reference so repeated dispatches accumulate tiers.
-	if existing, err := readBaseline(outPath); err == nil {
-		for k, v := range existing.Machines {
-			merged.Machines[k] = v
-		}
-		fmt.Printf("merge-historical: %d existing tier(s) in %s\n", len(existing.Machines), outPath)
-	} else if !os.IsNotExist(err) {
-		die("read existing reference %s: %v", outPath, err)
-	}
-
-	for _, in := range inputs {
-		b, err := readBaseline(in)
-		if err != nil {
-			die("read snapshot %s: %v", in, err)
-		}
-		for k, v := range b.Machines {
-			if prev, ok := merged.Machines[k]; ok && v.CapturedAt < prev.CapturedAt {
-				fmt.Printf("  %s: keeping newer existing capture (%s > %s)\n", k, prev.CapturedAt, v.CapturedAt)
-				continue
-			}
-			merged.Machines[k] = v
-			fmt.Printf("  %s: %d benchmarks @ %s (%s)\n", k, len(v.Benchmarks), v.CapturedAtSHA, v.CapturedAt)
-		}
-	}
-
-	if len(merged.Machines) == 0 {
-		die("merge-historical: no tiers to write")
-	}
-	if err := writeBaseline(outPath, merged); err != nil {
-		die("write reference: %v", err)
-	}
-	fmt.Printf("merged %d tier(s) → %s\n", len(merged.Machines), outPath)
 }
 
 // writeOrCheck dispatches the post-aggregate action.
@@ -742,7 +690,7 @@ var profiles = map[string]profile{
 		// Sized for fast PR feedback, not absolute precision: ~53 cases ×
 		// count 3 × 500ms keeps a two-pass A/B well under the old full-fleet
 		// runtime, and the 12% budget sits above the residual sub-µs jitter.
-		count:     3,
+		count:     4,
 		benchtime: "500ms",
 		budget:    0.12,
 		jobs: func(tags string) ([]captureJob, error) {
@@ -795,12 +743,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: tags, filter: filterRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -829,12 +777,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: "", filter: anchorRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -991,9 +939,44 @@ func captureOnePackage(pkg string, count int, benchtime, timeout, tags string, f
 	return written, nil
 }
 
+// reduceSamples collapses chronological per-rep measurements into one
+// robust value, hyperfine-style: with more than one rep, the FIRST is
+// discarded as warmup (cold caches, first-touch var resolution, and
+// CPU clock ramp make it the systematically slowest — the suite bench
+// visibly climbs across in-process reps), and the median of the rest
+// is taken. Median, not mean: a single contention spike or GC pause
+// skews an average straight into the stored baseline, which is how a
+// concurrently-running pass once manufactured six phantom regressions.
+//
+// Exactly three reps take the plain median of all three: the median
+// already rejects the systematically-slow cold rep, whereas discarding
+// it first would leave two samples and force a mean — the estimator
+// this function exists to avoid. This keeps -count 3 callers (the
+// perf-timeline ubuntu leg, whose measured budget can't fit count 4,
+// see #573) on a true median. With one rep (legacy captures, -count 1)
+// the value passes through.
+func reduceSamples(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	// n==2 still discards the cold rep (a single warm sample beats a mean
+	// that averages the cold rep in).
+	if len(vals) > 3 || len(vals) == 2 {
+		vals = vals[1:]
+	}
+	s := append([]float64(nil), vals...)
+	sort.Float64s(s)
+	if n := len(s); n%2 == 1 {
+		return s[n/2]
+	} else {
+		return (s[n/2-1] + s[n/2]) / 2
+	}
+}
+
 // aggregateFromFile reads a .jsonl of StreamRecord lines and returns
-// a Baseline computed from them. Same-named records (e.g. multiple
-// -count repetitions) are averaged.
+// a Baseline computed from them. Same-named records (multiple -count
+// repetitions, in capture order) reduce via reduceSamples: median, with
+// the first rep discarded as warmup when enough reps allow it.
 func aggregateFromFile(path string) (MachineBaseline, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1002,12 +985,11 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 	defer f.Close()
 
 	type accum struct {
-		pkg                       string
-		name                      string
-		count                     int
-		nsSum, bytesSum, allocSum float64
-		iters                     int64
-		samples                   []BenchmarkSample
+		pkg               string
+		name              string
+		ns, bytes, allocs []float64
+		iters             int64
+		samples           []BenchmarkSample
 	}
 	byName := map[string]*accum{}
 	dec := json.NewDecoder(f)
@@ -1022,10 +1004,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			a = &accum{pkg: rec.Package, name: rec.Name}
 			byName[key] = a
 		}
-		a.count++
-		a.nsSum += rec.NSPerOp
-		a.bytesSum += float64(rec.BytesPerOp)
-		a.allocSum += float64(rec.AllocsPerOp)
+		a.ns = append(a.ns, rec.NSPerOp)
+		a.bytes = append(a.bytes, float64(rec.BytesPerOp))
+		a.allocs = append(a.allocs, float64(rec.AllocsPerOp))
 		if rec.Iterations > a.iters {
 			a.iters = rec.Iterations
 		}
@@ -1038,9 +1019,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			Package:     a.pkg,
 			Name:        a.name,
 			Iterations:  a.iters,
-			NSPerOp:     a.nsSum / float64(a.count),
-			BytesPerOp:  int64(a.bytesSum / float64(a.count)),
-			AllocsPerOp: int64(a.allocSum / float64(a.count)),
+			NSPerOp:     reduceSamples(a.ns),
+			BytesPerOp:  int64(reduceSamples(a.bytes)),
+			AllocsPerOp: int64(reduceSamples(a.allocs)),
 			Samples:     append([]BenchmarkSample(nil), a.samples...),
 		})
 	}
@@ -1465,6 +1446,20 @@ func compareAndReport(baseline, current MachineBaseline, budget float64, format 
 		anchorDrift := (current.Anchor.NSPerOp - baseline.Anchor.NSPerOp) / baseline.Anchor.NSPerOp
 		fmt.Printf("anchor: baseline %.3f ns/op, current %.3f ns/op (%+.1f%%)\n",
 			baseline.Anchor.NSPerOp, current.Anchor.NSPerOp, anchorDrift*100)
+		// The anchor is the divisor for EVERY normalized ratio: on identical
+		// hardware+toolchain it should be stable to a few percent. A large
+		// drift means the anchor ran in a different CPU regime on one side
+		// (P-core vs E-core scheduling, thermal throttle, a concurrent
+		// load) — and every REGRESSION/ok verdict below is scaled by the
+		// same bogus factor. Observed in practice as a bimodal ~1.06 vs
+		// ~1.85 ns anchor on an M3 manufacturing phantom +38% regressions.
+		if anchorDrift < -0.15 || anchorDrift > 0.15 {
+			fmt.Printf("WARNING: anchor moved %+.1f%% on the same machine class — normalized\n", anchorDrift*100)
+			fmt.Printf("  ratios below are scaled by this factor and NOT trustworthy. Likely a\n")
+			fmt.Printf("  polluted capture (CPU scheduling/thermal/concurrent load) on one side;\n")
+			fmt.Printf("  re-run on a quiet machine, and if the drift persists recapture the\n")
+			fmt.Printf("  baseline (bench-ratchet update -force) from a clean checkout.\n")
+		}
 	}
 	fmt.Println()
 
