@@ -1,12 +1,37 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nooga/let-go/pkg/perfdata"
 )
+
+func writeMachineBaseline(t *testing.T, path, arch, cpu string, ratios map[string]float64) {
+	t.Helper()
+	m := Machine{Arch: arch, CPUModel: cpu}
+	benches := map[string]BenchmarkEntry{}
+	for k, r := range ratios {
+		benches[k] = BenchmarkEntry{RatioToAnchor: r}
+	}
+	multi := MultiBaseline{
+		Version: 2,
+		Machines: map[string]Baseline{
+			perfdata.MachineKey(m): {Machine: m, Benchmarks: benches},
+		},
+	}
+	b, err := json.Marshal(multi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSplitBenchmarkName(t *testing.T) {
 	pkg, name := splitBenchmarkName("github.com/nooga/let-go/pkg/vm.BenchmarkFuncInvoke/Direct")
@@ -62,6 +87,69 @@ func TestCompareWithHistorical(t *testing.T) {
 	}
 	if got := changes["pkg.BenchmarkB"]; !near(got, 0.2) {
 		t.Fatalf("BenchmarkB delta = %v, want 0.2", got)
+	}
+}
+
+func TestVersionLessOrdersNumerically(t *testing.T) {
+	// The trap: plain string order puts "v1.9.0" after "v1.10.0" once MINOR
+	// reaches two digits. versionLess must compare component-wise.
+	if !versionLess("v1.9.0", "v1.10.0") {
+		t.Fatal("v1.9.0 should sort before v1.10.0")
+	}
+	if versionLess("v1.11.0", "v1.11.0") {
+		t.Fatal("equal versions are not less")
+	}
+	// versionLess is the ASCENDING comparator; the display sorts descending, so
+	// versioned stems land first there. That means ascending puts non-versioned
+	// stems earlier: versionLess("nightly","v1.8.0") is true, not the reverse.
+	if !versionLess("nightly", "v1.8.0") {
+		t.Fatal("non-versioned stem should sort earlier ascending (later in display)")
+	}
+	if versionLess("v1.8.0", "nightly") {
+		t.Fatal("versioned stem should not sort earlier ascending")
+	}
+}
+
+func TestBuildAnchorPayloadsSkewAndMachine(t *testing.T) {
+	dir := t.TempDir()
+	current := Baseline{
+		Machine: Machine{Arch: "arm64", CPUModel: "Apple M2"},
+		Benchmarks: map[string]BenchmarkEntry{
+			"pkg.BenchmarkA":   {RatioToAnchor: 80},
+			"pkg.BenchmarkB":   {RatioToAnchor: 120},
+			"pkg.BenchmarkNew": {RatioToAnchor: 50}, // added since the anchor
+		},
+	}
+	// Same-machine anchor missing one current benchmark and carrying one the
+	// current run dropped.
+	writeMachineBaseline(t, filepath.Join(dir, "v1.9.0.json"), "arm64", "Apple M2", map[string]float64{
+		"pkg.BenchmarkA": 100, "pkg.BenchmarkB": 100, "pkg.BenchmarkGone": 10,
+	})
+	// Cross-machine anchor.
+	writeMachineBaseline(t, filepath.Join(dir, "v1.8.0.json"), "arm64", "Apple M3", map[string]float64{
+		"pkg.BenchmarkA": 90,
+	})
+
+	got := buildAnchorPayloads(current, dir)
+	if len(got) != 2 {
+		t.Fatalf("payloads = %d, want 2", len(got))
+	}
+	// Newest first.
+	if got[0].Name != "v1.9.0" || got[1].Name != "v1.8.0" {
+		t.Fatalf("order = %q,%q; want v1.9.0,v1.8.0", got[0].Name, got[1].Name)
+	}
+	v190 := got[0]
+	if !v190.SameMachine {
+		t.Fatal("v1.9.0 captured on Apple M2 should be same-machine")
+	}
+	if v190.Added != 1 { // BenchmarkNew
+		t.Fatalf("v1.9.0 added = %d, want 1", v190.Added)
+	}
+	if v190.Missing != 1 { // BenchmarkGone
+		t.Fatalf("v1.9.0 missing = %d, want 1", v190.Missing)
+	}
+	if got[1].SameMachine {
+		t.Fatal("v1.8.0 captured on Apple M3 should be cross-machine")
 	}
 }
 

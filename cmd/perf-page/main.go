@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -159,6 +160,12 @@ type PageData struct {
 	TopImprovements   []ChangeRow
 	TopSlowdowns      []ChangeRow
 	RecentlyTightened []BenchmarkRow
+
+	// Anchors is every historical baseline the "Largest changes" section can be
+	// compared against; AnchorsJSON is the same data embedded for the
+	// client-side switcher. ReferenceName is the initially selected one.
+	Anchors     []AnchorPayload
+	AnchorsJSON template.JS
 
 	// ExplorerURL is where the page fetches the tidy explorer data
 	// ({date, cpu, bench, metric, value} rows) at load time — written as a
@@ -338,6 +345,10 @@ func main() {
 
 	page := buildPage(current, reference, referenceName, timeline, logo)
 	page.ExplorerURL = *explorerURL
+	page.Anchors = buildAnchorPayloads(current, *historicalPath)
+	if js, err := json.Marshal(page.Anchors); err == nil {
+		page.AnchorsJSON = template.JS(js)
+	}
 	html, err := renderPage(page)
 	if err != nil {
 		die("render page: %v", err)
@@ -623,6 +634,122 @@ func buildPage(current, reference Baseline, referenceName string, timeline []Sna
 		TopSlowdowns:      slowdowns,
 		RecentlyTightened: recent,
 	}
+}
+
+// AnchorChange is a preformatted "Largest changes" row. Formatting happens at
+// generation time (deltaText/formatRatio) so the client-side baseline switcher
+// only injects strings — the JS never re-derives what the Go side already knows.
+type AnchorChange struct {
+	Pkg   string `json:"pkg"`
+	Name  string `json:"name"`
+	Delta string `json:"delta"`
+	Now   string `json:"now"`
+}
+
+// AnchorPayload carries one historical baseline's comparison against current,
+// computed once at generation time so selecting a different baseline in the UI
+// swaps the section without a round-trip or a recompute.
+type AnchorPayload struct {
+	Name         string         `json:"name"`
+	CPUModel     string         `json:"cpu"`
+	SameMachine  bool           `json:"sameMachine"`
+	Added        int            `json:"added"`   // benchmarks in current absent from this ref (added since)
+	Missing      int            `json:"missing"` // benchmarks in ref absent from current (removed/renamed)
+	Improvements []AnchorChange `json:"improvements"`
+	Slowdowns    []AnchorChange `json:"slowdowns"`
+}
+
+func toAnchorChanges(rows []ChangeRow) []AnchorChange {
+	out := make([]AnchorChange, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, AnchorChange{
+			Pkg:   r.Package,
+			Name:  r.Name,
+			Delta: deltaText(r.Delta),
+			Now:   formatRatio(r.NewRatio),
+		})
+	}
+	return out
+}
+
+// buildAnchorPayloads enumerates every historical/*.json and computes its
+// comparison against current, including the benchmark-set skew (how many
+// benchmarks were added since / are absent now) and whether the anchor was
+// captured on the same CPU. Unreadable anchors are skipped, not fatal — a
+// malformed snapshot shouldn't blank the whole page.
+func buildAnchorPayloads(current Baseline, dir string) []AnchorPayload {
+	paths, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		return nil
+	}
+	var out []AnchorPayload
+	for _, path := range paths {
+		ref, err := loadBaseline(path)
+		if err != nil {
+			continue
+		}
+		imp, slow := topChanges(current, ref, 8)
+		added, missing := 0, 0
+		for k := range current.Benchmarks {
+			if _, ok := ref.Benchmarks[k]; !ok {
+				added++
+			}
+		}
+		for k := range ref.Benchmarks {
+			if _, ok := current.Benchmarks[k]; !ok {
+				missing++
+			}
+		}
+		out = append(out, AnchorPayload{
+			Name:         strings.TrimSuffix(filepath.Base(path), ".json"),
+			CPUModel:     ref.Machine.CPUModel,
+			SameMachine:  ref.Machine.CPUModel == current.Machine.CPUModel,
+			Added:        added,
+			Missing:      missing,
+			Improvements: toAnchorChanges(imp),
+			Slowdowns:    toAnchorChanges(slow),
+		})
+	}
+	// Newest first. Version stems (vMAJOR.MINOR.PATCH) don't sort correctly as
+	// plain strings once MINOR reaches two digits ("v1.9.0" > "v1.10.0"), so
+	// compare component-wise.
+	sort.Slice(out, func(i, j int) bool { return versionLess(out[j].Name, out[i].Name) })
+	return out
+}
+
+// versionLess orders vMAJOR.MINOR.PATCH stems numerically; non-version stems
+// fall back to string order and sort after versioned ones.
+func versionLess(a, b string) bool {
+	pa, oka := parseVersion(a)
+	pb, okb := parseVersion(b)
+	if oka && okb {
+		for i := 0; i < 3; i++ {
+			if pa[i] != pb[i] {
+				return pa[i] < pb[i]
+			}
+		}
+		return false
+	}
+	if oka != okb {
+		return okb // versioned stems sort before non-versioned
+	}
+	return a < b
+}
+
+func parseVersion(s string) ([3]int, bool) {
+	var v [3]int
+	parts := strings.SplitN(strings.TrimPrefix(s, "v"), ".", 3)
+	if len(parts) != 3 {
+		return v, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return v, false
+		}
+		v[i] = n
+	}
+	return v, true
 }
 
 // defaultBudgetFraction mirrors bench-ratchet's regression budget (5%): the
@@ -1990,6 +2117,14 @@ const pageTemplate = `<!doctype html>
     .spark-tip .tip-r .good { color: #7fdca4; }
     .spark-tip .tip-r .bad { color: #f3a3a3; }
     .spark-tip .tip-r.muted { opacity: 0.6; }
+    .anchor-pick { margin-left: 10px; font-size: 13px; color: var(--muted); }
+    .anchor-pick select {
+      margin-left: 4px; padding: 2px 6px; font: inherit; font-size: 13px;
+      color: var(--ink); background: var(--paper);
+      border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+    }
+    .anchor-skew { margin-top: 6px; font-size: 12px; color: var(--muted); min-height: 1em; }
+    .anchor-skew.warn { color: var(--amber); }
   </style>
 </head>
 <body>
@@ -2115,39 +2250,84 @@ const pageTemplate = `<!doctype html>
     <section>
       <div class="section-head">
         <h2>Largest changes</h2>
-        <p>Current ratchet compared with {{.ReferenceName}}.</p>
+        <p>Current ratchet compared with <span id="anchor-label">{{.ReferenceName}}</span>.{{if gt (len .Anchors) 1}}
+          <label class="anchor-pick">baseline
+            <select id="anchor-select" data-current-cpu="{{.Current.Machine.CPUModel}}">
+              {{range .Anchors}}<option value="{{.Name}}"{{if eq .Name $.ReferenceName}} selected{{end}}>{{.Name}}{{if not .SameMachine}} ({{.CPUModel}}){{end}}</option>{{end}}
+            </select>
+          </label>{{end}}
+        </p>
+        <p id="anchor-skew" class="anchor-skew"></p>
       </div>
       <div class="grid-2">
-        {{if .TopImprovements}}
         <table>
           <thead><tr><th>Improved</th><th>Delta</th><th>Now</th></tr></thead>
-          <tbody>
+          <tbody id="improve-body">
             {{range .TopImprovements}}
             <tr>
               <td class="bench"><span class="pkg">{{.Package}}</span>{{.Name}}</td>
               <td><span class="delta good">{{deltaText .Delta}}</span></td>
               <td class="num">{{ratio .NewRatio}} anchors</td>
             </tr>
-            {{end}}
+            {{else}}<tr><td colspan="3" class="empty">No historical improvements found.</td></tr>{{end}}
           </tbody>
         </table>
-        {{else}}<div class="empty">No historical improvements found.</div>{{end}}
 
-        {{if .TopSlowdowns}}
         <table>
           <thead><tr><th>Slower</th><th>Delta</th><th>Now</th></tr></thead>
-          <tbody>
+          <tbody id="slower-body">
             {{range .TopSlowdowns}}
             <tr>
               <td class="bench"><span class="pkg">{{.Package}}</span>{{.Name}}</td>
               <td><span class="delta bad">{{deltaText .Delta}}</span></td>
               <td class="num">{{ratio .NewRatio}} anchors</td>
             </tr>
-            {{end}}
+            {{else}}<tr><td colspan="3" class="empty">No historical slowdowns found.</td></tr>{{end}}
           </tbody>
         </table>
-        {{else}}<div class="empty">No historical slowdowns found.</div>{{end}}
       </div>
+      {{if .Anchors}}
+      <script id="anchor-data" type="application/json">{{.AnchorsJSON}}</script>
+      <script>
+      (function () {
+        var el = document.getElementById('anchor-data');
+        var sel = document.getElementById('anchor-select');
+        if (!el || !sel) return;
+        var data = {};
+        JSON.parse(el.textContent || '[]').forEach(function (a) { data[a.name] = a; });
+        var improve = document.getElementById('improve-body');
+        var slower = document.getElementById('slower-body');
+        var label = document.getElementById('anchor-label');
+        var skew = document.getElementById('anchor-skew');
+        var curCPU = sel.getAttribute('data-current-cpu') || 'this machine';
+        function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+        function fill(tbody, list, cls, empty) {
+          if (!tbody) return;
+          if (!list || !list.length) { tbody.innerHTML = '<tr><td colspan="3" class="empty">' + empty + '</td></tr>'; return; }
+          tbody.innerHTML = list.map(function (r) {
+            return '<tr><td class="bench"><span class="pkg">' + esc(r.pkg) + '</span>' + esc(r.name) + '</td>' +
+              '<td><span class="delta ' + cls + '">' + esc(r.delta) + '</span></td>' +
+              '<td class="num">' + esc(r.now) + ' anchors</td></tr>';
+          }).join('');
+        }
+        function apply(name) {
+          var a = data[name];
+          if (!a) return;
+          if (label) label.textContent = a.name;
+          fill(improve, a.improvements, 'good', 'No historical improvements found.');
+          fill(slower, a.slowdowns, 'bad', 'No historical slowdowns found.');
+          var notes = [];
+          if (a.added) notes.push(a.added + ' benchmark' + (a.added > 1 ? 's' : '') + ' added since ' + a.name + ' (no comparison)');
+          if (a.missing) notes.push(a.missing + ' absent now');
+          if (!a.sameMachine) notes.push('⚠ captured on ' + a.cpu + ', not ' + curCPU + ' — ratios only, ignore ns/op');
+          skew.textContent = notes.join(' · ');
+          skew.classList.toggle('warn', !a.sameMachine);
+        }
+        sel.addEventListener('change', function (e) { apply(e.target.value); });
+        apply(sel.value);
+      })();
+      </script>
+      {{end}}
     </section>
 
     <section>
