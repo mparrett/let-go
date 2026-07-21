@@ -1,0 +1,95 @@
+name: lgb-diff
+
+# Opt-in bundle diff: label a PR `lgb-diff` and this posts (and keeps updated)
+# a sticky comment with the semantic bytecode diff of pkg/rt/core_compiled.lgb
+# against the merge-base, rendered by scripts/lgbdump.lg. Same-repo PRs only:
+# fork PRs get a read-only token, so the comment step would fail there.
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: lgb-diff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  diff:
+    if: contains(github.event.pull_request.labels.*.name, 'lgb-diff')
+    runs-on: ubuntu-latest
+    steps:
+      # Head SHA, not the merge ref: the lg built here must share an opcode
+      # enum with the bundle it dumps, and the head tree is that producer.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Locate bundle change
+        id: bundle
+        run: |
+          MB=$(git merge-base HEAD "origin/${{ github.event.pull_request.base.ref }}")
+          echo "mb=$MB" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$MB" HEAD -- pkg/rt/core_compiled.lgb; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.bundle.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build lg, dump both bundles, diff
+        if: steps.bundle.outputs.changed == 'true'
+        run: |
+          make lg
+          MB=${{ steps.bundle.outputs.mb }}
+          git show "$MB:pkg/rt/core_compiled.lgb" > /tmp/base.lgb
+          ./lg scripts/lgbdump.lg /tmp/base.lgb > /tmp/base.txt
+          ./lg scripts/lgbdump.lg pkg/rt/core_compiled.lgb > /tmp/head.txt
+          # diff(1) semantics: exit 1 just means the bundles differ.
+          diff -u --label "base ($(git rev-parse --short "$MB"))" --label head \
+            /tmp/base.txt /tmp/head.txt > /tmp/lgb.diff || true
+
+      - name: Post sticky comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER='<!-- lgb-diff -->'
+          MB_SHORT=$(git rev-parse --short "${{ steps.bundle.outputs.mb }}")
+          {
+            echo "$MARKER"
+            echo "### lgb-diff: \`pkg/rt/core_compiled.lgb\` vs merge-base \`$MB_SHORT\`"
+            echo ""
+            if [ "${{ steps.bundle.outputs.changed }}" = "false" ]; then
+              echo "Bundle unchanged."
+            else
+              LINES=$(wc -l < /tmp/lgb.diff)
+              echo "<details><summary>unified diff ($LINES lines)</summary>"
+              echo ""
+              echo '```diff'
+              head -400 /tmp/lgb.diff
+              echo '```'
+              echo "</details>"
+              if [ "$LINES" -gt 400 ]; then
+                echo ""
+                echo "_Truncated at 400 lines; dump both bundles with \`scripts/lgbdump.lg\` locally for the rest._"
+              fi
+            fi
+          } > /tmp/comment.md
+          CID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -F body=@/tmp/comment.md
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file /tmp/comment.md
+          fi
