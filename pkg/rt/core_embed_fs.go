@@ -20,17 +20,49 @@ import (
 //go:embed all:core
 var coreFS embed.FS
 
-// EmbeddedSource returns the source of an embedded namespace by its
-// dotted ns name.
+// auxEmbeddedSources holds embedded namespace sources that live OUTSIDE the
+// core/ tree. They resolve like embedded core but are deliberately excluded
+// from the core lowering universe: EmbeddedNSNames walks core/ only, so an aux
+// source is invisible to the self-hosting bootstrap (lgbgen). gogen is the case
+// (nooga/let-go#425) — it self-contains as embedded source but is the AOT
+// Go-emitter, not core content, and enrolling it in core/ perturbs the
+// interpreted-vs-native lowering fixpoint.
 //
-// Naming rule (the source-side analog of `cmd/lgbgen.nsToGoRelDir`, which
-// nests the lowered Go tree the same way):
+// Concurrency: a bare map with no lock, safe ONLY because it is written
+// exclusively from init() (via registerEmbeddedSource), which happens-before
+// every resolver read through EmbeddedSource. Do NOT add a runtime
+// RegisterEmbeddedSource entry point — a write racing a resolver read would be a
+// data race. Keep all registration in init().
+var auxEmbeddedSources = map[string]string{}
+
+// registerEmbeddedSource records an auxiliary embedded namespace source. Call it
+// ONLY from init() (see auxEmbeddedSources for the race invariant). An empty
+// source means the //go:embed directive that feeds it never populated — a broken
+// build — so fail loudly and name the namespace here, rather than let it surface
+// downstream as an obscure "Can't resolve <ns>/..." through the resolver's
+// fallback chain.
+func registerEmbeddedSource(name, src string) {
+	if src == "" {
+		panic("rt: embedded source for namespace " + name + " is empty (//go:embed failed?)")
+	}
+	auxEmbeddedSources[name] = src
+}
+
+// EmbeddedSource returns the source of an embedded namespace by its
+// dotted ns name. Auxiliary sources (auxEmbeddedSources) are checked first,
+// then the core/ tree.
+//
+// Naming rule for the core/ tree (the source-side analog of
+// `cmd/lgbgen.nsToGoRelDir`, which nests the lowered Go tree the same way):
 //   - dots are path separators: `ir.passes.dce` → `ir/passes/dce.lg`
 //   - in the *leaf* segment, hyphens map to underscores so the file
 //     name is a legal Go-style identifier: `ir.lower-go` → `ir/lower_go.lg`
 //
 // Returns ("", false) if no matching file exists.
 func EmbeddedSource(name string) (string, bool) {
+	if src, ok := auxEmbeddedSources[name]; ok {
+		return src, true
+	}
 	path := "core/" + nsNameToPath(name)
 	data, err := coreFS.ReadFile(path)
 	if err != nil {
