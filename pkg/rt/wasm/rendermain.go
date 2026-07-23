@@ -59,6 +59,13 @@ func main() {
 		v.SetRoot(vm.NewBoxed(hostEmitter))
 	}
 
+	// Route (surface/present ...) to the JS host via _lgSurface (HostSurface),
+	// the binary dual of the HostEmitter routing above. Same SetRoot rationale.
+	hostSurface := rt.NewHostSurface()
+	if v := rt.LookupCoreVar("*surface*"); v != nil {
+		v.SetRoot(vm.NewBoxed(hostSurface))
+	}
+
 	// Route storage through browser localStorage, scoped by the bundle's
 	// host-selected store id so guest keys remain app-local.
 	hostStorage := rt.NewHostStorage(__LG_STORAGE_ID__)

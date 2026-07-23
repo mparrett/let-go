@@ -354,6 +354,11 @@ func installIOBuiltins(ns *vm.Namespace) {
 	// per-process memory so native dev/tests get deterministic behavior even
 	// when no persistent host binding is installed.
 	ns.Def("*storage*", vm.NewBoxed(NewMemoryStorage()))
+
+	// *surface* — host RGBA frame sink for the surface namespace. Defaults to a
+	// no-op so (surface/present ...) is harmless and (surface/available?) is
+	// false when nothing is wired, the same way *emit* does. See surface.go.
+	ns.Def("*surface*", vm.NewBoxed(nopSurface{}))
 }
 
 // resolveIOHandleVar looks up a var (e.g. "*out*") in the core namespace
