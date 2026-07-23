@@ -11,11 +11,20 @@ import (
 
 // Encode serializes a Module to binary format.
 func Encode(w io.Writer, m *Module) error {
+	return encode(w, m, nil)
+}
+
+// encode serializes m. liveIdx, when non-nil, maps live *vm.CodeChunk pointers
+// to chunk indices (ModuleBuilder's registration map) so TagFunc bindings stay
+// exact even when two chunks share identical code. Without it, findChunkIndex
+// falls back to code+MaxStack matching (first hit wins).
+func encode(w io.Writer, m *Module, liveIdx map[*vm.CodeChunk]int) error {
 	enc := &encoder{
 		w:        NewWriter(w),
 		strings:  m.Strings,
 		strIndex: make(map[string]int, len(m.Strings)),
 		chunks:   m.Chunks,
+		liveIdx:  liveIdx,
 	}
 	for i, s := range m.Strings {
 		enc.strIndex[s] = i
@@ -73,8 +82,7 @@ func EncodeModule(w io.Writer, consts *vm.Consts, chunks []*vm.CodeChunk) error 
 	for _, v := range vals {
 		b.AddConst(v)
 	}
-	m := b.Build()
-	return Encode(w, m)
+	return b.encodeTo(w)
 }
 
 // EncodeCompilation serializes a compilation result (main chunk + const pool).
@@ -92,8 +100,7 @@ func EncodeCompilation(w io.Writer, consts *vm.Consts, mainChunk *vm.CodeChunk) 
 	for _, v := range vals {
 		b.AddConst(v)
 	}
-	m := b.Build()
-	return Encode(w, m)
+	return b.encodeTo(w)
 }
 
 // EncodeBundle serializes a multi-namespace compilation bundle.
@@ -124,8 +131,13 @@ func EncodeBundleOrdered(w io.Writer, consts *vm.Consts, nsChunks map[string]*vm
 	for _, v := range vals {
 		b.AddConst(v)
 	}
-	m := b.Build()
-	return Encode(w, m)
+	return b.encodeTo(w)
+}
+
+// encodeTo builds the Module and serializes it with pointer-accurate chunk
+// indices for Func consts.
+func (b *ModuleBuilder) encodeTo(w io.Writer) error {
+	return encode(w, b.Build(), b.chunkIndex)
 }
 
 // ModuleBuilder collects strings, chunks, and consts for serialization.
@@ -312,7 +324,9 @@ type encoder struct {
 	strings  []string
 	strIndex map[string]int
 	chunks   []*ChunkData
-	// chunkMap maps live CodeChunk pointers to chunk indices (populated by EncodeModule path)
+	// liveIdx maps live CodeChunk pointers to chunk indices when encoding from
+	// a ModuleBuilder. Nil for structural Encode(Module) callers.
+	liveIdx map[*vm.CodeChunk]int
 }
 
 func (e *encoder) writeHeader(m *Module) error {
@@ -629,19 +643,28 @@ func (e *encoder) writeValue(v vm.Value) error {
 }
 
 func (e *encoder) findChunkIndex(c *vm.CodeChunk) int {
+	if e.liveIdx != nil {
+		if idx, ok := e.liveIdx[c]; ok {
+			return idx
+		}
+	}
+	// Fallback for structural Encode(Module) without a live pointer map:
+	// match code + MaxStack. First hit wins when bodies collide.
 	code := c.Code()
+	ms := c.MaxStack()
 	for i, ch := range e.chunks {
-		if len(ch.Code) == len(code) {
-			match := true
-			for j := range code {
-				if ch.Code[j] != code[j] {
-					match = false
-					break
-				}
+		if ch.MaxStack != ms || len(ch.Code) != len(code) {
+			continue
+		}
+		match := true
+		for j := range code {
+			if ch.Code[j] != code[j] {
+				match = false
+				break
 			}
-			if match {
-				return i
-			}
+		}
+		if match {
+			return i
 		}
 	}
 	return -1

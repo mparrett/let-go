@@ -128,3 +128,55 @@ func TestStripDebugBundleFormat(t *testing.T) {
 		t.Fatalf("stripped bundle main ran to %v, want 7", out)
 	}
 }
+
+// Two funcs with identical bodies but different MaxStack must keep distinct
+// chunk bindings across StripDebug (and EncodeCompilation). findChunkIndex
+// used to match by code only and collapse them onto the first hit.
+func TestStripDebugPreservesDistinctIdenticalCodeChunks(t *testing.T) {
+	consts := vm.NewConsts()
+	mk := func(maxStack int, name string) *vm.CodeChunk {
+		c := vm.NewCodeChunk(consts)
+		c.Append32(int(vm.OP_LOAD_CONST))
+		c.Append32(consts.Intern(vm.NIL))
+		c.Append32(int(vm.OP_RETURN))
+		c.SetMaxStack(maxStack)
+		c.AddSourceInfoAt(0, vm.SourceInfo{File: name + ".lg", Line: 1, Column: 1, EndLine: 1, EndColumn: 1})
+		return c
+	}
+	c1 := mk(3, "fn1")
+	c2 := mk(7, "fn2")
+	f1 := vm.MakeFunc(0, false, c1)
+	f1.SetName("fn1")
+	f2 := vm.MakeFunc(0, false, c2)
+	f2.SetName("fn2")
+	_ = consts.Intern(f1)
+	_ = consts.Intern(f2)
+
+	main := vm.NewCodeChunk(consts)
+	main.Append32(int(vm.OP_LOAD_CONST))
+	main.Append32(consts.Intern(vm.Int(42)))
+	main.Append32(int(vm.OP_RETURN))
+	main.SetMaxStack(1)
+
+	var enc bytes.Buffer
+	if err := EncodeCompilation(&enc, consts, main); err != nil {
+		t.Fatal(err)
+	}
+	slim, err := StripDebug(enc.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := DecodeToExecUnitBytes(slim, func(ns, name string) *vm.Var { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, v := range unit.Consts.Values() {
+		if fn, ok := v.(*vm.Func); ok {
+			got[fn.FuncName()] = fn.Chunk().MaxStack()
+		}
+	}
+	if got["fn1"] != 3 || got["fn2"] != 7 {
+		t.Fatalf("StripDebug rebound identical-code funcs: %v (want fn1=3 fn2=7)", got)
+	}
+}

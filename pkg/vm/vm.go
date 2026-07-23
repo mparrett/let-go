@@ -324,6 +324,13 @@ func (c *CodeChunk) SetSourceMap(sm *SourceMap) {
 	c.sourceMap = sm
 }
 
+// ClearDebugInfo drops source maps and local-variable debug tables. Used by
+// bytecode.StripDebug before re-encoding a release artifact.
+func (c *CodeChunk) ClearDebugInfo() {
+	c.sourceMap = nil
+	c.localVars = nil
+}
+
 // LookupSource finds the source location for a given instruction pointer.
 func (c *CodeChunk) LookupSource(ip int) *SourceInfo {
 	if c.sourceMap == nil {
