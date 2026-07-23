@@ -162,6 +162,13 @@ func bundleBinary(ctx *compiler.Context, nsRes *resolver.NSResolver, src string,
 		}
 	}
 	lgbData := lgbBuf.Bytes()
+	if stripDebug {
+		stripped, err := bytecode.StripDebug(lgbData)
+		if err != nil {
+			return fmt.Errorf("stripping debug sections: %w", err)
+		}
+		lgbData = stripped
+	}
 
 	// Collect resources under the -resource-paths roots *before* creating the
 	// output file, and exclude the output path itself — otherwise a dst that
@@ -228,12 +235,7 @@ func compileLG(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ds
 	if err != nil {
 		return err
 	}
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
+	var buf bytes.Buffer
 	// If namespaces were loaded during compilation, use bundle format
 	if len(nsRes.LoadedChunks) > 0 {
 		// Include the main chunk under its namespace name, last in order
@@ -242,9 +244,21 @@ func compileLG(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ds
 		maps.Copy(nsChunks, nsRes.LoadedChunks)
 		nsChunks[mainNS] = chunk
 		nsOrder := append(nsRes.LoadOrder, mainNS)
-		return bytecode.EncodeBundleOrdered(out, ctx.Consts(), nsChunks, nsOrder)
+		if err := bytecode.EncodeBundleOrdered(&buf, ctx.Consts(), nsChunks, nsOrder); err != nil {
+			return err
+		}
+	} else if err := bytecode.EncodeCompilation(&buf, ctx.Consts(), chunk); err != nil {
+		return err
 	}
-	return bytecode.EncodeCompilation(out, ctx.Consts(), chunk)
+	data := buf.Bytes()
+	if stripDebug {
+		stripped, err := bytecode.StripDebug(data)
+		if err != nil {
+			return fmt.Errorf("stripping debug sections: %w", err)
+		}
+		data = stripped
+	}
+	return os.WriteFile(dst, data, 0644)
 }
 
 var nreplServer *nrepl.NreplServer
@@ -278,6 +292,7 @@ var wasmShell string
 var wasmPayload string
 var wasmHostEval bool
 var storageID string
+var stripDebug bool
 var sourcePaths string
 var resourcePaths string
 
@@ -292,6 +307,7 @@ func init() {
 	flag.StringVar(&compileOutput, "c", "", "compile .lg file to .lgb bytecode (specify output path)")
 	flag.StringVar(&bundleOutput, "b", "", "bundle .lg file into a standalone executable (specify output path)")
 	flag.StringVar(&bundleBase, "bundle-base", "", "path to target-platform lg binary for cross-OS bundling (defaults to current executable)")
+	flag.BoolVar(&stripDebug, "strip", false, "omit source maps and local-variable debug tables from the emitted bytecode (with -c/-b); smaller artifacts, unlocated runtime errors")
 	flag.StringVar(&wasmOutput, "w", "", "build .lg file into a WASM web app (specify output directory)")
 	flag.StringVar(&wasmShell, "w-shell", "xterm", "shell for -w: 'xterm' (default), 'none' (emit core only; client supplies its own shell via window.LetGoHost), or a path to a custom HTML template containing __LG_HOST_JS_BODY_PLACEHOLDER__")
 	flag.StringVar(&wasmPayload, "w-wasm", "inline", "wasm delivery for -w: 'inline' (default; gzip-base64 baked into index.html) or 'external' (emit a separate main.wasm the loader fetches + streams)")
