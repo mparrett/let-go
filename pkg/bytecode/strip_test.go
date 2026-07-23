@@ -68,3 +68,63 @@ func TestStripDebugRemovesDebugSections(t *testing.T) {
 		t.Fatalf("stripped bundle ran to %v, want 42", out)
 	}
 }
+
+func TestStripDebugBundleFormat(t *testing.T) {
+	consts := vm.NewConsts()
+	mk := func(v vm.Value) *vm.CodeChunk {
+		c := vm.NewCodeChunk(consts)
+		c.Append32(int(vm.OP_LOAD_CONST))
+		c.Append32(consts.Intern(v))
+		c.Append32(int(vm.OP_RETURN))
+		c.SetMaxStack(1)
+		c.AddSourceInfoAt(0, vm.SourceInfo{File: "ns.lg", Line: 1, Column: 1, EndLine: 1, EndColumn: 3})
+		c.AddLocalVar(0, "y")
+		return c
+	}
+	nsChunks := map[string]*vm.CodeChunk{"a.ns": mk(vm.Int(1)), "main": mk(vm.Int(7))}
+
+	var enc bytes.Buffer
+	if err := EncodeBundleOrdered(&enc, consts, nsChunks, []string{"a.ns", "main"}); err != nil {
+		t.Fatal(err)
+	}
+	slim, err := StripDebug(enc.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := Decode(bytes.NewReader(slim))
+	if err != nil {
+		t.Fatalf("stripped bundle does not decode: %v", err)
+	}
+	if len(m.NSTable) != 2 {
+		t.Fatalf("NS table lost in strip: %v", m.NSTable)
+	}
+	for i, c := range m.Chunks {
+		if len(c.SourceMap) != 0 || len(c.LocalVars) != 0 {
+			t.Errorf("chunk %d retains debug sections", i)
+		}
+	}
+
+	// Idempotent: stripping a stripped bundle is a no-op.
+	again, err := StripDebug(slim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(slim, again) {
+		t.Errorf("strip is not idempotent: %d -> %d bytes", len(slim), len(again))
+	}
+
+	unit, err := DecodeToExecUnitBytes(slim, func(ns, name string) *vm.Var { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := vm.NewFrame(unit.MainChunk, nil)
+	out, err := f.Run()
+	vm.ReleaseFrame(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != vm.Int(7) {
+		t.Fatalf("stripped bundle main ran to %v, want 7", out)
+	}
+}
