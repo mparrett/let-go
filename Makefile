@@ -60,6 +60,19 @@ build: $(LG)
 
 build-profile: $(LG-PROFILE)
 
+# Release build with a debug-stripped embedded core. Regenerates the core
+# bundle with `lgbgen -strip` (drops source maps + local-var tables, ~22%
+# of the bundle), builds, then restores the committed full-debug core so the
+# working tree is left clean. The trap runs on success or failure, so an
+# aborted build never leaves a stripped core checked in. The tradeoff is
+# release-only: core-originated runtime errors report without source
+# locations. Opt-in — the default `build` keeps the full-debug core.
+.PHONY: build-strip
+build-strip: $(GO)
+	go run -tags bootstrap ./cmd/lgbgen -strip
+	trap 'go run -tags bootstrap ./cmd/lgbgen >/dev/null' EXIT; \
+	go build -ldflags="-s -w -X main.commit=$(COMMIT)" -o $(LG) .
+
 # Bundle target. The runtime loads compiled bytecode for the core
 # namespaces from this file, NOT from the .lg sources. Anyone editing
 # a .lg under pkg/rt/core/ must regenerate the bundle or runtime

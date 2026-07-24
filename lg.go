@@ -307,7 +307,7 @@ func init() {
 	flag.StringVar(&compileOutput, "c", "", "compile .lg file to .lgb bytecode (specify output path)")
 	flag.StringVar(&bundleOutput, "b", "", "bundle .lg file into a standalone executable (specify output path)")
 	flag.StringVar(&bundleBase, "bundle-base", "", "path to target-platform lg binary for cross-OS bundling (defaults to current executable)")
-	flag.BoolVar(&stripDebug, "strip", false, "omit source maps and local-variable debug tables from the emitted bytecode (with -c/-b); smaller artifacts, unlocated runtime errors")
+	flag.BoolVar(&stripDebug, "strip", false, "omit source maps and local-variable debug tables from the emitted bytecode (with -c/-b/-w); smaller artifacts, unlocated runtime errors")
 	flag.StringVar(&wasmOutput, "w", "", "build .lg file into a WASM web app (specify output directory)")
 	flag.StringVar(&wasmShell, "w-shell", "xterm", "shell for -w: 'xterm' (default), 'none' (emit core only; client supplies its own shell via window.LetGoHost), or a path to a custom HTML template containing __LG_HOST_JS_BODY_PLACEHOLDER__")
 	flag.StringVar(&wasmPayload, "w-wasm", "inline", "wasm delivery for -w: 'inline' (default; gzip-base64 baked into index.html) or 'external' (emit a separate main.wasm the loader fetches + streams)")

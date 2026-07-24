@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -382,12 +383,14 @@ func main() {
 	// never rewrites the real checkout's wireup. When set, the manifest refresh
 	// is skipped too, keeping the run side-effect-free outside codeDir/outDir.
 	var codeDir string
+	var strip bool
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	fs.StringVar(&target, "target", "", "generation target: go, both, or empty for bundle-only")
 	fs.StringVar(&cpuProfilePath, "cpuprofile", "", "write Go CPU profile for the lgbgen process")
 	fs.StringVar(&memProfilePath, "memprofile", "", "write Go allocation profile (allocs) for the lgbgen process")
 	fs.StringVar(&codeDir, "code-dir", "", "base dir for generated gogen_ir wireup files (default: repo root)")
+	fs.BoolVar(&strip, "strip", false, "omit source maps and local-variable debug tables from the emitted core bundle; smaller shipped binary, unlocated core runtime errors")
 	fs.Parse(os.Args[1:])
 
 	switch target {
@@ -568,43 +571,50 @@ func main() {
 		return
 	}
 	if targetBoth {
-		writeBundle(outPath, consts, nsChunks, bundleOrder)
+		writeBundle(outPath, consts, nsChunks, bundleOrder, strip)
 		compileIRForLowering()
 		runGoTarget(goOutDir, codeDir)
 		return
 	}
 
 	// Bytecode mode: write .lgb bundle (ir.* excluded).
-	writeBundle(outPath, consts, nsChunks, bundleOrder)
+	writeBundle(outPath, consts, nsChunks, bundleOrder, strip)
 }
 
 // writeBundle encodes the compiled namespace chunks into the .lgb bundle at
 // outPath and closes the file before returning (so callers may proceed to the
 // Go-lowering target against the same in-memory state).
-func writeBundle(outPath string, consts *vm.Consts, nsChunks map[string]*vm.CodeChunk, nsOrder []string) {
-	f, err := os.Create(outPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create %s: %v\n", outPath, err)
-		os.Exit(1)
-	}
-
-	if err := bytecode.EncodeBundleOrdered(f, consts, nsChunks, nsOrder); err != nil {
-		f.Close()
+func writeBundle(outPath string, consts *vm.Consts, nsChunks map[string]*vm.CodeChunk, nsOrder []string, strip bool) {
+	// Encode into a buffer so -strip can post-process the debug sections out
+	// before the bytes hit disk. StripDebug re-encodes from a decoded unit, so
+	// stripping in-band here (rather than a separate re-read) keeps it to one pass.
+	var buf bytes.Buffer
+	if err := bytecode.EncodeBundleOrdered(&buf, consts, nsChunks, nsOrder); err != nil {
 		fmt.Fprintf(os.Stderr, "encode failed: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Stat is best-effort: success here is just for the byte-count in the
-	// success line. If it fails, we still wrote the bundle, so report what we
-	// know without dereferencing a nil FileInfo.
-	if fi, err := f.Stat(); err == nil {
-		fmt.Printf("wrote %s (%d bytes, %d consts, %d namespaces)\n",
-			outPath, fi.Size(), len(consts.Values()), len(nsChunks))
-	} else {
-		fmt.Printf("wrote %s (%d consts, %d namespaces; stat failed: %v)\n",
-			outPath, len(consts.Values()), len(nsChunks), err)
+	data := buf.Bytes()
+	if strip {
+		stripped, err := bytecode.StripDebug(data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "strip failed: %v\n", err)
+			os.Exit(1)
+		}
+		data = stripped
 	}
-	f.Close()
+
+	if err := os.WriteFile(outPath, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", outPath, err)
+		os.Exit(1)
+	}
+
+	if strip {
+		fmt.Printf("wrote %s (%d bytes, %d consts, %d namespaces; debug stripped)\n",
+			outPath, len(data), len(consts.Values()), len(nsChunks))
+	} else {
+		fmt.Printf("wrote %s (%d bytes, %d consts, %d namespaces)\n",
+			outPath, len(data), len(consts.Values()), len(nsChunks))
+	}
 	refreshManifest()
 }
 

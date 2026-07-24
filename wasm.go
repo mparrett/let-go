@@ -84,6 +84,15 @@ func buildWasm(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ou
 		}
 	}
 
+	lgbData := lgbBuf.Bytes()
+	if stripDebug {
+		stripped, err := bytecode.StripDebug(lgbData)
+		if err != nil {
+			return fmt.Errorf("stripping debug sections: %w", err)
+		}
+		lgbData = stripped
+	}
+
 	// 2. Create temp build directory
 	tmpDir, err := os.MkdirTemp("", "lg-wasm-*")
 	if err != nil {
@@ -98,7 +107,7 @@ func buildWasm(ctx *compiler.Context, nsRes *resolver.NSResolver, src string, ou
 	buildTags := strings.TrimSpace(os.Getenv("LG_WASM_BUILD_TAGS"))
 
 	// 3. Write generated source files
-	if err := os.WriteFile(filepath.Join(tmpDir, "program.lgb"), lgbBuf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "program.lgb"), lgbData, 0644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(wasmassets.RenderMain(storeID, hostEval)), 0644); err != nil {
