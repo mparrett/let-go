@@ -1,0 +1,89 @@
+name: Parity trial (fork experiment)
+
+# Throwaway experiment on the fork, never proposed upstream as-is. It answers one
+# question: can a free shared runner finish `make parity-check` in acceptable wall
+# time, and does the result stop tracking machine load once the per-defn timeout
+# is generous?
+#
+# Background: the bootstrap-parity gate is deferred out of CI
+# (.github/workflows/go.yml, docs/contribution-policy.md §3). The ir-stress legs
+# fail only into `:stress/timeout`, a wall-clock budget defaulting to 5000ms per
+# defn, so on a contended machine the pass/fail count measures load rather than
+# the diff — the same commit measured fail=0 at 67s and fail=5 at 268s locally.
+# Raising LG_STRESS_TIMEOUT_MS makes counts and bucket hashes load-independent;
+# both engines then agreed at load ~20. This job tests whether that holds on a
+# runner, where the CPU is slower but the machine is dedicated to the job.
+#
+# It gates nothing and must never sit in a PR's path.
+
+# Push-triggered on this experiment branch only. workflow_dispatch would need the
+# file on the default branch, and this is not worth putting on the fork's main.
+on:
+  push:
+    branches: [ci/parity-trial, ci/parity-trial-main]
+
+jobs:
+  parity:
+    # One runner per timeout, so the two arms cannot contend with each other —
+    # contention between them is exactly what would confound the result.
+    strategy:
+      fail-fast: false
+      matrix:
+        timeout_ms: [5000, 60000]
+    name: parity @ timeout=${{ matrix.timeout_ms }}
+    runs-on: ubuntu-latest
+    # Generous, because measuring the ceiling is the point — but bounded, so a
+    # runaway cannot burn a full six-hour slot.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Runner capacity (for reading the timings below)
+        run: |
+          echo "nproc:  $(nproc)"
+          echo "mem:    $(free -h | awk '/^Mem:/{print $2}')"
+          uptime
+
+      - name: make parity-check
+        id: parity
+        env:
+          LG_STRESS_TIMEOUT_MS: ${{ matrix.timeout_ms }}
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          # The suite's own exit code is the finding, not a reason to stop: a
+          # divergence is a result worth reporting, so capture it and keep going.
+          rc=0
+          make "parity-check" 2>&1 | tee parity.log || rc=$?
+          end=$(date +%s)
+          echo "elapsed_s=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Parity trial"
+            echo
+            echo "- target: \`parity-check\`"
+            echo "- \`LG_STRESS_TIMEOUT_MS\`: ${{ matrix.timeout_ms }}"
+            echo "- wall time: ${{ steps.parity.outputs.elapsed_s }}s"
+            echo "- exit code: ${{ steps.parity.outputs.rc }}"
+            echo
+            echo '```'
+            sed -n '/=== clojure-test-suite/,$p' parity.log 2>/dev/null | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parity-log-${{ matrix.timeout_ms }}
+          path: parity.log
