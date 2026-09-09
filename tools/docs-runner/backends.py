@@ -70,11 +70,29 @@ class OpenAICompatBackend:
         if not base_url:
             raise RuntimeError("MODEL_BASE_URL is required for the openai-compat backend")
 
+        # Refuse an empty model here rather than trusting the deploy config or
+        # the remote API to reject it. `model` is an OPTIONAL field for
+        # OpenAI-compatible routers, so an empty value can resolve to an
+        # account default: some other model runs and this harness attributes
+        # the result to the candidate it meant to score. A wrong number that
+        # looks right is the failure an evaluation can least afford.
+        model = os.environ.get("MODEL_NAME", "").strip()
+        if not model:
+            raise RuntimeError(
+                "MODEL_NAME is required for the openai-compat backend and must "
+                "not be empty: an empty model lets the router choose one, and "
+                "the result would be attributed to the wrong model"
+            )
+        self.model = model
+
+        # What the router says it actually served. Requesting a model is not
+        # proof the response came from it.
+        self.resolved_model: str | None = None
+
         self.client = OpenAI(
             base_url=base_url,
             api_key=os.environ.get("MODEL_API_KEY", ""),
         )
-        self.model = os.environ.get("MODEL_NAME", "n/a")
 
     def complete(self, system: str, user: str) -> str:
         response = self.client.chat.completions.create(
@@ -85,6 +103,20 @@ class OpenAICompatBackend:
                 {"role": "user", "content": user},
             ],
         )
+
+        served = getattr(response, "model", None)
+        self.resolved_model = served
+        if served and served != self.model:
+            # Not fatal - a router may legitimately answer with a more specific
+            # id than the one asked for (a dated or quantised variant). But a
+            # score only means something against the model that produced it, so
+            # record which one that was, in the log the run leaves behind.
+            print(
+                f"NOTE: requested model {self.model!r} but the router served "
+                f"{served!r}; attribute results to the latter",
+                flush=True,
+            )
+
         return response.choices[0].message.content or ""
 
 

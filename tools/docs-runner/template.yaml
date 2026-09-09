@@ -149,11 +149,17 @@ docs-runner-eval:
       OpenRouter so several candidate models can be scored on the same commit.
       Dry-run only; never pushes and never holds a GitHub credential.
 
-  # Permitting the name covers the case where the key is stored as a global
-  # secret. The documented path is a runnable-scoped secret, which is permitted
-  # automatically, so for that path this block is a no-op - and it costs nothing
-  # because the permission lives only on this child. See the MANIFEST for why
-  # the name is not in SECRET.
+  # REQUIRED - do not remove. A runnable cannot read a secret at runtime unless
+  # the name is permitted here, and that holds for the documented path too:
+  # Monk's template guide lists the per-runnable `secrets add -r <runnable>`
+  # form and then states the permission is still required. (Monk's secrets
+  # cookbook claims scoped secrets are permitted automatically; the two
+  # contradict each other, and only one reading keeps eval deploys working.)
+  # Remove this block and an eval deploy fails with "Secret not found or
+  # invalid" - an error that points at the secret rather than at the missing
+  # permission. Keeping it costs nothing: the permission lives only on this
+  # child, so the dry and prod entrypoints are unaffected. See the MANIFEST for
+  # why the name is not in SECRET.
   permitted-secrets:
     openrouter-api-key: true
 

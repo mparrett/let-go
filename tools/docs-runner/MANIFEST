@@ -27,9 +27,14 @@ SECRET anthropic-api-key docs-runner-github-token
 #
 #   monk secrets add -r monk-io-letgo/docs-runner-eval openrouter-api-key='sk-or-...'
 #
-# A runnable-scoped secret is automatically permitted and resolves through the
-# same secret("...") call, so it is a real source - just not an agent-collected
-# one. This is the only shape found that scopes collection, not merely injection.
+# The secret resolves through the same secret("...") call, so it is a real
+# source - just not an agent-collected one. This is the only shape found that
+# scopes collection, not merely injection.
+#
+# Scoping the secret to the runnable stores it; it does not grant access to it.
+# docs-runner-eval still needs its `permitted-secrets: openrouter-api-key` entry
+# in template.yaml, and removing that entry breaks every eval deploy. Read the
+# comment there before touching either half.
 
 # tag, runnables that consume it, build context, dockerfile (relative to context).
 # The context is `.` because the MANIFEST sits in the same directory as the

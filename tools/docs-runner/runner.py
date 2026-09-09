@@ -1082,13 +1082,21 @@ def main() -> int:
         )
         return 1
 
+    # Which model actually answered, when the backend can tell us. A score is
+    # only meaningful against the model that produced it, and the requested id
+    # is not proof of the served one.
+    model = getattr(backend, "resolved_model", None) or getattr(
+        backend, "model", backend.name
+    )
+
     url = open_pull_request(cfg, wiki, updated, branch)
     if url:
         emit_status("documented", sha=cfg.source_sha[:12],
-                    pages=len(updated), pr=url)
+                    pages=len(updated), model=model, pr=url)
         log(f"opened {url}")
     else:
-        emit_status("dry-run", sha=cfg.source_sha[:12], pages=len(updated))
+        emit_status("dry-run", sha=cfg.source_sha[:12],
+                    pages=len(updated), model=model)
     return 0
 
 

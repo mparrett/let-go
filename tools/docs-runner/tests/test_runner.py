@@ -519,3 +519,47 @@ def test_short_values_are_not_registered_as_secrets():
     """Redacting a 3-character value would mangle unrelated output."""
     runner.register_secret("abc")
     assert runner.redact("abcdef") == "abcdef"
+
+
+# --------------------------------------------------------------------------
+# Evaluation backend must name its model
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "model_name,why",
+    [
+        (None, "absent"),
+        ("", "empty"),
+        ("   ", "whitespace only"),
+    ],
+)
+def test_openai_compat_refuses_an_unnamed_model(monkeypatch, model_name, why):
+    """An unnamed model must fail before a request is ever sent.
+
+    `model` is optional for OpenAI-compatible routers, so an empty value can
+    resolve to an account default: another model runs and the harness credits
+    the candidate it meant to score. Neither the deploy config nor the remote
+    API can be relied on to catch that, so the process boundary does.
+    """
+    import backends
+
+    monkeypatch.setenv("MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("MODEL_NAME", raising=False)
+    if model_name is not None:
+        monkeypatch.setenv("MODEL_NAME", model_name)
+
+    with pytest.raises(RuntimeError, match="MODEL_NAME"):
+        backends.OpenAICompatBackend()
+
+
+def test_openai_compat_accepts_a_named_model(monkeypatch):
+    import backends
+
+    monkeypatch.setenv("MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("MODEL_NAME", "  qwen/qwen3-235b-a22b-instruct  ")
+    # The client refuses to construct without a credential. That is its own
+    # fail-closed behaviour, and not what this test is about.
+    monkeypatch.setenv("MODEL_API_KEY", "sk-or-test")
+    backend = backends.OpenAICompatBackend()
+    assert backend.model == "qwen/qwen3-235b-a22b-instruct", "surrounding space trimmed"
+    assert backend.resolved_model is None, "nothing served yet"
