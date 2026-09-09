@@ -6,8 +6,17 @@ name: Wiki docs
 # this repository and never merges anything.
 
 on:
-  push:
-    branches: [main]
+  # Manual only, for now. The automatic trigger is deliberately commented out
+  # rather than deleted: this runs a model over every commit and opens pull
+  # requests against another repository, and that should start when someone
+  # decides it should, not the moment this file merges.
+  #
+  # To go automatic, uncomment. Note that `dry_run` below then applies only to
+  # manual runs; a real commit landing on main is the case this exists for, so
+  # it opens a pull request.
+  #
+  # push:
+  #   branches: [main]
   workflow_dispatch:
     inputs:
       sha:
