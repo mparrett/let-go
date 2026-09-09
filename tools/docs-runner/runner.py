@@ -367,7 +367,10 @@ def map_pages(wiki: Path, changed: list[str]) -> tuple[list[Path], list[str]]:
 
     ranked = sorted(hits.items(), key=lambda pair: (-pair[1], str(pair[0])))
     to_edit = [page for page, _ in ranked[:MAX_PAGES_PER_RUN]]
-    return to_edit, uncovered
+    # The total, so the caller can tell "we processed every match, and there
+    # happened to be exactly the cap" from "we dropped some". Comparing the
+    # truncated length against the cap cannot distinguish those.
+    return to_edit, uncovered, len(ranked)
 
 
 # Two- and three-letter tokens ("ir", "vm") collide with too many slugs to be
@@ -631,9 +634,18 @@ def create_page(
         return None
 
     rel = Path(match.group("path").strip().lstrip("/"))
-    # The model chooses the path; make sure its choice stays inside the wiki.
+    # The model chooses the path, so it is checked the same way an existing page
+    # is. Staying inside the wiki and ending in .md is not enough: without the
+    # content-directory allowlist a reply could create `tools/generated.md` or
+    # `.github/generated.md`, and the wiki's own validator only inspects the
+    # content directories - so such a file would be invisible to validation and
+    # still committed and proposed in the pull request.
     target = (wiki / rel).resolve()
-    if not target.is_relative_to(wiki.resolve()) or target.suffix != ".md":
+    if (
+        not target.is_relative_to(wiki.resolve())
+        or target.suffix != ".md"
+        or not is_wiki_content(wiki, target)
+    ):
         log(f"  {path}: SKIPPED, refused page path {rel}")
         return None
     if target.exists():
@@ -1016,7 +1028,7 @@ def main() -> int:
     if baseline:
         log(f"wiki has {len(baseline)} pre-existing validator complaint(s)")
 
-    to_edit, uncovered = map_pages(wiki, changed)
+    to_edit, uncovered, total_matched = map_pages(wiki, changed)
     log(
         f"pages citing changed paths: "
         f"{', '.join(str(p.relative_to(wiki)) for p in to_edit) or '(none)'}"
@@ -1026,8 +1038,10 @@ def main() -> int:
         emit_status("skipped", reason="nothing-to-document", sha=cfg.source_sha[:12])
         return 0
 
-    if len(to_edit) == MAX_PAGES_PER_RUN:
-        note_partial("page-cap-reached", limit=MAX_PAGES_PER_RUN)
+    if total_matched > MAX_PAGES_PER_RUN:
+        note_partial(
+            "page-cap-reached", matched=total_matched, limit=MAX_PAGES_PER_RUN
+        )
     if len(uncovered) > MAX_NEW_PAGES_PER_RUN:
         note_partial(
             "new-page-cap-reached",

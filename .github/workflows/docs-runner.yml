@@ -1,0 +1,91 @@
+name: Docs runner
+
+# Tests for tools/docs-runner. The wiki-docs workflow that uses it is
+# workflow_dispatch-only, so without this job the runner's unit tests never run
+# on a pull request and its credential and pull-request-adoption invariants are
+# not covered by the green checks.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/docs-runner/**'
+      - '.github/workflows/docs-runner.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/docs-runner/**'
+      - '.github/workflows/docs-runner.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tools/docs-runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the interpreter the image pins. A version skew here would
+          # test something the container never runs.
+          python-version: '3.12'
+
+      - name: Install the locked dependencies
+        # The same lock the image installs, so a dependency that resolves here
+        # but not there (or vice versa) shows up as a failure rather than a
+        # surprise at deploy time.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run the tests
+        # Offline by design: no clones, no GitHub, no model calls. A failure
+        # here is a real regression, not a flaky network.
+        run: pytest tests/ -q
+
+  build:
+    name: image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t docs-runner:ci tools/docs-runner
+
+      - name: Assert the image is linux/amd64
+        # The base image is pinned to the amd64 manifest on purpose: deploy
+        # targets are x86_64 while development is Apple Silicon. Pinning the
+        # arm64 manifest by mistake once produced an image that ran locally and
+        # died on a droplet with "exec format error", which nothing local could
+        # have caught. This turns that into a checked property.
+        run: |
+          set -euo pipefail
+          arch=$(docker image inspect docs-runner:ci --format '{{.Architecture}}')
+          echo "built architecture: $arch"
+          if [ "$arch" != "amd64" ]; then
+            echo "::error::expected amd64, got $arch" >&2
+            exit 1
+          fi
+
+      - name: Assert every dependency imports
+        # --no-deps means pip installs exactly the lock and nothing else, so a
+        # missing transitive dependency surfaces at import time rather than in
+        # the middle of a run.
+        run: |
+          docker run --rm --entrypoint python docs-runner:ci -c \
+            'import anthropic, openai, yaml, markdown_it; print("imports ok")'

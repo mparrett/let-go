@@ -563,3 +563,125 @@ def test_openai_compat_accepts_a_named_model(monkeypatch):
     backend = backends.OpenAICompatBackend()
     assert backend.model == "qwen/qwen3-235b-a22b-instruct", "surrounding space trimmed"
     assert backend.resolved_model is None, "nothing served yet"
+
+
+# --------------------------------------------------------------------------
+# A generated page cannot escape the content directories
+# --------------------------------------------------------------------------
+
+CREATE_REPLY_TEMPLATE = """PATH: {path}
+SUMMARY: a summary
+---
+type: Concept
+category: concept
+title: "Escaped"
+description: "A page the model placed outside the content directories."
+tags: [compiler]
+resource: "https://example.com"
+sources: ["test"]
+created: "2026-09-09"
+updated: "2026-09-09"
+status: speculative
+---
+
+# Escaped
+"""
+
+
+class _FixedBackend:
+    """Returns one canned reply, standing in for a model."""
+
+    name = "fixed"
+
+    def __init__(self, reply):
+        self.reply = reply
+
+    def complete(self, system, user):
+        return self.reply
+
+
+def _create_page_at(monkeypatch, tmp_path, target_path):
+    """Run create_page with a model reply naming target_path. Returns the result."""
+    wiki = tmp_path / "wiki"
+    (wiki / "_meta").mkdir(parents=True)
+    (wiki / "index.md").write_text("# Index\n\n## Concepts\n")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "thing.go").write_text("package thing\n")
+
+    _set_env(monkeypatch, DRY_RUN="true")
+    cfg = runner.Config.from_env()
+    backend = _FixedBackend(CREATE_REPLY_TEMPLATE.format(path=target_path))
+    return backend, runner.create_page(
+        backend, "thing.go", source, wiki, "AGENTS", "TAXONOMY", cfg, "msg", "diff"
+    ), wiki
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tools/generated.md",
+        ".github/generated.md",
+        "_meta/generated.md",
+        "generated.md",
+        "docs/generated.md",
+    ],
+)
+def test_create_page_refuses_paths_outside_content_dirs(monkeypatch, tmp_path, target):
+    """The model picks the path, so it gets the same allowlist an edit does.
+
+    Staying inside the wiki and ending in .md is not enough. The wiki's own
+    validator only inspects the content directories, so a file placed elsewhere
+    would be invisible to validation and still committed into the pull request.
+    """
+    _, created, wiki = _create_page_at(monkeypatch, tmp_path, target)
+    assert created is None, f"{target} should be refused"
+    assert not (wiki / target).exists(), "nothing should be written"
+
+
+def test_create_page_allows_a_content_directory(monkeypatch, tmp_path):
+    _, created, wiki = _create_page_at(monkeypatch, tmp_path, "concepts/generated.md")
+    assert created is not None
+    assert created == wiki / "concepts" / "generated.md"
+    assert created.read_text().startswith("---\n")
+
+
+# --------------------------------------------------------------------------
+# The page cap marks a run partial only when something was actually dropped
+# --------------------------------------------------------------------------
+
+def _wiki_with_pages(tmp_path, count):
+    """A wiki whose N concept pages each cite a distinct changed file."""
+    wiki = tmp_path / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    changed = []
+    for i in range(count):
+        path = f"pkg/thing{i}.go"
+        changed.append(path)
+        (wiki / "concepts" / f"page{i}.md").write_text(
+            f'---\ntitle: "Page {i}"\nsources: ["{path}"]\n---\n\n# Page {i}\n'
+        )
+    return wiki, changed
+
+
+@pytest.mark.parametrize(
+    "matches,expect_truncated",
+    [
+        (runner.MAX_PAGES_PER_RUN - 1, False),
+        (runner.MAX_PAGES_PER_RUN, False),      # exactly the cap: nothing dropped
+        (runner.MAX_PAGES_PER_RUN + 1, True),
+    ],
+)
+def test_page_cap_reports_the_true_match_count(tmp_path, matches, expect_truncated):
+    """Exactly-at-the-cap is complete, not partial.
+
+    Comparing the truncated list's length against the cap cannot tell "we
+    processed every match, and there were exactly five" from "we dropped some",
+    so the total is returned separately.
+    """
+    wiki, changed = _wiki_with_pages(tmp_path, matches)
+    to_edit, _uncovered, total = runner.map_pages(wiki, changed)
+
+    assert total == matches, "the total counts matches, not survivors"
+    assert len(to_edit) == min(matches, runner.MAX_PAGES_PER_RUN)
+    assert (total > runner.MAX_PAGES_PER_RUN) is expect_truncated

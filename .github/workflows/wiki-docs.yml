@@ -49,6 +49,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Everything both modes need. The wiki write token is deliberately NOT here
+    # -- see the two run steps below.
+    env:
+      SOURCE_REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ inputs.sha || github.sha }}
+      WIKI_REPO: ${{ vars.WIKI_REPO || 'mparrett/let-go-wiki' }}
+      WIKI_BASE_BRANCH: ${{ vars.WIKI_BASE_BRANCH || 'main' }}
+      MODEL_BACKEND: anthropic
+      MODEL_NAME: ${{ vars.MODEL_NAME || 'claude-opus-5' }}
+      MODEL_EFFORT: ${{ vars.MODEL_EFFORT || 'high' }}
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,21 +74,37 @@ jobs:
         # do rather than one shaped by the build host.
         run: docker build -t docs-runner:ci tools/docs-runner
 
-      - name: Document the commit
+      # Two steps rather than one with a conditional token, because a dry run
+      # must not merely decline to USE the wiki credential -- it must not have
+      # it. An empty or ignored variable is still readable by every dependency
+      # and subprocess in the container, and this job runs the wiki's own
+      # check_wiki.py, which is code from another repository. So the token is
+      # scoped to the step that actually needs it, and the dry-run step's
+      # environment does not contain it at all.
+      #
+      # `env:` keys cannot be made conditional, which is why this is a step
+      # split rather than an expression.
+
+      - name: Document the commit (dry run)
+        if: ${{ inputs.dry_run }}
         env:
-          SOURCE_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ inputs.sha || github.sha }}
-          WIKI_REPO: ${{ vars.WIKI_REPO || 'mparrett/let-go-wiki' }}
-          WIKI_BASE_BRANCH: ${{ vars.WIKI_BASE_BRANCH || 'main' }}
-          MODEL_BACKEND: anthropic
-          MODEL_NAME: ${{ vars.MODEL_NAME || 'claude-opus-5' }}
-          MODEL_EFFORT: ${{ vars.MODEL_EFFORT || 'high' }}
-          # A manual run defaults to a dry run; a real commit landing on main
-          # is what this exists to document, so that opens a pull request.
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          # Needs contents:write and pull-requests:write on the WIKI repository
-          # only. This repository is public and is cloned unauthenticated, so
-          # the token needs no access to it.
+          DRY_RUN: "true"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e SOURCE_REPO -e SOURCE_SHA -e WIKI_REPO -e WIKI_BASE_BRANCH \
+            -e MODEL_BACKEND -e MODEL_NAME -e MODEL_EFFORT -e DRY_RUN \
+            -e ANTHROPIC_API_KEY \
+            docs-runner:ci 2>&1 | tee run.log
+
+      - name: Document the commit
+        if: ${{ !inputs.dry_run }}
+        env:
+          DRY_RUN: "false"
+          # Contents and pull-requests write on the WIKI repository only. This
+          # repository is public and is cloned unauthenticated, so the token
+          # needs no access to it.
           WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
