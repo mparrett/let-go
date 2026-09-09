@@ -1,0 +1,15 @@
+# The build context is this directory (see the IMAGE line in MANIFEST), so
+# everything here is sent to the builder. None of the below is COPYed into the
+# image; excluding it keeps the context small and stops a local cache directory
+# from busting the build cache.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+tests/
+
+# Monk's own files. They describe how to deploy the image, not what goes in it.
+MANIFEST
+template.yaml

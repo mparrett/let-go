@@ -1,0 +1,108 @@
+name: Wiki docs
+
+# Keep the let-go wiki in step with this repository: when a commit lands, work
+# out which wiki pages it affects, draft the updates with a model, and open a
+# pull request against the wiki for a human to review. The job never writes to
+# this repository and never merges anything.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to document (defaults to the triggering commit)
+        required: false
+        type: string
+      dry_run:
+        description: Build the branch without pushing or opening a pull request
+        required: false
+        default: true
+        type: boolean
+
+# Read-only here. Writing to the wiki uses a separate token (see WIKI_TOKEN
+# below); GITHUB_TOKEN is scoped to this repository and cannot push to another.
+permissions:
+  contents: read
+
+# Serialised, and deliberately NOT cancel-in-progress. A superseded run may
+# already have pushed a branch to the wiki, and cancelling it mid-flight would
+# leave that branch behind with no pull request attached. The runner recovers
+# from that on the next attempt, but not creating the mess is cheaper than
+# recovering from it. Doc runs are infrequent, so queueing costs little.
+concurrency:
+  group: wiki-docs
+  cancel-in-progress: false
+
+jobs:
+  document:
+    name: document commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only the runner sources are needed. The job clones the commit it is
+          # documenting itself, at the depth it needs.
+          fetch-depth: 1
+
+      - name: Build the runner image
+        # ubuntu-latest is x86_64, which is what the Dockerfile's base digest
+        # pins. See the comment on its FROM line: that digest is deliberately
+        # the amd64 manifest, so this builds the same image the deploy targets
+        # do rather than one shaped by the build host.
+        run: docker build -t docs-runner:ci tools/docs-runner
+
+      - name: Document the commit
+        env:
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.sha || github.sha }}
+          WIKI_REPO: ${{ vars.WIKI_REPO || 'mparrett/let-go-wiki' }}
+          WIKI_BASE_BRANCH: ${{ vars.WIKI_BASE_BRANCH || 'main' }}
+          MODEL_BACKEND: anthropic
+          MODEL_NAME: ${{ vars.MODEL_NAME || 'claude-opus-5' }}
+          MODEL_EFFORT: ${{ vars.MODEL_EFFORT || 'high' }}
+          # A manual run defaults to a dry run; a real commit landing on main
+          # is what this exists to document, so that opens a pull request.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          # Needs contents:write and pull-requests:write on the WIKI repository
+          # only. This repository is public and is cloned unauthenticated, so
+          # the token needs no access to it.
+          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e SOURCE_REPO -e SOURCE_SHA -e WIKI_REPO -e WIKI_BASE_BRANCH \
+            -e MODEL_BACKEND -e MODEL_NAME -e MODEL_EFFORT -e DRY_RUN \
+            -e GITHUB_TOKEN="$WIKI_TOKEN" \
+            -e ANTHROPIC_API_KEY \
+            docs-runner:ci 2>&1 | tee run.log
+
+      - name: Summarise the outcome
+        # The job exits 0 for outcomes that are not failures -- a commit with
+        # nothing to document, or one deliberately skipped -- so the exit code
+        # alone cannot answer "was this commit documented?". The runner emits a
+        # single status line for exactly this; surface it rather than making
+        # someone read the log.
+        if: always()
+        run: |
+          set -uo pipefail
+          status=$(grep '^DOCS_RUNNER_STATUS' run.log | tail -1 || true)
+          if [ -z "$status" ]; then
+            echo "No status line found - the run did not reach a terminal state." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "\`$status\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the log
+        # Logs are the only durable record of what the model was asked and what
+        # it decided; the container and its clones are gone by now.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-runner-log-${{ github.run_id }}
+          path: run.log
+          retention-days: 14

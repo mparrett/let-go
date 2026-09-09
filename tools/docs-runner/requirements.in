@@ -1,0 +1,14 @@
+# Direct dependencies. requirements.txt is the fully pinned lock compiled from
+# this file; the image installs the lock, never this.
+#
+# Regenerate after editing:
+#   uv pip compile --no-header --python-version 3.12 \
+#       requirements.in -o requirements.txt
+
+anthropic>=1.0
+openai>=1.0
+
+# Only what the wiki's own validator (tools/check_wiki.py) imports, so the job
+# can run it without a network fetch mid-run. Not the wiki's full requirements.
+PyYAML>=6.0
+markdown-it-py>=3.0
