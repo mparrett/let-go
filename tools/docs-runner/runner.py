@@ -527,7 +527,8 @@ Rules:
 - Cite the source file in `resource` and `sources`.
 - Set both `created` and `updated` to the date given.
 - Choose the directory per AGENTS.md: concepts/ (how it works), entities/ (the \
-  things), projects/, ideas/, references/.
+  things), sources/ (a summary page for one ingested source file), projects/, \
+  ideas/, references/. These are the only permitted directories.
 - Tags MUST come from the tag taxonomy reproduced below. Max 5.
 - Respond with EXACTLY this shape and nothing else:
 
@@ -665,13 +666,35 @@ def create_page(
     return target
 
 
+def _entry_slug(line: str) -> str:
+    """The wiki slug a catalog line points at, or '' if the line is not one."""
+    match = re.match(r"-\s+\[([^\]]+)\]", line.strip())
+    return match.group(1) if match else ""
+
+
 def add_index_entry(wiki: Path, rel: Path, summary: str) -> None:
-    """Add the page's catalog line to index.md, under its category if we can find it.
+    """Add the page's catalog line to index.md, under its Full catalog heading.
 
     AGENTS.md documents this line as `[[path/slug]] — summary`, but index.md is
     written with ordinary markdown links and check_wiki.py's orphan detector
     only counts those - a page added in the documented form is reported as an
     orphan. Follow the file, not the doc.
+
+    Two things here are deliberate, both learned from the first real run putting
+    an entry between the `---` rule and the `# Full catalog` heading, in no
+    section at all:
+
+    - The heading match is EXACT, not a substring. index.md opens with a
+      human-facing navigation map whose headings share their wording with the
+      catalog's below it: `## Sources & provenance` vs `## Sources`, and
+      `## Roadmap & ideas` vs `## Ideas`. A substring match binds to whichever
+      appears first, which is always the map.
+    - Only list items move the insertion point. A section can open with prose,
+      and matching "any non-blank line" walks the entry out of the section
+      entirely, past a trailing horizontal rule.
+
+    Neither mistake is visible to the validator: the link exists either way, so
+    the page is not reported as an orphan.
     """
     index = wiki / "index.md"
     if not index.exists():
@@ -679,26 +702,37 @@ def add_index_entry(wiki: Path, rel: Path, summary: str) -> None:
     slug = rel.with_suffix("").as_posix()
     entry = f"- [{slug}]({rel.as_posix()}) — {summary}"
     lines = index.read_text(encoding="utf-8").splitlines()
-    category = rel.parts[0].rstrip("s") if rel.parts else ""
+    directory = rel.parts[0].lower() if rel.parts else ""
 
-    # Find the heading for this category, then the last list item beneath it.
     start = next(
         (
-            i for i, line in enumerate(lines)
-            if line.startswith("#") and category and category in line.lower()
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("#")
+            and directory
+            and line.lstrip("#").strip().lower() == directory
         ),
         None,
     )
     if start is None:
         lines.append(entry)
-    else:
-        insert = start + 1
-        for i in range(start + 1, len(lines)):
-            if lines[i].startswith("#"):
-                break
-            if lines[i].strip():
-                insert = i + 1
-        lines.insert(insert, entry)
+        index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    # Catalog sections are kept in slug order, so insert in place rather than
+    # appending, and stop at the next heading so the entry stays in its section.
+    insert = start + 1
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("#"):
+            break
+        existing = _entry_slug(lines[i])
+        if not existing:
+            continue
+        if existing > slug:
+            insert = i
+            break
+        insert = i + 1
+    lines.insert(insert, entry)
 
     index.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

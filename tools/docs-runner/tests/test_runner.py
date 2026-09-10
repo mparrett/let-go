@@ -685,3 +685,143 @@ def test_page_cap_reports_the_true_match_count(tmp_path, matches, expect_truncat
     assert total == matches, "the total counts matches, not survivors"
     assert len(to_edit) == min(matches, runner.MAX_PAGES_PER_RUN)
     assert (total > runner.MAX_PAGES_PER_RUN) is expect_truncated
+
+
+# --- index.md catalog placement ---------------------------------------------
+#
+# The first real run put its entry between the `---` rule and the `# Full
+# catalog` heading -- in no section at all -- and the validator passed it,
+# because an entry in the wrong place is still a link and so still clears the
+# orphan check. These lock the placement itself.
+
+# The shape that broke it: a navigation map whose headings share their wording
+# with the catalog's, a horizontal rule between the two, and prose under a
+# heading. Trimmed from the real index.md.
+INDEX_WITH_A_NAV_MAP = """\
+# let-go-wiki
+
+## Roadmap & ideas
+[Master Roadmap](ideas/master-plan-roadmap.md) · [JVM Compat](ideas/jvm-compat.md)
+
+## Sources & provenance
+Every page cites where its claims come from. The [Sources](sources/let-go-readme.md)
+section has a summary page per ingested source.
+
+---
+
+# Full catalog
+Exhaustive listing by category.
+
+## Concepts
+- [concepts/exec-context](concepts/exec-context.md) — How the ExecContext carries state.
+
+## Ideas
+- [ideas/jvm-compat](ideas/jvm-compat.md) — A phased plan for Clojure libraries.
+
+## Sources
+- [sources/design-exec-context](sources/design-exec-context.md) — Design for ExecContext.
+- [sources/design-pods](sources/design-pods.md) — Babashka-compatible pods.
+- [sources/let-go-readme](sources/let-go-readme.md) — Official project README.
+"""
+
+
+def _index_section(text: str, heading: str) -> list[str]:
+    """The lines belonging to one heading, up to the next heading."""
+    lines = text.splitlines()
+    start = lines.index(heading)
+    out = []
+    for line in lines[start + 1 :]:
+        if line.startswith("#"):
+            break
+        out.append(line)
+    return out
+
+
+@pytest.mark.parametrize(
+    "rel,heading,decoy",
+    [
+        # Both of these matched the navigation map's heading first under a
+        # substring match, and they are the two directories a docs run
+        # produces most.
+        (Path("sources/design-ir-dynamic-vars.md"), "## Sources", "## Sources & provenance"),
+        (Path("ideas/some-new-idea.md"), "## Ideas", "## Roadmap & ideas"),
+    ],
+)
+def test_index_entry_lands_in_the_catalog_not_the_nav_map(tmp_path, rel, heading, decoy):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "index.md").write_text(INDEX_WITH_A_NAV_MAP, encoding="utf-8")
+
+    runner.add_index_entry(wiki, rel, "A one sentence summary")
+
+    text = (wiki / "index.md").read_text(encoding="utf-8")
+    slug = rel.with_suffix("").as_posix()
+    assert f"- [{slug}]({rel.as_posix()}) — A one sentence summary" in text
+
+    catalog = _index_section(text, heading)
+    assert any(slug in line for line in catalog), f"entry is missing from {heading}"
+    assert not any(slug in line for line in _index_section(text, decoy)), (
+        f"entry leaked into the navigation map under {decoy}"
+    )
+    # The rule and the catalog heading must stay adjacent: the original defect
+    # inserted between them.
+    assert "\n---\n\n# Full catalog\n" in text
+
+
+def test_index_entry_keeps_the_section_in_slug_order(tmp_path):
+    """Catalog sections are alphabetical, so appending is not good enough."""
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "index.md").write_text(INDEX_WITH_A_NAV_MAP, encoding="utf-8")
+
+    # Sorts between design-exec-context and design-pods.
+    runner.add_index_entry(
+        wiki, Path("sources/design-ir-dynamic-vars.md"), "Dynamic vars"
+    )
+
+    slugs = [
+        runner._entry_slug(line)
+        for line in _index_section(
+            (wiki / "index.md").read_text(encoding="utf-8"), "## Sources"
+        )
+        if runner._entry_slug(line)
+    ]
+    assert slugs == sorted(slugs)
+    assert slugs == [
+        "sources/design-exec-context",
+        "sources/design-ir-dynamic-vars",
+        "sources/design-pods",
+        "sources/let-go-readme",
+    ]
+
+
+def test_index_entry_for_an_unknown_directory_is_appended(tmp_path):
+    """No matching heading is a degraded case, not a crash or a wrong section."""
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "index.md").write_text(INDEX_WITH_A_NAV_MAP, encoding="utf-8")
+
+    runner.add_index_entry(wiki, Path("entities/let-go.md"), "The language")
+
+    text = (wiki / "index.md").read_text(encoding="utf-8")
+    assert text.rstrip().endswith("- [entities/let-go](entities/let-go.md) — The language")
+    assert not any(
+        "entities/let-go" in line
+        for line in _index_section(text, "## Sources & provenance")
+    )
+
+
+def test_index_entry_into_an_empty_section_follows_the_heading(tmp_path):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "index.md").write_text(
+        "# Full catalog\n\n## Sources\n\n## Concepts\n- [concepts/a](concepts/a.md) — A.\n",
+        encoding="utf-8",
+    )
+
+    runner.add_index_entry(wiki, Path("sources/first.md"), "The first one")
+
+    catalog = _index_section(
+        (wiki / "index.md").read_text(encoding="utf-8"), "## Sources"
+    )
+    assert catalog[0] == "- [sources/first](sources/first.md) — The first one"
