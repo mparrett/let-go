@@ -832,3 +832,64 @@ def test_index_entry_into_an_empty_section_follows_the_heading(tmp_path):
         (wiki / "index.md").read_text(encoding="utf-8"), "## Sources"
     )
     assert catalog[0] == "- [sources/first](sources/first.md) — The first one"
+
+
+# --- a page that is frontmatter and nothing else ----------------------------
+#
+# Found by evaluating candidate models on a real commit: one returned
+# well-formed frontmatter and stopped. check_wiki.py requires the schema keys
+# but has no opinion about whether a page says anything, so the empty page
+# cleared the validation gate and would have been committed and proposed for
+# review.
+
+FRONTMATTER_ONLY = """\
+---
+type: Concept
+category: concept
+title: "Empty"
+description: "Frontmatter, and no page."
+tags: [compiler]
+resource: "https://example.com"
+sources: ["test"]
+created: "2026-09-10"
+updated: "2026-09-10"
+status: speculative
+---
+"""
+
+
+@pytest.mark.parametrize(
+    "text,expected,why",
+    [
+        (FRONTMATTER_ONLY, True, "frontmatter then nothing"),
+        (FRONTMATTER_ONLY + "\n   \n\t\n", True, "trailing whitespace is not a body"),
+        (FRONTMATTER_ONLY + "\n# Heading\n\nProse.\n", False, "a real page"),
+        # No closing delimiter: malformed rather than empty, and the wiki's
+        # validator reports it. Judging it here would report the wrong defect.
+        ("---\ntype: Concept\nbody without a close\n", False, "unterminated"),
+        ("no frontmatter at all\n", False, "not a page reply"),
+    ],
+)
+def test_is_frontmatter_only(text, expected, why):
+    assert runner.is_frontmatter_only(text) is expected, why
+
+
+def test_create_page_refuses_a_body_less_reply(monkeypatch, tmp_path):
+    wiki = tmp_path / "wiki"
+    (wiki / "_meta").mkdir(parents=True)
+    (wiki / "index.md").write_text("# Index\n\n## Concepts\n")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "thing.go").write_text("package thing\n")
+
+    _set_env(monkeypatch, DRY_RUN="true")
+    cfg = runner.Config.from_env()
+    backend = _FixedBackend(
+        "PATH: concepts/empty.md\nSUMMARY: a summary\n" + FRONTMATTER_ONLY
+    )
+    created = runner.create_page(
+        backend, "thing.go", source, wiki, "AGENTS", "TAXONOMY", cfg, "msg", "diff"
+    )
+
+    assert created is None, "an empty page must not be created"
+    assert not (wiki / "concepts" / "empty.md").exists()
