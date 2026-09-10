@@ -815,7 +815,14 @@ def test_index_entry_into_an_empty_section_follows_the_heading(tmp_path):
     wiki = tmp_path / "wiki"
     wiki.mkdir()
     (wiki / "index.md").write_text(
-        "# Full catalog\n\n## Sources\n\n## Concepts\n- [concepts/a](concepts/a.md) — A.\n",
+        """\
+# Full catalog
+
+## Sources
+
+## Concepts
+- [concepts/a](concepts/a.md) — A.
+""",
         encoding="utf-8",
     )
 
