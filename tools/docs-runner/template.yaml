@@ -1,0 +1,204 @@
+namespace: monk-io-letgo
+
+# Shared definition for both environments. Never an ENTRY itself; the two
+# entrypoints below inherit from it.
+#
+# The GitHub token is deliberately absent here rather than declared and then
+# blanked out in the dry-run child. `inherits` deep-merges maps and `[override]`
+# is only available on connections, depends, and affinity, so a child cannot
+# delete an inherited variable or an inherited permitted-secrets entry. Adding
+# the token only in the child that needs it is the only shape that actually
+# keeps it out of the dry-run container.
+docs-runner:
+  defines: runnable
+  metadata:
+    name: docs-runner
+    description: >-
+      Run-to-completion documentation job. Clones the source repo at a commit,
+      clones the wiki repo, calls the model API, opens a pull request, exits.
+      Monk has no first-class job type, so this is a runnable whose single
+      container is declared non-restarting.
+
+  permitted-secrets:
+    anthropic-api-key: true
+
+  variables:
+    source-repo:
+      type: string
+      value: mparrett/let-go
+      env: SOURCE_REPO
+    # This default exists only so a local test run has a real commit to
+    # document; it is not the commit anyone actually wants documented. Once the
+    # pipeline is wired up, the GitHub Action overrides this per commit.
+    source-sha:
+      type: string
+      value: "14e1746d1b5d39f0132a8cb35e8917922a52e977"
+      env: SOURCE_SHA
+    wiki-repo:
+      type: string
+      value: mparrett/let-go-wiki
+      env: WIKI_REPO
+    wiki-base-branch:
+      type: string
+      value: main
+      env: WIKI_BASE_BRANCH
+    model-backend:
+      type: string
+      value: anthropic
+      env: MODEL_BACKEND
+    # Cost/quality knobs, deployable without touching backends.py. Opus 5 at
+    # high effort is the baseline; claude-sonnet-5 is the cheaper alternative we
+    # measured (roughly 2.5x lower cost and competitive on the same commit).
+    # Effort accepts low, medium, high, xhigh, max.
+    model-name:
+      type: string
+      value: claude-opus-5
+      env: MODEL_NAME
+    model-effort:
+      type: string
+      value: high
+      env: MODEL_EFFORT
+    # Build the branch locally but do not push it. The prod entrypoint below is
+    # the only thing that flips this.
+    dry-run:
+      type: string
+      value: "true"
+      env: DRY_RUN
+    anthropic-api-key:
+      type: string
+      value: <- secret("anthropic-api-key")
+      env: ANTHROPIC_API_KEY
+
+  containers:
+    runner:
+      image: docs-runner
+      # The job is supposed to exit. Without this, a clean exit(0) looks like a
+      # crash and the container is started again, re-running the whole job.
+      restart: 'no'
+
+  # Same reason at the runnable level: a finished job must not be treated as a
+  # failure worth recovering from.
+  recovery:
+    when: none
+
+  # No volumes on purpose: both clones live in the container's /work scratch
+  # space and must not outlive the run.
+
+# Entrypoint for ENV dry. Clones both public repos anonymously, generates pages,
+# commits to a local branch, stops.
+#
+# It adds nothing to the base, and that absence is the point: no github-token
+# variable, so GITHUB_TOKEN is never set in the container, and no
+# docs-runner-github-token permission, so the runnable could not read the secret
+# even if something asked for it. That is the configuration half of what
+# Config.may_authenticate already enforces in code.
+docs-runner-dry:
+  defines: runnable
+  inherits: monk-io-letgo/docs-runner
+  metadata:
+    name: docs-runner-dry
+    description: >-
+      Dry-run entrypoint. Generates the branch locally and never pushes, never
+      calls the GitHub API, and is never given a GitHub credential.
+
+# Entrypoint for ENV prod. Pushes the branch and opens the pull request, so this
+# is the only entrypoint that carries the token.
+docs-runner-prod:
+  defines: runnable
+  inherits: monk-io-letgo/docs-runner
+  metadata:
+    name: docs-runner-prod
+    description: >-
+      Production entrypoint. Pushes the generated branch and opens a pull
+      request against the wiki repo.
+
+  permitted-secrets:
+    docs-runner-github-token: true
+
+  variables:
+    dry-run:
+      type: string
+      value: "false"
+      env: DRY_RUN
+    github-token:
+      type: string
+      value: <- secret("docs-runner-github-token")
+      env: GITHUB_TOKEN
+
+# Entrypoint for ENV eval. An evaluation harness, not a production path: it
+# points the generic OpenAI-compatible backend at OpenRouter so candidate
+# open-weights models (Qwen, Llama, DeepSeek, Mistral, and Claude through the
+# same endpoint) can be scored with the wiki's own validator before anyone rents
+# a GPU and stands up vLLM.
+#
+# It deliberately does not override dry-run, so it inherits DRY_RUN=true from
+# the base and, like docs-runner-dry, is never permitted to read the GitHub
+# token. Scoring a candidate model must not be able to open a pull request.
+#
+# The native `anthropic` backend remains the production path for Claude: it uses
+# adaptive thinking, effort, and server-side refusal fallbacks that a generic
+# chat-completions call cannot express. Numbers from this entrypoint rank
+# candidates against each other; they do not judge the shipped pipeline.
+docs-runner-eval:
+  defines: runnable
+  inherits: monk-io-letgo/docs-runner
+  metadata:
+    name: docs-runner-eval
+    description: >-
+      Evaluation entrypoint. Runs the OpenAI-compatible backend against
+      OpenRouter so several candidate models can be scored on the same commit.
+      Dry-run only; never pushes and never holds a GitHub credential.
+
+  # REQUIRED - do not remove. A runnable cannot read a secret at runtime unless
+  # the name is permitted here, and that holds for the documented path too:
+  # Monk's template guide lists the per-runnable `secrets add -r <runnable>`
+  # form and then states the permission is still required. (Monk's secrets
+  # cookbook claims scoped secrets are permitted automatically; the two
+  # contradict each other, and only one reading keeps eval deploys working.)
+  # Remove this block and an eval deploy fails with "Secret not found or
+  # invalid" - an error that points at the secret rather than at the missing
+  # permission. Keeping it costs nothing: the permission lives only on this
+  # child, so the dry and prod entrypoints are unaffected. See the MANIFEST for
+  # why the name is not in SECRET.
+  permitted-secrets:
+    openrouter-api-key: true
+
+  variables:
+    model-backend:
+      type: string
+      value: openai-compat
+      env: MODEL_BACKEND
+    model-base-url:
+      type: string
+      value: https://openrouter.ai/api/v1
+      env: MODEL_BASE_URL
+    model-api-key:
+      type: string
+      value: <- secret("openrouter-api-key")
+      env: MODEL_API_KEY
+    # Blanked on purpose. MODEL_NAME is shared by all three backends and the
+    # base sets it to claude-opus-5, which is meaningless to OpenRouter - its
+    # ids are vendor-qualified (`anthropic/claude-opus-4`,
+    # `qwen/qwen3-235b-a22b-instruct`). Inheriting that value would quietly ask
+    # OpenRouter for a model id that does not exist there, so this entrypoint
+    # carries no default at all: every eval run names its model with
+    # `-s model-name=...`, which is the same knob a sweep varies anyway.
+    # A child cannot delete an inherited variable, so an empty required value is
+    # the closest available thing to "unset".
+    model-name:
+      type: string
+      value: ""
+      required: true
+      env: MODEL_NAME
+    # The Anthropic path hardcodes 64000 in backends.py; most OpenRouter models
+    # cap output far below that. Declared here rather than left to the code
+    # default so it is visible and sweepable.
+    model-max-tokens:
+      type: string
+      value: "16000"
+      env: MODEL_MAX_TOKENS
+
+  # Two inherited values are inert on this path and cannot be removed, since
+  # `inherits` cannot delete: MODEL_EFFORT (read only by the Anthropic backend)
+  # and ANTHROPIC_API_KEY (unread by OpenAICompatBackend, which takes its
+  # credential from MODEL_API_KEY).
