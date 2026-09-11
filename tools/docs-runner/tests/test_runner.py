@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import backends
 import runner
 
 
@@ -24,6 +25,7 @@ def _reset_run_state(monkeypatch):
     """The status contract is module state; keep tests independent of order."""
     monkeypatch.setattr(runner, "_PARTIAL_REASONS", [])
     monkeypatch.setattr(runner, "_REDACTIONS", [])
+    monkeypatch.setattr(runner, "_BACKEND", None)
 
 
 # --------------------------------------------------------------------------
@@ -898,3 +900,85 @@ def test_create_page_refuses_a_body_less_reply(monkeypatch, tmp_path):
 
     assert created is None, "an empty page must not be created"
     assert not (wiki / "concepts" / "empty.md").exists()
+
+
+# --- token accounting ------------------------------------------------------
+#
+# Added so a model sweep can cost its runs from the logs instead of inferring
+# tokens from output byte counts. The case worth protecting is the difference
+# between "this backend used no tokens" and "this backend cannot say".
+
+def test_usage_accumulates_across_calls():
+    """A run makes several calls; the status line reports the run, not the last."""
+    u = backends.Usage()
+    u.record(1000, 200)
+    u.record(500, 100)
+
+    assert u.calls == 2
+    assert u.input_tokens == 1500
+    assert u.output_tokens == 300
+    assert u.status_fields() == {"calls": 2, "in_tokens": 1500, "out_tokens": 300}
+
+
+def test_unavailable_usage_is_not_counted_as_zero():
+    """The CLI backend cannot report tokens, and must not look like it used none.
+
+    Reporting in_tokens=0 would be a lie shaped exactly like a measurement, and
+    a comparison built on it would silently believe the cheapest model was free.
+    """
+    u = backends.Usage()
+    u.record(None, None)
+
+    assert u.calls == 1
+    assert u.calls_without_usage == 1
+    assert u.status_fields()["calls_missing_usage"] == 1
+
+
+def test_partial_usage_marks_the_totals_incomplete():
+    """One call without accounting taints the total, so the total says so."""
+    u = backends.Usage()
+    u.record(1000, 200)
+    u.record(None, None)
+
+    fields = u.status_fields()
+    assert fields["in_tokens"] == 1000, "known calls still count"
+    assert fields["calls"] == 2
+    assert fields["calls_missing_usage"] == 1
+
+
+def test_usage_is_silent_when_every_call_reported():
+    """No noise on the status line for the ordinary case."""
+    u = backends.Usage()
+    u.record(10, 20)
+    assert "calls_missing_usage" not in u.status_fields()
+
+
+def test_failed_status_still_reports_what_the_run_spent(capsys):
+    """A failed run still cost money.
+
+    Reporting tokens only on success would under-count exactly the runs worth
+    investigating -- a model that burns its budget and then trips the validator
+    is the expensive case, not the cheap one.
+    """
+    backend = backends.OpenAICompatBackend.__new__(backends.OpenAICompatBackend)
+    backend.usage = backends.Usage()
+    backend.usage.record(4000, 900)
+    runner.set_backend(backend)
+
+    runner.emit_status("failed", reason="validation-regressed", new_errors=1)
+
+    line = capsys.readouterr().out.strip()
+    assert "action=failed" in line
+    assert "in_tokens=4000" in line and "out_tokens=900" in line and "calls=1" in line
+
+
+def test_status_omits_usage_when_no_call_was_made(capsys):
+    """A run that exited before the model is not a run that cost zero."""
+    backend = backends.OpenAICompatBackend.__new__(backends.OpenAICompatBackend)
+    backend.usage = backends.Usage()
+    runner.set_backend(backend)
+
+    runner.emit_status("skipped", reason="no-files-changed")
+
+    line = capsys.readouterr().out.strip()
+    assert "in_tokens" not in line, "absent, not zero"
