@@ -74,6 +74,17 @@ def note_partial(reason: str, **fields: object) -> None:
     log(f"  incomplete: {reason}{' (' + detail + ')' if detail else ''}")
 
 
+# The backend in use, so every terminal status can report what the run spent.
+# A failed run still cost money, and a cost line that only appears on success
+# would systematically under-count exactly the runs worth investigating.
+_BACKEND: object | None = None
+
+
+def set_backend(backend: object) -> None:
+    global _BACKEND
+    _BACKEND = backend
+
+
 def emit_status(action: str, **fields: object) -> None:
     """Emit THE machine-readable status line. Call once, at the end of a run.
 
@@ -92,6 +103,13 @@ def emit_status(action: str, **fields: object) -> None:
     if _PARTIAL_REASONS:
         parts.append(f"partial_reasons={','.join(_PARTIAL_REASONS)}")
     parts.extend(f"{k}={v}" for k, v in fields.items())
+
+    usage = getattr(_BACKEND, "usage", None)
+    # Omitted entirely when no call was made, rather than reported as zero:
+    # a run that exited before reaching the model did not spend nothing, it
+    # spent nothing *measurable here*, and the absent field says so.
+    if usage is not None and usage.calls:
+        parts.extend(f"{k}={v}" for k, v in usage.status_fields().items())
     log("DOCS_RUNNER_STATUS " + " ".join(parts))
 
 
@@ -1120,6 +1138,7 @@ def main() -> int:
         )
 
     backend = backends.load()
+    set_backend(backend)
 
     updated = [
         page for page in to_edit

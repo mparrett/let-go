@@ -10,11 +10,53 @@ the OpenAI SDK for what it actually is.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import ClassVar, Protocol
+
+
+@dataclass
+class Usage:
+    """Token counts accumulated across every model call in one run.
+
+    A run makes one call per page it edits plus one per new-page decision, so
+    the per-call number is not the interesting one; the run total is, because
+    that is what a cost estimate is built from.
+
+    `calls_without_usage` exists so a backend that *cannot* report tokens is
+    distinguishable from one that used none. Reporting `in=0` for the CLI
+    backend would be a lie shaped exactly like a measurement, and an evaluation
+    comparing models on cost would silently believe it.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calls_without_usage: int = 0
+
+    def record(self, input_tokens: int | None, output_tokens: int | None) -> None:
+        self.calls += 1
+        if input_tokens is None or output_tokens is None:
+            self.calls_without_usage += 1
+            return
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+
+    def status_fields(self) -> dict[str, object]:
+        """The pieces that ride on the run's single terminal status line."""
+        fields: dict[str, object] = {
+            "calls": self.calls,
+            "in_tokens": self.input_tokens,
+            "out_tokens": self.output_tokens,
+        }
+        if self.calls_without_usage:
+            # Say so rather than letting the totals read as complete.
+            fields["calls_missing_usage"] = self.calls_without_usage
+        return fields
 
 
 class Backend(Protocol):
     name: str
+    usage: Usage
 
     def complete(self, system: str, user: str) -> str:
         """Return the model's text response."""
@@ -33,6 +75,7 @@ class AnthropicBackend:
         self.client = Anthropic()
         self.model = os.environ.get("MODEL_NAME", "claude-opus-5")
         self.effort = os.environ.get("MODEL_EFFORT", "high")
+        self.usage = Usage()
 
     def complete(self, system: str, user: str) -> str:
         # Streaming because doc pages routinely run past the non-streaming
@@ -53,6 +96,12 @@ class AnthropicBackend:
             fallbacks="default",
         ) as stream:
             message = stream.get_final_message()
+
+        reported = getattr(message, "usage", None)
+        self.usage.record(
+            getattr(reported, "input_tokens", None),
+            getattr(reported, "output_tokens", None),
+        )
 
         if message.stop_reason == "refusal":
             detail = getattr(message, "stop_details", None)
@@ -94,6 +143,7 @@ class OpenAICompatBackend:
         # What the router says it actually served. Requesting a model is not
         # proof the response came from it.
         self.resolved_model: str | None = None
+        self.usage = Usage()
 
         self.client = OpenAI(
             base_url=base_url,
@@ -108,6 +158,14 @@ class OpenAICompatBackend:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+        )
+
+        # Optional in the OpenAI schema, and some routers omit it, so an
+        # absent block is recorded as unavailable rather than as zero.
+        reported = getattr(response, "usage", None)
+        self.usage.record(
+            getattr(reported, "prompt_tokens", None),
+            getattr(reported, "completion_tokens", None),
         )
 
         served = getattr(response, "model", None)
@@ -148,6 +206,10 @@ class ClaudeCliBackend:
         self.binary = os.environ.get("CLAUDE_CLI", "claude")
         self.model = os.environ.get("MODEL_NAME", "claude-opus-5")
         self.timeout = int(os.environ.get("CLAUDE_CLI_TIMEOUT", "900"))
+        # `--output-format text` returns prose and no accounting, so every call
+        # here counts as usage-unavailable. Recorded rather than skipped so the
+        # call count stays right and the totals are visibly incomplete.
+        self.usage = Usage()
 
     def complete(self, system: str, user: str) -> str:
         import subprocess
@@ -169,6 +231,7 @@ class ClaudeCliBackend:
         result = subprocess.run(
             cmd, input=user, capture_output=True, text=True, timeout=self.timeout
         )
+        self.usage.record(None, None)
         if result.returncode != 0:
             raise RuntimeError(
                 f"claude CLI exited {result.returncode}: {result.stderr.strip()[:2000]}"
