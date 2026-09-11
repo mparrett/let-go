@@ -10,7 +10,7 @@ the OpenAI SDK for what it actually is.
 from __future__ import annotations
 
 import os
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 
 class Backend(Protocol):
@@ -43,7 +43,11 @@ class AnthropicBackend:
             system=system,
             messages=[{"role": "user", "content": user}],
             thinking={"type": "adaptive"},
-            output_config={"effort": self.effort},
+            # MODEL_EFFORT is a deploy-time string, so it cannot satisfy the
+            # SDK's Literal-typed TypedDict statically. Ignored rather than
+            # cast, because importing the beta param type would couple this
+            # file to an SDK path that has already moved once.
+            output_config={"effort": self.effort},  # type: ignore[arg-type]
             # Route around a safety refusal instead of failing the whole run.
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
@@ -68,7 +72,9 @@ class OpenAICompatBackend:
 
         base_url = os.environ.get("MODEL_BASE_URL")
         if not base_url:
-            raise RuntimeError("MODEL_BASE_URL is required for the openai-compat backend")
+            raise RuntimeError(
+                "MODEL_BASE_URL is required for the openai-compat backend"
+            )
 
         # Refuse an empty model here rather than trusting the deploy config or
         # the remote API to reject it. `model` is an OPTIONAL field for
@@ -133,7 +139,7 @@ class ClaudeCliBackend:
 
     # Nothing here needs tools; denying them keeps a prompt that happens to
     # read like an instruction from touching the filesystem.
-    DENIED_TOOLS = [
+    DENIED_TOOLS: ClassVar[list[str]] = [
         "Bash", "Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep",
         "WebFetch", "WebSearch", "Task", "Agent",
     ]
