@@ -330,7 +330,9 @@ def page_covers(citations: str, path: str) -> bool:
     )
 
 
-def map_pages(wiki: Path, changed: list[str]) -> tuple[list[Path], list[str]]:
+def map_pages(
+    wiki: Path, changed: list[str]
+) -> tuple[list[Path], list[str], int]:
     """Split the commit into (pages to edit, source paths nothing documents).
 
     The wiki's own schema requires every page to cite where its claims come

@@ -43,7 +43,11 @@ class AnthropicBackend:
             system=system,
             messages=[{"role": "user", "content": user}],
             thinking={"type": "adaptive"},
-            output_config={"effort": self.effort},
+            # MODEL_EFFORT is a deploy-time string, so it cannot satisfy the
+            # SDK's Literal-typed TypedDict statically. Ignored rather than
+            # cast, because importing the beta param type would couple this
+            # file to an SDK path that has already moved once.
+            output_config={"effort": self.effort},  # type: ignore[arg-type]
             # Route around a safety refusal instead of failing the whole run.
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
