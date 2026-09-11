@@ -1,14 +1,19 @@
 namespace: monk-io-letgo
 
-# Shared definition for both environments. Never an ENTRY itself; the two
-# entrypoints below inherit from it.
+# Provider-neutral base, shared by all three environments. Never an ENTRY
+# itself; every entrypoint below reaches it, either directly or through the
+# docs-runner-anthropic layer.
 #
-# The GitHub token is deliberately absent here rather than declared and then
-# blanked out in the dry-run child. `inherits` deep-merges maps and `[override]`
-# is only available on connections, depends, and affinity, so a child cannot
-# delete an inherited variable or an inherited permitted-secrets entry. Adding
-# the token only in the child that needs it is the only shape that actually
-# keeps it out of the dry-run container.
+# Nothing provider-specific lives here. `inherits` deep-merges maps and
+# `[override]` is only available on connections, depends, and affinity, so a
+# child can neither delete an inherited variable nor delete an inherited
+# permitted-secrets entry. Declaring something here and blanking it out in a
+# child that does not want it is therefore not possible, which is the reason for
+# the whole structure: anything only some children need is declared only on the
+# branch that needs it. That is why the GitHub token appears solely on
+# docs-runner-prod, and why the Anthropic credential, model backend, model name,
+# and effort knob sit on docs-runner-anthropic rather than here - the eval
+# entrypoint inherits this base directly and so is never handed either.
 docs-runner:
   defines: runnable
   metadata:
@@ -18,9 +23,6 @@ docs-runner:
       clones the wiki repo, calls the model API, opens a pull request, exits.
       Monk has no first-class job type, so this is a runnable whose single
       container is declared non-restarting.
-
-  permitted-secrets:
-    anthropic-api-key: true
 
   variables:
     source-repo:
@@ -42,32 +44,12 @@ docs-runner:
       type: string
       value: main
       env: WIKI_BASE_BRANCH
-    model-backend:
-      type: string
-      value: anthropic
-      env: MODEL_BACKEND
-    # Cost/quality knobs, deployable without touching backends.py. Opus 5 at
-    # high effort is the baseline; claude-sonnet-5 is the cheaper alternative we
-    # measured (roughly 2.5x lower cost and competitive on the same commit).
-    # Effort accepts low, medium, high, xhigh, max.
-    model-name:
-      type: string
-      value: claude-opus-5
-      env: MODEL_NAME
-    model-effort:
-      type: string
-      value: high
-      env: MODEL_EFFORT
     # Build the branch locally but do not push it. The prod entrypoint below is
     # the only thing that flips this.
     dry-run:
       type: string
       value: "true"
       env: DRY_RUN
-    anthropic-api-key:
-      type: string
-      value: <- secret("anthropic-api-key")
-      env: ANTHROPIC_API_KEY
 
   containers:
     runner:
@@ -84,17 +66,59 @@ docs-runner:
   # No volumes on purpose: both clones live in the container's /work scratch
   # space and must not outlive the run.
 
+# Anthropic layer. Never an ENTRY itself; the dry and prod entrypoints below
+# inherit from it, and the eval entrypoint deliberately does not.
+#
+# Everything specific to the native Anthropic backend lives here rather than in
+# the base for the reason spelled out above: a child cannot delete what it
+# inherits, so the only way for docs-runner-eval to be free of ANTHROPIC_API_KEY
+# and MODEL_EFFORT is for those never to reach it.
+docs-runner-anthropic:
+  defines: runnable
+  inherits: monk-io-letgo/docs-runner
+  metadata:
+    name: docs-runner-anthropic
+    description: >-
+      Anthropic-backed layer. Adds the native `anthropic` backend, its model and
+      effort settings, and the API credential. Never an ENTRY itself; the dry
+      and prod entrypoints inherit from it.
+
+  permitted-secrets:
+    anthropic-api-key: true
+
+  variables:
+    model-backend:
+      type: string
+      value: anthropic
+      env: MODEL_BACKEND
+    # Cost/quality knobs, deployable without touching backends.py. Opus 5 at
+    # high effort is the baseline; claude-sonnet-5 is the cheaper alternative we
+    # measured (roughly 2.5x lower cost and competitive on the same commit).
+    # Effort accepts low, medium, high, xhigh, max.
+    model-name:
+      type: string
+      value: claude-opus-5
+      env: MODEL_NAME
+    model-effort:
+      type: string
+      value: high
+      env: MODEL_EFFORT
+    anthropic-api-key:
+      type: string
+      value: <- secret("anthropic-api-key")
+      env: ANTHROPIC_API_KEY
+
 # Entrypoint for ENV dry. Clones both public repos anonymously, generates pages,
 # commits to a local branch, stops.
 #
-# It adds nothing to the base, and that absence is the point: no github-token
-# variable, so GITHUB_TOKEN is never set in the container, and no
+# It adds nothing to docs-runner-anthropic, and that absence is the point: no
+# github-token variable, so GITHUB_TOKEN is never set in the container, and no
 # docs-runner-github-token permission, so the runnable could not read the secret
 # even if something asked for it. That is the configuration half of what
 # Config.may_authenticate already enforces in code.
 docs-runner-dry:
   defines: runnable
-  inherits: monk-io-letgo/docs-runner
+  inherits: monk-io-letgo/docs-runner-anthropic
   metadata:
     name: docs-runner-dry
     description: >-
@@ -105,7 +129,7 @@ docs-runner-dry:
 # is the only entrypoint that carries the token.
 docs-runner-prod:
   defines: runnable
-  inherits: monk-io-letgo/docs-runner
+  inherits: monk-io-letgo/docs-runner-anthropic
   metadata:
     name: docs-runner-prod
     description: >-
@@ -176,15 +200,14 @@ docs-runner-eval:
       type: string
       value: <- secret("openrouter-api-key")
       env: MODEL_API_KEY
-    # Blanked on purpose. MODEL_NAME is shared by all three backends and the
-    # base sets it to claude-opus-5, which is meaningless to OpenRouter - its
-    # ids are vendor-qualified (`anthropic/claude-opus-4`,
-    # `qwen/qwen3-235b-a22b-instruct`). Inheriting that value would quietly ask
-    # OpenRouter for a model id that does not exist there, so this entrypoint
-    # carries no default at all: every eval run names its model with
-    # `-s model-name=...`, which is the same knob a sweep varies anyway.
-    # A child cannot delete an inherited variable, so an empty required value is
-    # the closest available thing to "unset".
+    # Declared with no default on purpose. MODEL_NAME is shared by all three
+    # backends, but there is no sensible eval default: OpenRouter ids are
+    # vendor-qualified (`anthropic/claude-opus-4`,
+    # `qwen/qwen3-235b-a22b-instruct`), and picking one would silently privilege
+    # a single candidate in a harness whose entire job is to compare them. So
+    # every eval run must name its model with `-s model-name=...`, which is the
+    # same knob a sweep varies anyway; `required: true` over an empty value is
+    # what makes forgetting it an error rather than a mystery 404.
     model-name:
       type: string
       value: ""
@@ -198,7 +221,10 @@ docs-runner-eval:
       value: "16000"
       env: MODEL_MAX_TOKENS
 
-  # Two inherited values are inert on this path and cannot be removed, since
-  # `inherits` cannot delete: MODEL_EFFORT (read only by the Anthropic backend)
-  # and ANTHROPIC_API_KEY (unread by OpenAICompatBackend, which takes its
-  # credential from MODEL_API_KEY).
+  # This entrypoint inherits the provider-neutral base directly, not
+  # docs-runner-anthropic, and that is load-bearing: it is the only reason
+  # MODEL_EFFORT (read only by the Anthropic backend) and ANTHROPIC_API_KEY
+  # (unread by OpenAICompatBackend, which takes its credential from
+  # MODEL_API_KEY) are absent here. Since `inherits` cannot delete, flattening
+  # the two layers back together would hand this runnable an Anthropic
+  # credential it never uses, with no way to take it away again.
