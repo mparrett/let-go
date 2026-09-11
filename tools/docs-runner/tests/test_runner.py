@@ -719,7 +719,7 @@ Exhaustive listing by category.
 - [ideas/jvm-compat](ideas/jvm-compat.md) — A phased plan for Clojure libraries.
 
 ## Sources
-- [sources/design-exec-context](sources/design-exec-context.md) — Design for ExecContext.
+- [sources/design-exec-context](sources/design-exec-context.md) — ExecContext design.
 - [sources/design-pods](sources/design-pods.md) — Babashka-compatible pods.
 - [sources/let-go-readme](sources/let-go-readme.md) — Official project README.
 """
@@ -743,11 +743,14 @@ def _index_section(text: str, heading: str) -> list[str]:
         # Both of these matched the navigation map's heading first under a
         # substring match, and they are the two directories a docs run
         # produces most.
-        (Path("sources/design-ir-dynamic-vars.md"), "## Sources", "## Sources & provenance"),
+        (Path("sources/design-ir-dynamic-vars.md"), "## Sources",
+         "## Sources & provenance"),
         (Path("ideas/some-new-idea.md"), "## Ideas", "## Roadmap & ideas"),
     ],
 )
-def test_index_entry_lands_in_the_catalog_not_the_nav_map(tmp_path, rel, heading, decoy):
+def test_index_entry_lands_in_the_catalog_not_the_nav_map(
+    tmp_path, rel, heading, decoy
+):
     wiki = tmp_path / "wiki"
     wiki.mkdir()
     (wiki / "index.md").write_text(INDEX_WITH_A_NAV_MAP, encoding="utf-8")
@@ -804,7 +807,9 @@ def test_index_entry_for_an_unknown_directory_is_appended(tmp_path):
     runner.add_index_entry(wiki, Path("entities/let-go.md"), "The language")
 
     text = (wiki / "index.md").read_text(encoding="utf-8")
-    assert text.rstrip().endswith("- [entities/let-go](entities/let-go.md) — The language")
+    assert text.rstrip().endswith(
+        "- [entities/let-go](entities/let-go.md) — The language"
+    )
     assert not any(
         "entities/let-go" in line
         for line in _index_section(text, "## Sources & provenance")

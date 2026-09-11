@@ -1,0 +1,22 @@
+# Lint settings for the docs runner. This is the only Python in the repository,
+# so it carries its own config rather than adding one at the root.
+#
+# Without a config, `ruff check` runs its small default set (E4, E7, E9, F) and
+# reports clean while real findings sit in the file. Pinning the selection is
+# what makes "ruff is clean" a statement anyone can reproduce.
+line-length = 88
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplifications
+    "RUF",  # ruff's own rules
+    # Enabled so the deliberate broad `except` at the job boundary has to say
+    # so with a noqa, rather than the noqa reading as dead weight.
+    "BLE",
+]
