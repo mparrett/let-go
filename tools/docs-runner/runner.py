@@ -503,10 +503,35 @@ def update_page(
     if reply == body.strip():
         log(f"  {rel}: identical to current content")
         return False
+    if is_frontmatter_only(reply):
+        log(f"  {rel}: SKIPPED, reply was frontmatter with no page body")
+        return False
 
     page.write_text(reply + "\n", encoding="utf-8")
     log(f"  {rel}: updated")
     return True
+
+
+_PAGE_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n?(?P<rest>.*)$", re.DOTALL)
+
+
+def is_frontmatter_only(text: str) -> bool:
+    """True when a reply is a complete frontmatter block and no page body.
+
+    Found by evaluating candidate models: one returned well-formed frontmatter
+    and stopped. That page satisfies check_wiki.py, which requires the schema
+    keys but has no opinion about whether the page says anything, so it passed
+    the validation gate and would have been committed and proposed for review.
+    An empty page is worse than no page - it costs a reviewer's attention and
+    then reads as documentation that exists.
+
+    A reply with no closing delimiter is not judged here; that is malformed
+    frontmatter, which the validator does catch.
+    """
+    match = _PAGE_FRONTMATTER_RE.match(text)
+    if match is None:
+        return False
+    return not match.group("rest").strip()
 
 
 CREATE_SYSTEM_PROMPT = """\
@@ -658,6 +683,9 @@ def create_page(
     # emitted a separator ahead of the page's own `---`.
     if body.startswith("---\n---\n"):
         body = body[4:]
+    if is_frontmatter_only(body):
+        log(f"  {path}: SKIPPED, reply was frontmatter with no page body")
+        return None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body + "\n", encoding="utf-8")
