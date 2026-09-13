@@ -1,0 +1,50 @@
+# REFERENCE ONLY - this workflow is not used and must not be moved into
+# .github/workflows/. Kept because it is the evaluation artifact: the exact
+# output of Monk's `cicd_setup`, unedited, generated 2026-09-13.
+#
+# It was written to tools/docs-runner/.github/workflows/deploy.yml, two levels
+# below the repository root, where GitHub never looks - so as generated it could
+# not have run at all.
+#
+# The live workflow is .github/workflows/docs-runner-deploy.yml. It exists
+# because this file cannot do the job: monk-io/monk-actions/deploy@v1 declares
+# no input for template variables, so `source-sha` can never be set and every
+# run would document the placeholder commit pinned in template.yaml while
+# reporting success. It also triggers on pull_request, which for the production
+# entrypoint means unmerged code opening pull requests against the wiki.
+#
+# Full analysis:
+#   monk-io-letgo/devlog/2026-09-12-cicd-tools-live-and-what-setup-gets-wrong.md
+
+name: Deploy to Monk Cluster
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: monk-io/monk-actions/build-images@v1
+      with:
+        registry-address: ${{ secrets.REGISTRY_ADDRESS }}
+        registry-username: ${{ secrets.REGISTRY_USERNAME }}
+        registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+        registry-tls-verify: ${{ secrets.REGISTRY_TLS_VERIFY }}
+
+  deploy:
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: monk-io/monk-actions/deploy@v1
+      with:
+        monkcode: ${{ secrets.MONKCODE }}
+        service-token: ${{ secrets.MONK_SERVICE_TOKEN }}
+        workload: "monk-io-letgo/docs-runner-dry"
+        branch-tag: "default"
+        capsule-mode: static
