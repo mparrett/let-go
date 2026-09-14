@@ -209,9 +209,20 @@ jobs:
               --entrypoint monk "$MONK_CI_IMAGE" "$@"
           }
           # Expected to fail on the very first run, when there is nothing to
-          # delete. --ignore-images keeps the built image so the next run does
-          # not rebuild from scratch.
-          monk delete --no-confirm --ignore-images "$WORKLOAD" || true
+          # delete.
+          #
+          # Deliberately WITHOUT --ignore-images, which is the flag's default.
+          # The MANIFEST names the image `docs-runner` with no tag, so it
+          # resolves as `:latest` -- a mutable tag. Keeping the node's cached
+          # copy means a freshly pushed `:latest` is never pulled: the deploy's
+          # "Checking/pulling images" finished in 0.5s and the container went on
+          # running month-old code while the build job reported success. Letting
+          # the delete remove the image costs a pull each run and is what makes
+          # the build above mean anything.
+          #
+          # The flag was here because the image used to be built on the cluster;
+          # once the build moved to the runner, it only preserved staleness.
+          monk delete --no-confirm "$WORKLOAD" || true
 
           # The `|| true` above cannot distinguish "nothing to delete" from
           # "delete failed", and the difference matters: if a previous workload
