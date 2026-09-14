@@ -110,6 +110,20 @@ jobs:
         # deploy action runs in static mode -- with the one addition that action
         # cannot express, `--set source-sha`. The MANIFEST has to be the working
         # directory, hence -w.
+        #
+        # The delete first is not tidiness, it is correctness. Measured on the
+        # cluster 2026-09-13: `update` against an existing workload restarts the
+        # container in place rather than replacing it ("container ... already
+        # exists", IsAlreadyRunning: true), and the job then re-runs over its
+        # previous clone and dies with
+        #   FAILED: command failed (3): git remote add origin ...
+        #   error: remote origin already exists.
+        # Worse, the container's log keeps BOTH runs, so a successful
+        # DOCS_RUNNER_STATUS from the earlier run is still sitting there for the
+        # steps below to find -- the job would report the old success while this
+        # run had actually failed. A fresh container per run gives a log
+        # containing exactly one run, which is what makes the parsing below
+        # sound.
         run: |
           set -euo pipefail
           echo "documenting $SOURCE_SHA via $WORKLOAD"
@@ -120,6 +134,10 @@ jobs:
               -v "$PWD:/work" -w /work/tools/docs-runner \
               --entrypoint monk "$MONK_CI_IMAGE" "$@"
           }
+          # Expected to fail on the very first run, when there is nothing to
+          # delete. --ignore-images keeps the built image so the next run does
+          # not rebuild from scratch.
+          monk delete --no-confirm --ignore-images "$WORKLOAD" || true
           monk load MANIFEST
           monk update -t default --set source-sha="$SOURCE_SHA" "$WORKLOAD"
 
@@ -133,9 +151,11 @@ jobs:
         # behaves against a container that has already exited, which is not
         # documented.
         #
-        # UNVERIFIED until the first real run: whether `monk logs` returns the
-        # log of an exited container at all. If this step times out while the
-        # run plainly succeeded, that is the thing to check first.
+        # Verified against the cluster 2026-09-13: `monk logs` does return the
+        # full log of a container that has already exited and disappeared from
+        # `monk ps`, so polling for the line is sound. This works only because
+        # the deploy step deletes the previous workload first -- see the comment
+        # there for what a stale log does to this loop.
         run: |
           set -euo pipefail
           monk() {
@@ -151,6 +171,14 @@ jobs:
             if grep -q '^DOCS_RUNNER_STATUS' run.log; then
               echo "terminal status reached"
               break
+            fi
+            # The runner prints this and stops without ever emitting a status
+            # line. Catching it turns a 30-minute wait for a run that is already
+            # dead into an immediate failure that names the cause.
+            if grep -q '^FAILED:' run.log; then
+              echo "::error::runner failed before reaching a terminal status" >&2
+              grep '^FAILED:' run.log >&2
+              exit 1
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error::no DOCS_RUNNER_STATUS after 30 minutes" >&2
