@@ -138,6 +138,22 @@ jobs:
           # delete. --ignore-images keeps the built image so the next run does
           # not rebuild from scratch.
           monk delete --no-confirm --ignore-images "$WORKLOAD" || true
+
+          # The `|| true` above cannot distinguish "nothing to delete" from
+          # "delete failed", and the difference matters: if a previous workload
+          # survives, `update` restarts it in place and its old
+          # DOCS_RUNNER_STATUS line stays in the log for the steps below to
+          # match, reporting the previous run's result as this one's. Prove the
+          # log is clean instead of assuming it, and fail loudly if it is not --
+          # a stuck workload is worth a red run, never a green one.
+          if monk logs --last 2000 "$WORKLOAD" 2>/dev/null \
+               | grep -q '^DOCS_RUNNER_STATUS'; then
+            echo "::error::a previous run's log survived the delete; refusing to" \
+                 "deploy over it, because its status line would be read as this" \
+                 "run's result. Delete $WORKLOAD on the cluster by hand." >&2
+            exit 1
+          fi
+
           monk load MANIFEST
           monk update -t default --set source-sha="$SOURCE_SHA" "$WORKLOAD"
 
