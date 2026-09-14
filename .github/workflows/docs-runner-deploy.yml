@@ -29,17 +29,22 @@ on:
         description: Commit to document (defaults to the triggering commit)
         required: false
         type: string
-      dry_run:
-        description: Deploy the dry entrypoint, which never pushes or opens a PR
+      entrypoint:
+        description: Which entrypoint to deploy
         required: false
-        default: true
-        type: boolean
+        default: dry
+        type: choice
+        options: [dry, prod, eval]
       model_name:
-        description: "Model to use (default: the MODEL_NAME repo variable)"
+        description: "Model to use (default: the MODEL_NAME repo variable; REQUIRED for eval)"
         required: false
         type: string
       model_effort:
-        description: Effort level - low, medium, high, xhigh, max
+        description: Effort level - low, medium, high, xhigh, max (ignored by eval)
+        required: false
+        type: string
+      model_max_tokens:
+        description: "Output cap for eval only (default: the template's 16000)"
         required: false
         type: string
 
@@ -148,13 +153,27 @@ jobs:
       # applies.
       MODEL_NAME: ${{ inputs.model_name || vars.MODEL_NAME }}
       MODEL_EFFORT: ${{ inputs.model_effort || vars.MODEL_EFFORT }}
+      MODEL_MAX_TOKENS: ${{ inputs.model_max_tokens }}
 
-      # Reads as "dry unless someone dispatched this and explicitly asked for
-      # prod". Written this way rather than the shorter `inputs.dry_run && ...`
-      # so that uncommenting the push trigger above cannot silently select the
-      # entrypoint that pushes: on any non-dispatch event `inputs.dry_run` is
-      # null, and the short form would fall through to prod.
-      WORKLOAD: ${{ (github.event_name != 'workflow_dispatch' || inputs.dry_run) && 'monk-io-letgo/docs-runner-dry' || 'monk-io-letgo/docs-runner-prod' }}
+      # `eval` inherits the provider-neutral base rather than the Anthropic
+      # layer, so MODEL_EFFORT is not a variable it declares and `--set
+      # model-effort` against it is an error. The repo-level MODEL_EFFORT
+      # variable would otherwise reach it through the env above, which is why
+      # this is a computed flag rather than a check at the call site.
+      IS_EVAL: ${{ github.event_name == 'workflow_dispatch' && inputs.entrypoint == 'eval' }}
+
+      # Reads as "dry unless someone dispatched this and explicitly named
+      # another entrypoint". The default-to-dry fallthrough is deliberate and
+      # load-bearing twice over: on any non-dispatch event `inputs.entrypoint`
+      # is null, and on a dispatch an unrecognised value lands here too. Only
+      # the literal string `prod` selects the entrypoint that pushes, so
+      # uncommenting the push trigger above cannot silently start opening pull
+      # requests.
+      WORKLOAD: >-
+        ${{ github.event_name != 'workflow_dispatch' && 'monk-io-letgo/docs-runner-dry'
+         || inputs.entrypoint == 'prod' && 'monk-io-letgo/docs-runner-prod'
+         || inputs.entrypoint == 'eval' && 'monk-io-letgo/docs-runner-eval'
+         || 'monk-io-letgo/docs-runner-dry' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -246,14 +265,38 @@ jobs:
           # place. `if` blocks rather than `[ -n ... ] &&`, which would trip
           # `set -e` on the false branch.
           args=(--set source-sha="$SOURCE_SHA")
+
+          # eval declares model-name with `required: true` over an empty value
+          # on purpose, so that forgetting it is an error rather than a mystery
+          # 404 from the router. Catching it here names the cause before the
+          # deploy rather than after it.
+          if [ "$IS_EVAL" = "true" ] && [ -z "${MODEL_NAME:-}" ]; then
+            echo "::error::the eval entrypoint has no default model; pass model_name" >&2
+            echo "::error::OpenRouter ids are vendor-qualified, e.g. qwen/qwen3.5-9b" >&2
+            exit 1
+          fi
+
           if [ -n "${MODEL_NAME:-}" ]; then
             args+=(--set model-name="$MODEL_NAME")
           fi
-          if [ -n "${MODEL_EFFORT:-}" ]; then
+          # Not on eval: see IS_EVAL above for why the guard is the flag rather
+          # than the emptiness of MODEL_EFFORT.
+          if [ "$IS_EVAL" != "true" ] && [ -n "${MODEL_EFFORT:-}" ]; then
             args+=(--set model-effort="$MODEL_EFFORT")
           fi
-          echo "model: ${MODEL_NAME:-<template default>}" \
-               "effort: ${MODEL_EFFORT:-<template default>}"
+          # Only eval declares it; the Anthropic path hardcodes its own cap in
+          # backends.py.
+          if [ "$IS_EVAL" = "true" ] && [ -n "${MODEL_MAX_TOKENS:-}" ]; then
+            args+=(--set model-max-tokens="$MODEL_MAX_TOKENS")
+          fi
+
+          if [ "$IS_EVAL" = "true" ]; then
+            echo "model: $MODEL_NAME" \
+                 "max-tokens: ${MODEL_MAX_TOKENS:-<template default>}"
+          else
+            echo "model: ${MODEL_NAME:-<template default>}" \
+                 "effort: ${MODEL_EFFORT:-<template default>}"
+          fi
 
           monk update -t default "${args[@]}" "$WORKLOAD"
 
