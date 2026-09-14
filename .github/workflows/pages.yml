@@ -38,8 +38,17 @@ jobs:
       - name: Fetch perf timeline from perf-data branch
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --heads origin perf-data >/dev/null 2>&1; then
-            git fetch --depth 1 origin perf-data
+          # LAB BRANCH ONLY - do not propose upstream.
+          #
+          # This fork's own perf-data carries 36 commits of power-study and
+          # parity-trial snapshots that upstream does not have, and only ~39
+          # timeline files against upstream's ~476. Reading it would render a
+          # sparse explorer and prove nothing, and overwriting it would destroy
+          # fork-only experiment data. So this preview reads upstream's
+          # perf-data directly and leaves the fork's alone.
+          PERF_DATA_REMOTE=https://github.com/nooga/let-go.git
+          if git ls-remote --exit-code --heads "$PERF_DATA_REMOTE" perf-data >/dev/null 2>&1; then
+            git fetch --depth 1 "$PERF_DATA_REMOTE" perf-data
             rm -rf docs/perf/timeline
             mkdir -p docs/perf
             if git checkout FETCH_HEAD -- timeline 2>/dev/null; then
