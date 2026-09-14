@@ -1,0 +1,229 @@
+name: Docs runner (Monk)
+
+# Run the docs runner on the standing `letgo-docs` Monk cluster instead of on
+# the GitHub runner. The sibling `wiki-docs.yml` does the same job with a plain
+# `docker run` on the runner and stays as it is -- this is a second, parallel
+# path, not a replacement, and the two are deliberately comparable so the Monk
+# round trip can be measured against the runner-local one.
+#
+# NOT the file `monk.cicd_setup` generates. That one is kept unedited, with its
+# provenance, at tools/docs-runner/docs/monk-cicd-generated-deploy.yml, and it
+# cannot do this job: `monk-io/monk-actions/deploy@v1` exposes no input
+# for template variables, so it can never set `source-sha` and every run would
+# document the placeholder commit pinned in template.yaml while reporting
+# success. See monk-io-letgo/devlog/2026-09-12-cicd-tools-live-and-what-setup-gets-wrong.md.
+
+on:
+  # Manual only, matching wiki-docs.yml and for the same reason: this runs a
+  # model over a commit and opens pull requests against another repository, and
+  # that should start when someone decides it should. The automatic trigger is
+  # commented rather than deleted so turning it on is a one-line change.
+  #
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'tools/docs-runner/**'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to document (defaults to the triggering commit)
+        required: false
+        type: string
+      dry_run:
+        description: Deploy the dry entrypoint, which never pushes or opens a PR
+        required: false
+        default: true
+        type: boolean
+
+# Nothing here writes to this repository. The cluster holds the credentials the
+# job itself needs (anthropic-api-key, docs-runner-github-token) and injects
+# them into the container; they are never passed from CI.
+permissions:
+  contents: read
+
+# Serialised and deliberately NOT cancel-in-progress, same as wiki-docs.yml: a
+# superseded run may already have pushed a branch to the wiki, and cancelling
+# mid-flight leaves that branch behind with no pull request attached.
+concurrency:
+  group: docs-runner-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy and run
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # The image monk-io/monk-actions is itself built on. Using it directly
+      # skips the capsule-flow wrapper (curl, jq, htpasswd) this job does not
+      # need. `latest` is what the CI/CD playbook documents; there is no
+      # published tag matching the cluster's daemon version, so this is an
+      # unpinned dependency by necessity rather than by choice.
+      MONK_CI_IMAGE: monkreleases.azurecr.io/monk-ci:latest
+
+      # Both read from the environment by the CLI. MONK_SOCKET is how the
+      # documented static CI/CD flow points the CLI at an existing cluster --
+      # note the CLI's global `-s` is `--socket` while `update`'s `-s` is
+      # `--set`, so the socket goes through the environment and variables go
+      # through the long `--set` to keep the two from colliding.
+      MONK_SOCKET: monkcode://${{ secrets.MONKCODE }}
+      MONK_SERVICE_TOKEN: ${{ secrets.MONK_SERVICE_TOKEN }}
+      MONK_CLI_NO_FANCY: "true"
+      MONK_CLI_NO_COLOR: "true"
+      MONK_NO_INTERACTIVE: "true"
+
+      SOURCE_SHA: ${{ inputs.sha || github.sha }}
+
+      # Reads as "dry unless someone dispatched this and explicitly asked for
+      # prod". Written this way rather than the shorter `inputs.dry_run && ...`
+      # so that uncommenting the push trigger above cannot silently select the
+      # entrypoint that pushes: on any non-dispatch event `inputs.dry_run` is
+      # null, and the short form would fall through to prod.
+      WORKLOAD: ${{ (github.event_name != 'workflow_dispatch' || inputs.dry_run) && 'monk-io-letgo/docs-runner-dry' || 'monk-io-letgo/docs-runner-prod' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only the MANIFEST and template are needed here. The job clones the
+          # commit it is documenting itself, inside the container, at the depth
+          # it needs.
+          fetch-depth: 1
+
+      - name: Check the cluster secrets are present
+        # These are pushed by monk.cicd_setup, not by hand, so an empty one
+        # means the setup never completed or the service token was rotated.
+        # Failing here names the cause; failing later looks like a cluster
+        # problem.
+        run: |
+          set -euo pipefail
+          missing=
+          [ -n "${{ secrets.MONKCODE }}" ] || missing="$missing MONKCODE"
+          [ -n "${{ secrets.MONK_SERVICE_TOKEN }}" ] || missing="$missing MONK_SERVICE_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing - re-run monk.cicd.setup" >&2
+            exit 1
+          fi
+
+      - name: Deploy the workload
+        # `monk load` then `monk update`, which is exactly what Monk's own
+        # deploy action runs in static mode -- with the one addition that action
+        # cannot express, `--set source-sha`. The MANIFEST has to be the working
+        # directory, hence -w.
+        #
+        # The delete first is not tidiness, it is correctness. Measured on the
+        # cluster 2026-09-13: `update` against an existing workload restarts the
+        # container in place rather than replacing it ("container ... already
+        # exists", IsAlreadyRunning: true), and the job then re-runs over its
+        # previous clone and dies with
+        #   FAILED: command failed (3): git remote add origin ...
+        #   error: remote origin already exists.
+        # Worse, the container's log keeps BOTH runs, so a successful
+        # DOCS_RUNNER_STATUS from the earlier run is still sitting there for the
+        # steps below to find -- the job would report the old success while this
+        # run had actually failed. A fresh container per run gives a log
+        # containing exactly one run, which is what makes the parsing below
+        # sound.
+        run: |
+          set -euo pipefail
+          echo "documenting $SOURCE_SHA via $WORKLOAD"
+          monk() {
+            docker run --rm \
+              -e MONK_SOCKET -e MONK_SERVICE_TOKEN \
+              -e MONK_CLI_NO_FANCY -e MONK_CLI_NO_COLOR -e MONK_NO_INTERACTIVE \
+              -v "$PWD:/work" -w /work/tools/docs-runner \
+              --entrypoint monk "$MONK_CI_IMAGE" "$@"
+          }
+          # Expected to fail on the very first run, when there is nothing to
+          # delete. --ignore-images keeps the built image so the next run does
+          # not rebuild from scratch.
+          monk delete --no-confirm --ignore-images "$WORKLOAD" || true
+
+          # The `|| true` above cannot distinguish "nothing to delete" from
+          # "delete failed", and the difference matters: if a previous workload
+          # survives, `update` restarts it in place and its old
+          # DOCS_RUNNER_STATUS line stays in the log for the steps below to
+          # match, reporting the previous run's result as this one's. Prove the
+          # log is clean instead of assuming it, and fail loudly if it is not --
+          # a stuck workload is worth a red run, never a green one.
+          if monk logs --last 2000 "$WORKLOAD" 2>/dev/null \
+               | grep -q '^DOCS_RUNNER_STATUS'; then
+            echo "::error::a previous run's log survived the delete; refusing to" \
+                 "deploy over it, because its status line would be read as this" \
+                 "run's result. Delete $WORKLOAD on the cluster by hand." >&2
+            exit 1
+          fi
+
+          monk load MANIFEST
+          monk update -t default --set source-sha="$SOURCE_SHA" "$WORKLOAD"
+
+      - name: Wait for the run to finish
+        # The runner is restart:'no' and exits on purpose, so "deployed" is not
+        # "finished" and Monk's own deploy status cannot answer "was this commit
+        # documented?". The runner emits exactly one DOCS_RUNNER_STATUS line when
+        # it reaches a terminal state, so that line is both the completion
+        # signal and the result -- the same line wiki-docs.yml greps out of its
+        # local log. Polling for it avoids depending on how `monk logs --follow`
+        # behaves against a container that has already exited, which is not
+        # documented.
+        #
+        # Verified against the cluster 2026-09-13: `monk logs` does return the
+        # full log of a container that has already exited and disappeared from
+        # `monk ps`, so polling for the line is sound. This works only because
+        # the deploy step deletes the previous workload first -- see the comment
+        # there for what a stale log does to this loop.
+        run: |
+          set -euo pipefail
+          monk() {
+            docker run --rm \
+              -e MONK_SOCKET -e MONK_SERVICE_TOKEN \
+              -e MONK_CLI_NO_FANCY -e MONK_CLI_NO_COLOR -e MONK_NO_INTERACTIVE \
+              -v "$PWD:/work" -w /work/tools/docs-runner \
+              --entrypoint monk "$MONK_CI_IMAGE" "$@"
+          }
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            monk logs --last 2000 "$WORKLOAD" > run.log 2>&1 || true
+            if grep -q '^DOCS_RUNNER_STATUS' run.log; then
+              echo "terminal status reached"
+              break
+            fi
+            # The runner prints this and stops without ever emitting a status
+            # line. Catching it turns a 30-minute wait for a run that is already
+            # dead into an immediate failure that names the cause.
+            if grep -q '^FAILED:' run.log; then
+              echo "::error::runner failed before reaching a terminal status" >&2
+              grep '^FAILED:' run.log >&2
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no DOCS_RUNNER_STATUS after 30 minutes" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Summarise the outcome
+        # The runner exits 0 for outcomes that are not failures -- a commit with
+        # nothing to document, or one deliberately skipped -- so surface the
+        # status line rather than making someone read the log.
+        if: always()
+        run: |
+          set -uo pipefail
+          status=$(grep '^DOCS_RUNNER_STATUS' run.log 2>/dev/null | tail -1 || true)
+          if [ -z "$status" ]; then
+            echo "No status line found - the run did not reach a terminal state." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "\`$status\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the log
+        # Logs are the only durable record of what the model was asked and what
+        # it decided; the workload and its clones are gone by now.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-runner-monk-log-${{ github.run_id }}
+          path: run.log
+          retention-days: 14
