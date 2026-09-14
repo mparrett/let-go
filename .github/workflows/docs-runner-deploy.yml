@@ -57,8 +57,62 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build-image:
+    name: build and push the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: tools/docs-runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install podman
+        # Preferred over docker for the push, following monk-io/monk-actions:
+        # the cluster registry is served on :7080 and podman takes an explicit
+        # --tls-verify, where docker needs the host in its insecure-registries
+        # config before it will talk to one.
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+
+      - name: Build and push
+        # Replicates monk-io/monk-actions/build-images rather than calling it.
+        # That action is composite and its script requires MANIFEST in the
+        # working directory, and `working-directory` is not honoured on a
+        # `uses:` step -- so it cannot be pointed at tools/docs-runner, where
+        # this project's MANIFEST lives. The tag, source and dockerfile are read
+        # from the MANIFEST's IMAGE line so this stays in step with it rather
+        # than hardcoding a name in two places.
+        env:
+          REGISTRY_ADDRESS: ${{ secrets.REGISTRY_ADDRESS }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_TLS_VERIFY: ${{ secrets.REGISTRY_TLS_VERIFY }}
+        run: |
+          set -euo pipefail
+          read -r tag source dockerfile <<<"$(
+            awk '$1=="IMAGE"{print $2, $4, $5; exit}' MANIFEST
+          )"
+          if [ -z "${tag:-}" ] || [ -z "${source:-}" ] || [ -z "${dockerfile:-}" ]; then
+            echo "::error::no usable IMAGE line in MANIFEST" >&2
+            exit 1
+          fi
+          echo "building $tag from $source/$dockerfile"
+
+          podman build -t "$tag" -f "$source/$dockerfile" "$source"
+          podman tag "$tag" "$REGISTRY_ADDRESS/$tag"
+          podman push --tls-verify="${REGISTRY_TLS_VERIFY:-true}" \
+            --creds="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+            "$REGISTRY_ADDRESS/$tag"
+
   deploy:
     name: deploy and run
+    needs: build-image
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
