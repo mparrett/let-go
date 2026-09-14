@@ -109,6 +109,19 @@ def emit_status(action: str, **fields: object) -> None:
     # a run that exited before reaching the model did not spend nothing, it
     # spent nothing *measurable here*, and the absent field says so.
     if usage is not None and usage.calls:
+        # Which model produced this result, on every terminal action rather
+        # than only the ones that wrote a page. Two runs of the same commit are
+        # not comparable without it, and `no-change` is exactly where that
+        # bites: a model that proposes nothing leaves token counts as the only
+        # signal, and those vary enough run to run to distinguish two models
+        # only by accident. Gated on the same `calls` condition as usage --
+        # with no call made there is no served model, and the requested id
+        # would be a claim about something that never happened.
+        model = getattr(_BACKEND, "resolved_model", None) or getattr(
+            _BACKEND, "model", getattr(_BACKEND, "name", None)
+        )
+        if model:
+            parts.append(f"model={model}")
         parts.extend(f"{k}={v}" for k, v in usage.status_fields().items())
     log("DOCS_RUNNER_STATUS " + " ".join(parts))
 
@@ -1186,21 +1199,17 @@ def main() -> int:
         )
         return 1
 
-    # Which model actually answered, when the backend can tell us. A score is
-    # only meaningful against the model that produced it, and the requested id
-    # is not proof of the served one.
-    model = getattr(backend, "resolved_model", None) or getattr(
-        backend, "model", backend.name
-    )
-
+    # `model=` is no longer passed here: emit_status derives it from the
+    # backend for every terminal action, so these two paths no longer have a
+    # field the other outcomes lack.
     url = open_pull_request(cfg, wiki, updated, branch)
     if url:
         emit_status("documented", sha=cfg.source_sha[:12],
-                    pages=len(updated), model=model, pr=url)
+                    pages=len(updated), pr=url)
         log(f"opened {url}")
     else:
         emit_status("dry-run", sha=cfg.source_sha[:12],
-                    pages=len(updated), model=model)
+                    pages=len(updated))
     return 0
 
 

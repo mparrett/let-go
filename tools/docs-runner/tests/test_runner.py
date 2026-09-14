@@ -982,3 +982,62 @@ def test_status_omits_usage_when_no_call_was_made(capsys):
 
     line = capsys.readouterr().out.strip()
     assert "in_tokens" not in line, "absent, not zero"
+
+
+def test_status_names_the_model_on_a_no_change_run(capsys):
+    """The outcome that carries no other evidence of which model ran.
+
+    `model=` used to be emitted only where a page was written, so a run that
+    proposed nothing recorded token counts and nothing else. Those vary enough
+    between runs of one model to distinguish two models only by accident, which
+    made a cross-model comparison unfalsifiable exactly where it mattered.
+    """
+    backend = backends.OpenAICompatBackend.__new__(backends.OpenAICompatBackend)
+    backend.model = "claude-sonnet-5"
+    backend.resolved_model = None
+    backend.usage = backends.Usage()
+    backend.usage.record(23601, 2263)
+    runner.set_backend(backend)
+
+    runner.emit_status("no-change", reason="model-proposed-nothing")
+
+    line = capsys.readouterr().out.strip()
+    assert "model=claude-sonnet-5" in line
+
+
+def test_status_prefers_the_served_model_over_the_requested_one(capsys):
+    """A router may answer with a different id than the one asked for.
+
+    The requested id is a claim about intent; the served id is what produced
+    the result, so it wins when the backend reports one.
+    """
+    backend = backends.OpenAICompatBackend.__new__(backends.OpenAICompatBackend)
+    backend.model = "claude-sonnet-5"
+    backend.resolved_model = "claude-sonnet-5-20260101"
+    backend.usage = backends.Usage()
+    backend.usage.record(10, 10)
+    runner.set_backend(backend)
+
+    runner.emit_status("no-change", reason="model-proposed-nothing")
+
+    line = capsys.readouterr().out.strip()
+    assert "model=claude-sonnet-5-20260101" in line
+    assert "model=claude-sonnet-5 " not in line, "served id, not the requested one"
+
+
+def test_status_omits_the_model_when_no_call_was_made(capsys):
+    """Same rule as usage: no call, no served model to name.
+
+    Naming the configured model here would assert that it produced something,
+    on a run that never reached it.
+    """
+    backend = backends.OpenAICompatBackend.__new__(backends.OpenAICompatBackend)
+    backend.model = "claude-sonnet-5"
+    backend.resolved_model = None
+    backend.usage = backends.Usage()
+    runner.set_backend(backend)
+
+    runner.emit_status("skipped", reason="nothing-to-document")
+
+    line = capsys.readouterr().out.strip()
+    assert "model=" not in line
