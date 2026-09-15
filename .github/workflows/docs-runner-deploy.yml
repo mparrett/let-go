@@ -169,11 +169,25 @@ jobs:
       # the literal string `prod` selects the entrypoint that pushes, so
       # uncommenting the push trigger above cannot silently start opening pull
       # requests.
+      # The `local/` prefix is the REPOSITORY the workload lives in, and naming
+      # it is not decoration. A cluster can hold the same runnable in several
+      # repositories at once -- `monk ls` on the cluster showed this template in
+      # both `local` and a stray `eval` repository -- and an unqualified name
+      # matching more than one makes `update` stop on "Select which
+      # 'monk-io-letgo/docs-runner-X' to update", which in CI is a hang that
+      # reports itself as "Terminal is not interactive". `local` is where
+      # `monk load MANIFEST` puts them, so it is the one this workflow means.
+      #
+      # It read as unnecessary for as long as exactly one repository existed:
+      # dry and prod worked for weeks unqualified, and began matching twice the
+      # moment a second repository appeared -- without anything in this file
+      # changing. Qualifying makes the deploy independent of what else is loaded
+      # on the cluster.
       WORKLOAD: >-
-        ${{ github.event_name != 'workflow_dispatch' && 'monk-io-letgo/docs-runner-dry'
-         || inputs.entrypoint == 'prod' && 'monk-io-letgo/docs-runner-prod'
-         || inputs.entrypoint == 'eval' && 'monk-io-letgo/docs-runner-eval'
-         || 'monk-io-letgo/docs-runner-dry' }}
+        ${{ github.event_name != 'workflow_dispatch' && 'local/monk-io-letgo/docs-runner-dry'
+         || inputs.entrypoint == 'prod' && 'local/monk-io-letgo/docs-runner-prod'
+         || inputs.entrypoint == 'eval' && 'local/monk-io-letgo/docs-runner-eval'
+         || 'local/monk-io-letgo/docs-runner-dry' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -227,19 +241,6 @@ jobs:
               -v "$PWD:/work" -w /work/tools/docs-runner \
               --entrypoint monk "$MONK_CI_IMAGE" "$@"
           }
-
-          # TEMPORARY DIAGNOSTIC - remove once the eval ambiguity is understood.
-          # This container is the only shell that actually reaches the cluster:
-          # a developer laptop's CLI is bound to its local peer, reports `tag
-          # 'default' doesn't exist in the cluster`, and so cannot reproduce any
-          # of this. Everything here is read-only and `|| true` so it can never
-          # fail the job.
-          echo "::group::cluster template list"
-          monk list 2>&1 | grep -i 'docs-runner' || monk ls 2>&1 | grep -i 'docs-runner' || true
-          echo "::endgroup::"
-          echo "::group::candidates for the ambiguous name"
-          monk ls 2>&1 | grep -c 'docs-runner-eval' || true
-          echo "::endgroup::"
           # Expected to fail on the very first run, when there is nothing to
           # delete.
           #
