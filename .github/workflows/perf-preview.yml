@@ -1,0 +1,207 @@
+name: Perf page preview
+
+# Fork-only. Builds cmd/perf-page from one or more refs of nooga/let-go and
+# publishes each under preview/<slug>/, so an open PR can carry a link that
+# reviewers can actually click:
+#   https://mparrett.github.io/let-go/preview/<slug>/
+#
+# Why this exists rather than dispatching pages.yml per branch: Pages on this
+# fork is build_type=workflow, so every deploy replaces the WHOLE site. One
+# branch at a time means a link in PR A goes stale the moment PR B is
+# previewed. This workflow builds main's site and every preview in a single
+# artifact, so the links coexist and stay valid.
+#
+# Two consequences of that same whole-site-replacement rule:
+#   - Any push to fork main runs pages.yml, which deploys main's site WITHOUT
+#     previews and so removes them. Re-dispatch this workflow to restore them;
+#     nothing is lost but the deploy.
+#   - This workflow must rebuild main's site too, which is why it repeats
+#     pages.yml's wasm + timeline steps rather than only building previews.
+#
+# It adds no edits to existing files - a new file alone - so re-syncing fork
+# main to upstream never conflicts: rebase this one commit and force-push.
+#
+# NOT for upstream. nooga/let-go publishes the real perf page; this one exists
+# to preview unmerged generator changes and sets no CNAME.
+
+on:
+  workflow_dispatch:
+    inputs:
+      previews:
+        description: 'Comma-separated slug=ref pairs, e.g. "main=main,chart=wt/perf-chart-legibility"'
+        required: true
+        default: main=main
+      source_repo:
+        description: 'Repository the refs are taken from'
+        required: true
+        default: nooga/let-go
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Same group as pages.yml: both write the one Pages deployment for this repo.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The timeline snapshots live on the unprotected `perf-data` branch
+      # (written by perf-timeline.yml), NOT on main. Every preview reads the
+      # same snapshots, so fetch them once and point each build at this copy -
+      # a preview is a rendering change, never a data change.
+      - name: Fetch perf timeline from perf-data branch
+        id: timeline
+        run: |
+          set -euo pipefail
+          mkdir -p docs/perf
+          if git ls-remote --exit-code --heads origin perf-data >/dev/null 2>&1; then
+            git fetch --depth 1 origin perf-data
+            rm -rf docs/perf/timeline
+            if git checkout FETCH_HEAD -- timeline 2>/dev/null; then
+              mv timeline docs/perf/timeline
+            else
+              mkdir -p docs/perf/timeline
+            fi
+          else
+            mkdir -p docs/perf/timeline
+          fi
+          echo "count=$(find docs/perf/timeline -name '*.json' | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "dir=$(pwd)/docs/perf/timeline" >> "$GITHUB_OUTPUT"
+
+      - name: Build main site (wasm REPL plus the current perf page)
+        run: cd wasm && make pages
+
+      - name: Build previews
+        env:
+          PREVIEWS: ${{ inputs.previews }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          TIMELINE: ${{ steps.timeline.outputs.dir }}
+          SNAPSHOTS: ${{ steps.timeline.outputs.count }}
+        run: |
+          set -euo pipefail
+          site="$GITHUB_WORKSPACE/wasm/static/preview"
+          mkdir -p "$site"
+          # Each preview writes its explorer payload to a temp path so the
+          # copies can be compared; identical ones collapse to a single file
+          # shared by every page (it is ~27 MB, and three copies is 81).
+          exp_tmp="$RUNNER_TEMP/explorer"
+          mkdir -p "$exp_tmp"
+          rows="$RUNNER_TEMP/rows.md"
+          : > "$rows"
+          slugs=""
+
+          IFS=','
+          for pair in $PREVIEWS; do
+            unset IFS
+            slug="$(printf '%s' "${pair%%=*}" | tr -d '[:space:]')"
+            ref="$(printf '%s' "${pair#*=}" | tr -d '[:space:]')"
+            # `slug` is free text from the dispatch form and lands in a
+            # filesystem path, so reject anything that could escape preview/.
+            case "$slug" in
+              *[!a-zA-Z0-9_-]*|'')
+                echo "::error::slug must match [a-zA-Z0-9_-]+ (got '$slug')"; exit 1 ;;
+            esac
+            if [ -z "$ref" ] || [ "$ref" = "$pair" ]; then
+              echo "::error::'$pair' is not a slug=ref pair"; exit 1
+            fi
+
+            echo "::group::$slug from $SOURCE_REPO@$ref"
+            src="$RUNNER_TEMP/src/$slug"
+            rm -rf "$src"
+            git clone --quiet --depth 1 --branch "$ref" \
+              "https://github.com/$SOURCE_REPO.git" "$src"
+            sha="$(git -C "$src" rev-parse --short HEAD)"
+
+            mkdir -p "$site/$slug"
+            # Run the generator FROM the previewed ref: the generator is the
+            # change under review. Baseline and historical come from that ref
+            # too; only the timeline is shared.
+            ( cd "$src" && go run ./cmd/perf-page \
+                -timeline "$TIMELINE" \
+                -out "$site/$slug/index.html" \
+                -explorer-out "$exp_tmp/$slug.json" \
+                -explorer-url "../explorer.json" )
+
+            printf '| [%s](preview/%s/) | `%s` | `%s` |\n' \
+              "$slug" "$slug" "$ref" "$sha" >> "$rows"
+            slugs="$slugs $slug"
+            echo "::endgroup::"
+          done
+
+          # Collapse the explorer payloads. They are equal whenever no preview
+          # changes how the data is built, which is the normal case; a
+          # difference means -explorer-url is pointing pages at the wrong
+          # payload, so fail loudly rather than publish a page reading someone
+          # else's numbers.
+          first=""
+          for slug in $slugs; do
+            if [ -z "$first" ]; then first="$slug"; continue; fi
+            if ! cmp -s "$exp_tmp/$first.json" "$exp_tmp/$slug.json"; then
+              echo "::error::explorer payloads differ ($first vs $slug); these previews cannot share one explorer.json"
+              exit 1
+            fi
+          done
+          cp "$exp_tmp/$first.json" "$site/explorer.json"
+
+          {
+            echo "### Perf page previews"
+            echo
+            echo "Base: https://mparrett.github.io/let-go/preview/"
+            echo
+            echo "| Preview | Ref | Commit |"
+            echo "|---|---|---|"
+            cat "$rows"
+            echo
+            echo "Timeline: $SNAPSHOTS snapshot(s) from the perf-data branch."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A plain index so preview/ is navigable rather than a 404.
+      - name: Write preview index
+        env:
+          PREVIEWS: ${{ inputs.previews }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/wasm/static/preview/index.html"
+          {
+            echo '<!doctype html><meta charset=utf-8><title>let-go perf page previews</title>'
+            echo '<style>body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:40px auto;max-width:44rem;padding:0 20px;color:#171717}'
+            echo 'h1{font-size:22px}code{background:#f2f2ef;padding:1px 5px;border-radius:4px}li{margin:6px 0}</style>'
+            echo '<h1>let-go perf page previews</h1>'
+            echo '<p>Unmerged <code>cmd/perf-page</code> changes, rendered against the shared perf-data timeline. Built by <code>.github/workflows/perf-preview.yml</code> on this fork.</p><ul>'
+            IFS=','
+            for pair in $PREVIEWS; do
+              unset IFS
+              slug="$(printf '%s' "${pair%%=*}" | tr -d '[:space:]')"
+              ref="$(printf '%s' "${pair#*=}" | tr -d '[:space:]')"
+              echo "<li><a href=\"$slug/\">$slug</a> &mdash; <code>$ref</code></li>"
+            done
+            echo '</ul>'
+          } > "$out"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'wasm/static'
+
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
