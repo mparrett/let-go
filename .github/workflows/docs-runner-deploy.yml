@@ -298,7 +298,13 @@ jobs:
                  "effort: ${MODEL_EFFORT:-<template default>}"
           fi
 
-          monk update -t default "${args[@]}" "$WORKLOAD"
+          # -a because `update` otherwise stops on "Select which
+          # 'monk-io-letgo/docs-runner-eval' to update" and then dies with
+          # "Terminal is not interactive". Measured 2026-09-14 on the first eval
+          # dispatch. It never fired for dry or prod, so it went unnoticed until
+          # a third entrypoint existed; the flag is harmless on all three, since
+          # it only suppresses a prompt rather than choosing differently.
+          monk update -t default -a "${args[@]}" "$WORKLOAD"
 
       - name: Wait for the run to finish
         # The runner is restart:'no' and exits on purpose, so "deployed" is not
