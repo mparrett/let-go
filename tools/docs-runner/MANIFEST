@@ -30,7 +30,7 @@ ENTRY monk-io-letgo/docs-runner-dry
 # token is still collected ahead of a dry run even though nothing in that run
 # can read it - docs-runner-dry neither permits the secret nor places it in the
 # container environment. Injection is scoped; collection is not.
-SECRET anthropic-api-key docs-runner-github-token
+SECRET anthropic-api-key docs-runner-github-token openrouter-api-key
 #
 # `openrouter-api-key` is deliberately NOT listed. Adding it here would make
 # Monk collect it before every dry run too, and the eval path is an occasional
