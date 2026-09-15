@@ -184,28 +184,11 @@ jobs:
             echo "Timeline: $SNAPSHOTS snapshot(s) from ${TIMELINE_REPO} (perf-data)."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # A plain index so preview/ is navigable rather than a 404.
-      - name: Write preview index
-        env:
-          PREVIEWS: ${{ inputs.previews }}
-        run: |
-          set -euo pipefail
-          out="$GITHUB_WORKSPACE/wasm/static/preview/index.html"
-          {
-            echo '<!doctype html><meta charset=utf-8><title>let-go perf page previews</title>'
-            echo '<style>body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:40px auto;max-width:44rem;padding:0 20px;color:#171717}'
-            echo 'h1{font-size:22px}code{background:#f2f2ef;padding:1px 5px;border-radius:4px}li{margin:6px 0}</style>'
-            echo '<h1>let-go perf page previews</h1>'
-            echo '<p>Unmerged <code>cmd/perf-page</code> changes, rendered against the shared perf-data timeline. Built by <code>.github/workflows/perf-preview.yml</code> on this fork.</p><ul>'
-            IFS=','
-            for pair in $PREVIEWS; do
-              unset IFS
-              slug="$(printf '%s' "${pair%%=*}" | tr -d '[:space:]')"
-              ref="$(printf '%s' "${pair#*=}" | tr -d '[:space:]')"
-              echo "<li><a href=\"$slug/\">$slug</a> &mdash; <code>$ref</code></li>"
-            done
-            echo '</ul>'
-          } > "$out"
+      # The board is a committed file rather than a heredoc: it is client-side
+      # and reads the GitHub API at load, so it needs no build-time data and
+      # stays current between dispatches.
+      - name: Publish the collab board as the preview index
+        run: cp .github/preview-hub.html "$GITHUB_WORKSPACE/wasm/static/preview/index.html"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

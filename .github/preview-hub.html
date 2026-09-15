@@ -1,0 +1,222 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>let-go collab board</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Light palette on bare :root so the default resolves without a media query;
+     dark only redefines tokens. The perf page itself is light-only, which is
+     the complaint this board does not want to repeat. */
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f4; --paper: #fff; --ink: #171717; --muted: #65645f;
+    --line: #deddd6; --accent: #245c73;
+    --ok-fg: #167a48; --ok-bg: #e4f3ea;
+    --warn-fg: #8b5e12; --warn-bg: #f7eeda;
+    --bad-fg: #aa2e2e; --bad-bg: #f8e3e0;
+    --chip-bg: #eceae2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16171a; --paper: #1e2024; --ink: #e9e8e3; --muted: #9b9a93;
+      --line: #32343a; --accent: #7fb6cd;
+      --ok-fg: #7fdca4; --ok-bg: #16301f;
+      --warn-fg: #e0b567; --warn-bg: #33280f;
+      --bad-fg: #f3a3a3; --bad-bg: #331b1b;
+      --chip-bg: #2a2c31;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .lede { color: var(--muted); margin: 0 0 6px; max-width: 72ch; }
+  .meta { color: var(--muted); font-size: 12.5px; margin: 0 0 26px; }
+  .meta button {
+    font: inherit; font-size: 12.5px; border: 1px solid var(--line); cursor: pointer;
+    background: var(--paper); color: var(--ink); border-radius: 6px; padding: 2px 9px; margin-left: 6px;
+  }
+  h2 { font-size: 17px; margin: 30px 0 2px; }
+  .ws-note { color: var(--muted); font-size: 13.5px; margin: 0 0 14px; max-width: 74ch; }
+  .card {
+    border: 1px solid var(--line); border-left: 3px solid var(--line);
+    border-radius: 9px; background: var(--paper);
+    padding: 11px 14px; margin-bottom: 9px;
+  }
+  .card.is-merged { border-left-color: var(--accent); }
+  .card.is-open { border-left-color: var(--ok-fg); }
+  .card.is-closed { border-left-color: var(--bad-fg); }
+  .row1 { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .num { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; min-width: 3.4em; }
+  .title { font-weight: 600; flex: 1 1 22rem; min-width: 0; }
+  .title a { color: inherit; text-decoration: none; }
+  .title a:hover { text-decoration: underline; }
+  .row2 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 7px; }
+  .pill {
+    font-size: 11.5px; font-weight: 650; padding: 1.5px 8px; border-radius: 20px;
+    background: var(--chip-bg); color: var(--muted); white-space: nowrap;
+  }
+  .pill.ok { background: var(--ok-bg); color: var(--ok-fg); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn-fg); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad-fg); }
+  .preview {
+    font-size: 12.5px; margin-left: auto; color: var(--accent);
+    text-decoration: none; font-weight: 600; white-space: nowrap;
+  }
+  .preview:hover { text-decoration: underline; }
+  .seq { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+  .err {
+    border: 1px solid var(--line); background: var(--warn-bg); color: var(--warn-fg);
+    border-radius: 8px; padding: 9px 13px; font-size: 13px; margin-bottom: 18px;
+  }
+  code { background: var(--chip-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  footer { margin-top: 44px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--line); padding-top: 14px; }
+  a { color: var(--accent); }
+</style>
+
+<div class="wrap">
+  <h1>let-go collab board</h1>
+  <p class="lede">Work in flight on <code>nooga/let-go</code>, with the fork's rendered previews beside each
+  change that has one. Live from the GitHub API — nothing here is baked at build time.</p>
+  <p class="meta"><span id="status">Loading…</span><button id="refresh" type="button">Refresh</button></p>
+  <div id="out"></div>
+  <footer>
+    Served from <code>mparrett/let-go</code> via <code>.github/workflows/perf-preview.yml</code>.
+    Previews are fork builds of unmerged refs, not published artifacts.
+  </footer>
+</div>
+
+<script>
+// One entry per workstream. `order` is the sequence these want landing in when
+// they touch one file and the repo forbids merge commits; `preview` is the
+// slug published under preview/ by the same workflow that serves this page.
+var REPO = "nooga/let-go";
+var WORKSTREAMS = [
+  {
+    title: "perf-page",
+    note: "Split out of #879 so each piece is reviewable alone. They all touch " +
+          "cmd/perf-page/main.go, so they land in order, each rebased on the last.",
+    ordered: true,
+    prs: [
+      { n: 886, preview: null,                summary: "“Recently tightened” ordering" },
+      { n: 887, preview: "chart-legibility",  summary: "timeline chart legibility" },
+      { n: 888, preview: "table-readability", summary: "sparkline table readability" },
+      { n: 889, preview: "section-chrome",    summary: "section chrome" }
+    ]
+  },
+  {
+    title: "perf-page — parent and stack",
+    note: "The branch the four were split out of, and the client-side explorer stacked on it.",
+    ordered: false,
+    prs: [
+      { n: 879, preview: null, summary: "page-wide CPU filter" },
+      { n: 880, preview: null, summary: "timeline explorer" }
+    ]
+  }
+];
+
+var PREVIEW_BASE = "./";
+var out = document.getElementById("out");
+var statusEl = document.getElementById("status");
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
+
+function pill(text, cls) {
+  return '<span class="pill' + (cls ? " " + cls : "") + '">' + esc(text) + "</span>";
+}
+
+// One list request covers every PR on the board; per-PR calls would multiply
+// against the 60/hour unauthenticated limit for no extra information.
+function load() {
+  statusEl.textContent = "Loading…";
+  var wanted = [];
+  WORKSTREAMS.forEach(function (w) { w.prs.forEach(function (p) { wanted.push(p.n); }); });
+
+  fetch("https://api.github.com/repos/" + REPO + "/pulls?state=all&per_page=100", {
+    headers: { Accept: "application/vnd.github+json" }
+  })
+    .then(function (r) {
+      if (!r.ok) { throw new Error("GitHub API " + r.status); }
+      return r.json();
+    })
+    .then(function (list) {
+      var byNum = {};
+      list.forEach(function (p) { byNum[p.number] = p; });
+      render(byNum, null);
+    })
+    .catch(function (e) {
+      // Rate limiting is the common case and is not an error worth hiding the
+      // board for: the numbers and links below stand on their own.
+      render({}, e.message);
+    });
+}
+
+function render(byNum, errMsg) {
+  var html = "";
+  if (errMsg) {
+    html += '<div class="err">Live status unavailable (' + esc(errMsg) +
+      "). The unauthenticated GitHub API allows 60 requests an hour per address; " +
+      "links and previews below still work.</div>";
+  }
+  WORKSTREAMS.forEach(function (w) {
+    html += "<h2>" + esc(w.title) + "</h2>";
+    if (w.note) { html += '<p class="ws-note">' + esc(w.note) + "</p>"; }
+    w.prs.forEach(function (entry) {
+      var pr = byNum[entry.n];
+      var state = "unknown", cls = "";
+      if (pr) {
+        state = pr.merged_at ? "merged" : pr.state;
+        cls = pr.merged_at ? "is-merged" : (pr.state === "open" ? "is-open" : "is-closed");
+      }
+      html += '<div class="card ' + cls + '">';
+      html += '<div class="row1">';
+      html += '<span class="num">#' + entry.n + "</span>";
+      html += '<span class="title"><a href="https://github.com/' + REPO + "/pull/" + entry.n +
+        '">' + esc(pr ? pr.title : entry.summary) + "</a></span>";
+      html += "</div>";
+
+      html += '<div class="row2">';
+      if (pr) {
+        html += pill(state, pr.merged_at ? "" : (pr.state === "open" ? "ok" : "bad"));
+        if (pr.draft) { html += pill("draft", "warn"); }
+        html += pill(pr.head.ref + " → " + pr.base.ref);
+      } else {
+        html += pill(entry.summary);
+      }
+      if (entry.preview) {
+        html += '<a class="preview" href="' + PREVIEW_BASE + entry.preview +
+          '/">preview ↗</a>';
+      }
+      html += "</div></div>";
+    });
+    if (w.ordered) {
+      html += '<p class="seq">Landing order: ' +
+        w.prs.map(function (p) { return "#" + p.n; }).join(" → ") + "</p>";
+    }
+  });
+
+  // A main-branch render of the same data, so a preview can be compared
+  // against something rather than judged on its own.
+  html += "<h2>Reference</h2>";
+  html += '<p class="ws-note">The same page built from upstream main and the same ' +
+    'perf-data snapshots, so the only difference against any preview is that diff.</p>';
+  html += '<div class="card"><div class="row1"><span class="num">—</span>' +
+    '<span class="title">perf page, upstream main</span></div>' +
+    '<div class="row2">' + pill("baseline") +
+    '<a class="preview" href="' + PREVIEW_BASE + 'main/">preview ↗</a></div></div>';
+
+  out.innerHTML = html;
+  statusEl.textContent = errMsg
+    ? "Static view"
+    : "Updated " + new Date().toLocaleTimeString();
+}
+
+document.getElementById("refresh").onclick = load;
+load();
+</script>
