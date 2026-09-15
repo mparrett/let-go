@@ -35,6 +35,10 @@ on:
         description: 'Repository the refs are taken from'
         required: true
         default: nooga/let-go
+      timeline_repo:
+        description: 'Repository whose perf-data branch supplies the timeline'
+        required: true
+        default: nooga/let-go
 
 permissions:
   contents: read
@@ -61,24 +65,36 @@ jobs:
       # (written by perf-timeline.yml), NOT on main. Every preview reads the
       # same snapshots, so fetch them once and point each build at this copy -
       # a preview is a rendering change, never a data change.
-      - name: Fetch perf timeline from perf-data branch
+      #
+      # Read them from UPSTREAM by default, not from this fork. The fork's own
+      # perf-data trails badly (45 snapshots against upstream's 482), and
+      # snapshot density is exactly what some of these changes are about: at 45
+      # the dots are far enough apart that a fix for overlap at 400+ renders
+      # identically to main, so a thin timeline makes the preview say nothing.
+      - name: Fetch perf timeline from the perf-data branch
         id: timeline
+        env:
+          TIMELINE_REPO: ${{ inputs.timeline_repo }}
         run: |
           set -euo pipefail
-          mkdir -p docs/perf
-          if git ls-remote --exit-code --heads origin perf-data >/dev/null 2>&1; then
-            git fetch --depth 1 origin perf-data
-            rm -rf docs/perf/timeline
-            if git checkout FETCH_HEAD -- timeline 2>/dev/null; then
-              mv timeline docs/perf/timeline
-            else
-              mkdir -p docs/perf/timeline
-            fi
+          dir="$RUNNER_TEMP/perf-data"
+          rm -rf "$dir"
+          if git clone --quiet --depth 1 --branch perf-data --single-branch \
+               "https://github.com/$TIMELINE_REPO.git" "$dir" 2>/dev/null; then
+            :
           else
-            mkdir -p docs/perf/timeline
+            echo "::warning::$TIMELINE_REPO has no perf-data branch; charts will be empty"
+            mkdir -p "$dir/timeline"
           fi
-          echo "count=$(find docs/perf/timeline -name '*.json' | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
-          echo "dir=$(pwd)/docs/perf/timeline" >> "$GITHUB_OUTPUT"
+          mkdir -p "$dir/timeline"
+          count="$(find "$dir/timeline" -name '*.json' | wc -l | tr -d ' ')"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir/timeline" >> "$GITHUB_OUTPUT"
+          echo "Loaded $count timeline snapshot(s) from $TIMELINE_REPO."
+          # The main-site build below reads the default docs/perf/timeline.
+          rm -rf docs/perf/timeline
+          mkdir -p docs/perf
+          cp -R "$dir/timeline" docs/perf/timeline
 
       - name: Build main site (wasm REPL plus the current perf page)
         run: cd wasm && make pages
@@ -89,6 +105,7 @@ jobs:
           SOURCE_REPO: ${{ inputs.source_repo }}
           TIMELINE: ${{ steps.timeline.outputs.dir }}
           SNAPSHOTS: ${{ steps.timeline.outputs.count }}
+          TIMELINE_REPO: ${{ inputs.timeline_repo }}
         run: |
           set -euo pipefail
           site="$GITHUB_WORKSPACE/wasm/static/preview"
@@ -164,7 +181,7 @@ jobs:
             echo "|---|---|---|"
             cat "$rows"
             echo
-            echo "Timeline: $SNAPSHOTS snapshot(s) from the perf-data branch."
+            echo "Timeline: $SNAPSHOTS snapshot(s) from ${TIMELINE_REPO} (perf-data)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # A plain index so preview/ is navigable rather than a 404.
