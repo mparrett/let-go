@@ -142,6 +142,15 @@ jobs:
             sha="$(git -C "$src" rev-parse --short HEAD)"
 
             mkdir -p "$site/$slug"
+            # Ask the ref's own binary which flags it has. A ref that emits the
+            # Timeline explorer takes -viewer-out; one that predates it aborts
+            # on an unknown flag, so the flag cannot be passed unconditionally.
+            extra=()
+            if ( cd "$src" && go run ./cmd/perf-page -h 2>&1 || true ) | grep -q -- "-viewer-out"; then
+              extra=(-viewer-out "$site/$slug/explore/index.html")
+              echo "  (ref emits the Timeline explorer: also building $slug/explore/)"
+            fi
+
             # Run the generator FROM the previewed ref: the generator is the
             # change under review. Baseline and historical come from that ref
             # too; only the timeline is shared.
@@ -149,7 +158,8 @@ jobs:
                 -timeline "$TIMELINE" \
                 -out "$site/$slug/index.html" \
                 -explorer-out "$exp_tmp/$slug.json" \
-                -explorer-url "../explorer.json" )
+                -explorer-url "../explorer.json" \
+                "${extra[@]}" )
 
             printf '| [%s](preview/%s/) | `%s` | `%s` |\n' \
               "$slug" "$slug" "$ref" "$sha" >> "$rows"

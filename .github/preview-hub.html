@@ -72,6 +72,8 @@
     text-decoration: none; font-weight: 600; white-space: nowrap;
   }
   .preview:hover { text-decoration: underline; }
+  /* Only the first of a pair pushes right; the second sits beside it. */
+  .preview ~ .preview { margin-left: 0; }
   .seq { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
   .err {
     border: 1px solid var(--line); background: var(--warn-bg); color: var(--warn-fg);
@@ -116,11 +118,13 @@ var WORKSTREAMS = [
   },
   {
     title: "perf-page — parent and stack",
-    note: "The branch the four were split out of, and the client-side explorer stacked on it.",
+    note: "The branch the four were split out of, and the client-side explorer stacked on it. " +
+          "#880 is based on #879, so its preview carries both changes.",
     ordered: false,
     prs: [
-      { n: 879, preview: null, summary: "page-wide CPU filter" },
-      { n: 880, preview: null, summary: "timeline explorer" }
+      { n: 879, preview: "cpu-filter", summary: "page-wide CPU filter" },
+      { n: 880, preview: "timeline-explorer", summary: "timeline explorer",
+        also: { label: "explorer page", path: "timeline-explorer/explore" } }
     ]
   }
 ];
@@ -200,6 +204,10 @@ function render(byNum, errMsg) {
       if (entry.preview) {
         html += '<a class="preview" href="' + PREVIEW_BASE + entry.preview +
           '/">preview ↗</a>';
+      }
+      if (entry.also) {
+        html += '<a class="preview" href="' + PREVIEW_BASE + entry.also.path +
+          '/">' + esc(entry.also.label) + " ↗</a>";
       }
       html += "</div></div>";
     });
