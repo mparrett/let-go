@@ -1,0 +1,275 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>perf-page review guide — #886–#889</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg:#f7f7f4; --paper:#fff; --ink:#171717; --muted:#65645f; --line:#deddd6;
+    --accent:#245c73; --ok-fg:#167a48; --ok-bg:#e4f3ea; --warn-fg:#8b5e12;
+    --warn-bg:#f7eeda; --bad-fg:#aa2e2e; --bad-bg:#f8e3e0; --chip:#eceae2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#16171a; --paper:#1e2024; --ink:#e9e8e3; --muted:#9b9a93; --line:#32343a;
+      --accent:#7fb6cd; --ok-fg:#7fdca4; --ok-bg:#16301f; --warn-fg:#e0b567;
+      --warn-bg:#33280f; --bad-fg:#f3a3a3; --bad-bg:#331b1b; --chip:#2a2c31;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:30px 20px 90px}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:-.01em}
+  .lede{color:var(--muted);margin:0 0 4px;max-width:76ch}
+  a{color:var(--accent)}
+  .how{border:1px solid var(--line);background:var(--paper);border-radius:10px;padding:13px 16px;margin:20px 0 34px}
+  .how h3{margin:0 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .how ol{margin:0;padding-left:20px}
+  .how li{margin:3px 0}
+  .pr{border:1px solid var(--line);border-radius:12px;background:var(--paper);padding:18px 20px;margin-bottom:22px}
+  .pr > h2{margin:0 0 3px;font-size:19px}
+  .pr > h2 .n{color:var(--muted);font-weight:600;font-variant-numeric:tabular-nums}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 14px}
+  .links{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
+  .links a{font-size:12.5px;font-weight:650;text-decoration:none;border:1px solid var(--line);border-radius:7px;padding:3px 11px;background:var(--bg)}
+  .links a:hover{border-color:var(--accent)}
+  h4{margin:16px 0 5px;font-size:13px;text-transform:uppercase;letter-spacing:.055em;color:var(--muted)}
+  ul.look{margin:0;padding-left:19px}
+  ul.look li{margin:5px 0}
+  kbd{background:var(--chip);border-radius:4px;padding:1px 6px;font:inherit;font-size:.87em;font-weight:600}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:.89em}
+  .ab{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:12px 0 4px}
+  @media (max-width:860px){.ab{grid-template-columns:1fr}}
+  figure{margin:0;min-width:0}
+  figure img{width:100%;display:block;border:1px solid var(--line);border-radius:8px;background:var(--paper)}
+  figcaption{font-size:12.5px;color:var(--muted);margin-top:5px}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:1px 7px;border-radius:5px;margin-right:6px;vertical-align:1px}
+  .tag.before{background:var(--bad-bg);color:var(--bad-fg)}
+  .tag.after{background:var(--ok-bg);color:var(--ok-fg)}
+  .ask{border-left:3px solid var(--warn-fg);background:var(--warn-bg);color:var(--warn-fg);border-radius:0 8px 8px 0;padding:9px 14px;margin-top:14px;font-size:13.5px}
+  .ask b{display:block;margin-bottom:2px}
+  .note{border-left:3px solid var(--line);padding:2px 0 2px 13px;color:var(--muted);font-size:13.5px;margin:14px 0 0}
+  footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px}
+</style>
+
+<div class="wrap">
+<h1>perf-page review guide</h1>
+<p class="lede">Four PRs split out of #879, one file between them. Each section below says what to open,
+where to look, and what to disbelieve. Every preview is built from the same 482 snapshots on
+<code>perf-data</code>, so the only difference against the <b>main</b> preview is that PR's diff.</p>
+
+<div class="how">
+  <h3>How to use this</h3>
+  <ol>
+    <li>Open <a href="https://mparrett.github.io/let-go/preview/main/">preview/main</a> in one tab — that is the control.</li>
+    <li>Open the PR's preview in a second tab and switch between them. The pages are the same length,
+        so the same scroll position lands on the same section.</li>
+    <li>The screenshots below are the same two pages, captured at 1340px wide.</li>
+  </ol>
+</div>
+
+<!-- 886 -->
+<div class="pr">
+  <h2><span class="n">#886</span> &nbsp;“Recently tightened” ordering</h2>
+  <p class="sub">The section published the alphabetically first eight benchmarks under a heading that says
+  “most recently lowered ratchet bars”.</p>
+  <div class="links">
+    <a href="https://github.com/nooga/let-go/pull/886">PR #886 ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/recent-tightened/">preview ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/main/">control: main ↗</a>
+  </div>
+
+  <h4>Where to look</h4>
+  <ul class="look">
+    <li>Scroll to <b>Recently tightened</b>, about two thirds down.</li>
+    <li>On <b>main</b>, read the <b>Bar Set</b> column: every cell is a bare <code>@</code>. That is the
+        template's <code>date @ sha</code> with both halves empty — the tell that the sort key is missing.</li>
+    <li>Read the benchmark names downward: <code>InitFromLGB</code>, <code>IRCompile [bytecode]</code>,
+        <code>IRCompile [gogen_ir]</code>, <code>BindingPushPop</code>, <code>CheckedMulInt/small</code>…
+        strictly alphabetical, not chronological.</li>
+    <li>Six of the eight rows say <b>new</b> in the last column, which is what first looked wrong here —
+        a row with no history cannot have been recently tightened.</li>
+  </ul>
+
+  <div class="ab">
+    <figure>
+      <img src="img/main-tightened.png" alt="Recently tightened on main: eight alphabetical rows, Bar Set column showing only @">
+      <figcaption><span class="tag before">before</span>Bar Set is a column of bare <code>@</code>; rows are in name order.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/recent-tightened-tightened.png" alt="Recently tightened after the fix: an empty-state sentence">
+      <figcaption><span class="tag after">after</span>The section states why it is empty instead of inventing an order.</figcaption>
+    </figure>
+  </div>
+
+  <div class="ask">
+    <b>The judgement call</b>
+    On the profile that actually renders, the fix makes the section disappear. That is the honest
+    outcome — the data is not there — but it trades a populated-looking table for a sentence. Worth
+    confirming that is the preferred trade before it ships.
+  </div>
+  <p class="note">Why the data is missing at all is <a href="https://github.com/nooga/let-go/issues/597">#597</a>:
+  <code>selectProfile</code> takes the first key in sort order, <code>amd64/</code> sorts before
+  <code>arm64/</code>, and <code>arm64/Apple M3</code> is the only profile of six carrying
+  <code>best_since_at</code> — 140 of 140, against 0 of 157 on each amd64 profile.</p>
+</div>
+
+<!-- 887 -->
+<div class="pr">
+  <h2><span class="n">#887</span> &nbsp;Timeline chart legibility</h2>
+  <p class="sub">At 482 snapshots the dots were drawn 6.4 wide in 0.95 units of space, so each one sat
+  several deep into its neighbours and the ring on each punched holes in the rest.</p>
+  <div class="links">
+    <a href="https://github.com/nooga/let-go/pull/887">PR #887 ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/chart-legibility/">preview ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/main/">control: main ↗</a>
+  </div>
+
+  <h4>Where to look</h4>
+  <ul class="look">
+    <li>The <b>Timeline</b> charts at the top — no scrolling needed.</li>
+    <li>On main, the per-snapshot <b>percentage labels</b> (−9.3%, +4.7%…) sit unreadable inside the mass.
+        After, they carry a paper halo and read cleanly.</li>
+    <li><b>Hover a dot.</b> This is the load-bearing check: the dots carry the date/SHA/value tooltip, so
+        they have to stay hittable. Sizing purely to spacing gave 0.90, inside the 2.5-wide line, which
+        made them invisible <em>and</em> unhoverable. The floor is 1.76.</li>
+    <li>Look at <b>Suite memory</b> and <b>IR compile</b> specifically — those are the two whose lines
+        read as broken on the published page. They are not broken; the dots were covering them.</li>
+  </ul>
+
+  <div class="ab">
+    <figure>
+      <img src="img/main-charts.png" alt="Timeline chart on main: dense hatched mass of ringed dots">
+      <figcaption><span class="tag before">before</span>r=3.2 with a paper ring, at ~0.95 units of spacing.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/chart-legibility-charts.png" alt="Timeline chart after: smaller translucent dots, no ring, haloed labels">
+      <figcaption><span class="tag after">after</span>r=1.76, ring dropped, fill at 75%, line thinned to 1.5.</figcaption>
+    </figure>
+  </div>
+
+  <div class="ask">
+    <b>What I am least sure of</b>
+    1.76 is a floor chosen against the line width, not derived from the data. At 482 snapshots the dots
+    still overlap — they have to, there is less than a unit each. The question is whether overlap that
+    reads as density is better than a line with no snapshots marked on it at all.
+  </div>
+  <p class="note">Noticed and deliberately not fixed: <b>Suite memory</b> draws a legend with two series
+  and one visible line. Both variants have identical heap bytes per op on this profile, so
+  <code>ir_bytecode</code> sits exactly under <code>aot_native</code>. The chart is honest; the legend
+  cannot say so.</p>
+</div>
+
+<!-- 888 -->
+<div class="pr">
+  <h2><span class="n">#888</span> &nbsp;Sparkline table readability</h2>
+  <p class="sub">Four changes to one table, all about comparing numbers by eye instead of by counting digits.</p>
+  <div class="links">
+    <a href="https://github.com/nooga/let-go/pull/888">PR #888 ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/table-readability/">preview ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/main/">control: main ↗</a>
+  </div>
+
+  <h4>Where to look</h4>
+  <ul class="look">
+    <li>Scroll to <b>Trend sparklines</b> — the long scrolling table.</li>
+    <li><b>Magnitudes.</b> Find the <code>ClojureTestSuiteCompileAndRun</code> rows. Main prints
+        <code>2,806,110,000</code> and <code>13,908,200,000</code>; after they read <code>2.81B</code> and
+        <code>13.91B</code>.</li>
+    <li><b>Multiples over percents.</b> The Δ column reads <code>5.0×</code> rather than
+        <code>+400.3%</code> past a doubling, and stays in percent below it.</li>
+    <li><b>Scale families.</b> The <code>VectorAccess/ArrayVector</code> rows show
+        <code>0.451–0.473</code> in First and <code>21.5× · 4</code> in Δ — a range and a geometric mean
+        over four scales, where main spread a pill per scale across all three columns.</li>
+    <li><b>Hover those three cells.</b> They carry a dotted underline; hovering gives the per-scale
+        breakdown. A native <code>title</code> was tried first and never appeared — it waits out a hover
+        delay and does not fire while the pointer moves across a dense table.</li>
+    <li><b>Column widths.</b> The header reads <b>Trend</b>, not the old sentence. Measured on the two
+        previews at 1340 wide: on main the table is 1199px inside a 1178px container, so it
+        <em>overflows horizontally</em> and <b>46 of the first 60</b> benchmark names are truncated.
+        After, the table is 1178px — no overflow, <b>0 truncated</b>.</li>
+  </ul>
+
+  <div class="ab">
+    <figure>
+      <img src="img/main-spark.png" alt="Sparkline table on main">
+      <figcaption><span class="tag before">before</span>Full digit strings, percent deltas, pills spanning three
+      columns. The &Delta; column really is cut off at the right — the table overflows its container here.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/table-readability-spark.png" alt="Sparkline table after">
+      <figcaption><span class="tag after">after</span>Compacted magnitudes, × multiples, one summary per column.</figcaption>
+    </figure>
+  </div>
+
+  <div class="ask">
+    <b>Open question</b>
+    <code>21.5× · 4</code> packs a geometric mean and a count into one cell. Geometric is the right mean
+    for multipliers — an arithmetic mean follows whichever scale has the largest ratio — but whether the
+    notation reads without explanation is a taste call.
+  </div>
+</div>
+
+<!-- 889 -->
+<div class="pr">
+  <h2><span class="n">#889</span> &nbsp;Section chrome</h2>
+  <p class="sub">Heading alignment, baseline provenance, the table cap and the scrollbar.</p>
+  <div class="links">
+    <a href="https://github.com/nooga/let-go/pull/889">PR #889 ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/section-chrome/">preview ↗</a>
+    <a href="https://mparrett.github.io/let-go/preview/main/">control: main ↗</a>
+  </div>
+
+  <h4>Where to look</h4>
+  <ul class="look">
+    <li>Scroll to <b>Current baseline</b>, the last section.</li>
+    <li><b>Alignment.</b> On main the heading and its description are bottom-aligned, so a wrapped heading
+        pushes its description down to meet the last line. After, both start level at the top.</li>
+    <li><b>Provenance.</b> The capture date, SHA, CPU model and Go version now sit on their own line rather
+        than trailing the description.</li>
+    <li><b>Column header.</b> <code>Delta</code> becomes <code>vs v1.8.0</code>, so the comparison names
+        itself instead of relying on a line at the top of the page.</li>
+    <li><b>The cap.</b> The table scrolls inside a 620px region with a sticky header, matching the
+        sparkline table. On main it runs its full 157 rows.</li>
+    <li>Also: the <b>Trend sparklines</b> heading drops “(first → last)”.</li>
+  </ul>
+
+  <div class="ab">
+    <figure>
+      <img src="img/main-baseline.png" alt="Current baseline on main: full-length table, bottom-aligned heading">
+      <figcaption><span class="tag before">before</span>Runs full length; heading bottom-aligned; column reads “Delta”.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/section-chrome-baseline.png" alt="Current baseline after: capped scrolling table with provenance line">
+      <figcaption><span class="tag after">after</span>Capped at 620px, sticky header, provenance on its own line.</figcaption>
+    </figure>
+  </div>
+
+  <div class="ask">
+    <b>Cannot be checked in a screenshot</b>
+    The <b>scrollbar</b> is the point of one of these changes and headless Chromium draws overlay
+    scrollbars regardless, omitting them from captures. It needs a real browser: the track should hold
+    its space at 14px rather than fading out. No <code>scrollbar-width</code>/<code>scrollbar-color</code>
+    is set alongside it, because setting either makes Chrome ignore the
+    <code>::-webkit-scrollbar</code> rules entirely — that is how a first attempt rendered a 2px sliver.
+  </div>
+</div>
+
+<div class="how">
+  <h3>Before merging</h3>
+  <ol>
+    <li>Land in order <b>#886 → #887 → #888 → #889</b>, rebasing each on the last. They all touch
+        <code>cmd/perf-page/main.go</code>, and the repo forbids merge commits.</li>
+    <li>#879 keeps the CPU filter it is named for; #880 stays stacked on it.</li>
+    <li>Both remaining pages are <b>light-only</b> — the perf page declares
+        <code>color-scheme: light</code> with no dark block, so it stays white on a dark desktop. Not
+        addressed in any of these four.</li>
+  </ol>
+</div>
+
+<footer>
+  Previews rebuilt from upstream refs against 482 <code>perf-data</code> snapshots. Screenshots captured
+  from the live preview URLs at 1340 wide. Published from <code>mparrett/let-go</code>, a fork — these are
+  builds of unmerged refs, not published artifacts.
+</footer>
+</div>

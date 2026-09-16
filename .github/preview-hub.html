@@ -34,6 +34,12 @@
   h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
   .lede { color: var(--muted); margin: 0 0 6px; max-width: 72ch; }
   .meta { color: var(--muted); font-size: 12.5px; margin: 0 0 26px; }
+  .guide-link {
+    margin: 14px 0 4px; font-size: 13.5px; color: var(--muted);
+    border-left: 3px solid var(--accent); padding-left: 12px;
+  }
+  .guide-link a { font-weight: 650; text-decoration: none; }
+  .guide-link a:hover { text-decoration: underline; }
   .meta button {
     font: inherit; font-size: 12.5px; border: 1px solid var(--line); cursor: pointer;
     background: var(--paper); color: var(--ink); border-radius: 6px; padding: 2px 9px; margin-left: 6px;
@@ -80,6 +86,8 @@
   <h1>let-go collab board</h1>
   <p class="lede">Work in flight on <code>nooga/let-go</code>, with the fork's rendered previews beside each
   change that has one. Live from the GitHub API — nothing here is baked at build time.</p>
+  <p class="guide-link"><a href="./guide/">Review guide →</a> what to look at in each change, with
+  before/after captures and the parts a screenshot cannot show.</p>
   <p class="meta"><span id="status">Loading…</span><button id="refresh" type="button">Refresh</button></p>
   <div id="out"></div>
   <footer>
@@ -100,7 +108,7 @@ var WORKSTREAMS = [
           "cmd/perf-page/main.go, so they land in order, each rebased on the last.",
     ordered: true,
     prs: [
-      { n: 886, preview: null,                summary: "“Recently tightened” ordering" },
+      { n: 886, preview: "recent-tightened", summary: "“Recently tightened” ordering" },
       { n: 887, preview: "chart-legibility",  summary: "timeline chart legibility" },
       { n: 888, preview: "table-readability", summary: "sparkline table readability" },
       { n: 889, preview: "section-chrome",    summary: "section chrome" }

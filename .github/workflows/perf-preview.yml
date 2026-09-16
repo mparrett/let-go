@@ -190,6 +190,12 @@ jobs:
       - name: Publish the collab board as the preview index
         run: cp .github/preview-hub.html "$GITHUB_WORKSPACE/wasm/static/preview/index.html"
 
+      # The review guide is prose plus captured screenshots, so it is committed
+      # rather than generated: its before/after pairs have to stay pinned to the
+      # state they were taken from, not re-shot against whatever main is today.
+      - name: Publish the review guide
+        run: cp -R .github/review-guide "$GITHUB_WORKSPACE/wasm/static/preview/guide"
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
