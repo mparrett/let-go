@@ -228,3 +228,59 @@ docs-runner-eval:
   # MODEL_API_KEY) are absent here. Since `inherits` cannot delete, flattening
   # the two layers back together would hand this runnable an Anthropic
   # credential it never uses, with no way to take it away again.
+
+# Entrypoint for ENV attractor. The same documentation job, with the generation
+# step replaced by Strange Lettractor's agentic pipeline instead of one model
+# call, so the two can be run over the same commit and compared.
+#
+# It inherits docs-runner-anthropic rather than the neutral base, which is the
+# opposite of what docs-runner-eval does and for the opposite reason: attractor
+# reaches Anthropic through its own native adapter and reads ANTHROPIC_API_KEY
+# from the environment itself, so it wants exactly what that layer hands out.
+# MODEL_EFFORT comes along unread -- an unused variable, not a credential, and
+# `inherits` cannot delete it anyway.
+#
+# It deliberately does not override dry-run. Like docs-runner-eval this is a
+# measurement path, so it inherits DRY_RUN=true from the base and is never
+# permitted the GitHub token: scoring a generation strategy must not be able to
+# open a pull request. The comparison is read from the validator result and the
+# run's status line, which is what a dry run already produces.
+docs-runner-attractor:
+  defines: runnable
+  inherits: monk-io-letgo/docs-runner-anthropic
+  metadata:
+    name: docs-runner-attractor
+    description: >-
+      Agentic-pipeline entrypoint. Runs the same documentation job with
+      MODEL_BACKEND=attractor, so each page is drafted, checked against the
+      reply contract, critiqued and revised rather than answered in one call.
+      Dry-run only; never pushes and never holds a GitHub credential.
+
+  variables:
+    model-backend:
+      type: string
+      value: attractor
+      env: MODEL_BACKEND
+
+    # The DOT graph's iteration budget, read by its setup gate. Deliberately
+    # small and deliberately deployable: each iteration is a full model call
+    # over a diff plus a page body, a run does this for up to MAX_PAGES_PER_RUN
+    # pages, so the knob multiplies. Three covers a draft, one contract repair
+    # and one critique revision, which is the shape the failures take. The gate
+    # clamps anything outside 1-8 back to its own default rather than trusting
+    # this value.
+    attractor-page-max-iterations:
+      type: string
+      value: "3"
+      env: ATTRACTOR_PAGE_MAX_ITERATIONS
+
+    # Per-page wall clock for the whole pipeline, not for one call. The graph
+    # caps a single model stage at 20m on its own, so a value near that would
+    # kill runs that were still making progress; this is the sum of a few such
+    # stages plus their shell gates. It must stay comfortably inside the
+    # Action's own wait, which gives up after 30 minutes for the entire run --
+    # a page that burns the full budget here leaves nothing for the rest.
+    attractor-timeout:
+      type: string
+      value: "1500"
+      env: ATTRACTOR_TIMEOUT

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import ClassVar, Protocol
 
 
@@ -239,6 +240,123 @@ class ClaudeCliBackend:
         return result.stdout
 
 
+class AttractorBackend:
+    """Strange Lettractor's agentic pipeline, standing in for a single call.
+
+    The point of this backend is the comparison, not the capability. Every other
+    backend answers a prompt with one model call; this one hands the same system
+    and user prompt to a DOT workflow that drafts, critiques its own draft
+    against the task's criteria, and revises before answering. The harness
+    around it is unchanged -- same page mapping, same validator, same pull
+    request -- so a run through this backend and a run through `anthropic` on
+    the same commit differ in exactly one thing, which is what makes the two
+    numbers worth putting next to each other.
+
+    The prompts travel as files rather than as DOT attributes. Attractor's maker
+    stages read the working directory with their own file tools, and a page body
+    plus a commit diff is far past what belongs in a graph attribute -- the
+    task-runner example passes its request the same way, for the same reason.
+    """
+
+    name = "attractor"
+
+    # Where the pipeline looks for its inputs and leaves its answer. Mirrors the
+    # layout examples/task-runner/ uses, so the graph here reads like the ones
+    # upstream ships rather than inventing a second convention.
+    IN_SYSTEM = "task.system.md"
+    IN_USER = "task.user.md"
+    OUT_ANSWER = "state/answer.md"
+
+    def __init__(self) -> None:
+        self.binary = os.environ.get("ATTRACTOR_BIN", "attractor")
+        self.graph = os.environ.get(
+            "ATTRACTOR_GRAPH", "/app/pipelines/page-update.dot"
+        )
+
+        # Attractor addresses a model as `provider/name`, while MODEL_NAME here
+        # is the bare id the Anthropic SDK takes. Deriving the qualified form
+        # rather than asking for it twice keeps a comparison run honest: set
+        # MODEL_NAME once and both backends use the same model. ATTRACTOR_MODEL
+        # overrides for the case where they should deliberately differ.
+        model = os.environ.get("ATTRACTOR_MODEL", "").strip()
+        if not model:
+            bare = os.environ.get("MODEL_NAME", "claude-opus-5").strip()
+            provider = os.environ.get("ATTRACTOR_PROVIDER", "anthropic").strip()
+            model = bare if "/" in bare else f"{provider}/{bare}"
+        self.model = model
+
+        # A whole pipeline, not one call: the default is the sum of several
+        # model stages plus their shell gates. The upstream graph caps a model
+        # stage at 20m on its own, so anything much below this truncates a run
+        # that was still making progress.
+        self.timeout = int(os.environ.get("ATTRACTOR_TIMEOUT", "1800"))
+
+        # One record per complete(), deliberately, even though each one spends
+        # several model calls internally. `calls` then means the same thing it
+        # means for every other backend -- pages processed -- and the tokens are
+        # reported as unavailable rather than as an undercount that would read
+        # as a measurement. A cost comparison against the baseline has to come
+        # from the provider's own billing, and saying so here is cheaper than
+        # someone later trusting a number this cannot know.
+        self.usage = Usage()
+
+    def complete(self, system: str, user: str) -> str:
+        import shutil
+        import subprocess
+        import tempfile
+
+        # A fresh directory per page. Attractor's setup gate refuses to start
+        # when its state directory already exists -- a deliberate guard against
+        # two runs sharing one worktree -- and a docs run calls this once per
+        # page, so reusing a directory would fail every call after the first.
+        workdir = tempfile.mkdtemp(prefix="attractor-page-")
+        try:
+            base = Path(workdir)
+            (base / "state").mkdir()
+            (base / self.IN_SYSTEM).write_text(system, encoding="utf-8")
+            (base / self.IN_USER).write_text(user, encoding="utf-8")
+
+            cmd = [
+                self.binary, "run", self.graph,
+                # Unattended. Without it the pipeline's human gates block on
+                # stdin forever inside a container nobody is watching.
+                "--auto-approve",
+                # `run` uses a mock model unless told otherwise, and a mock that
+                # silently produces plausible text is the worst possible failure
+                # for an evaluation.
+                "--llm",
+                "--model", self.model,
+            ]
+            result = subprocess.run(
+                cmd, cwd=workdir, capture_output=True, text=True,
+                timeout=self.timeout, check=False,
+            )
+            self.usage.record(None, None)
+
+            answer = base / self.OUT_ANSWER
+            if result.returncode != 0:
+                # The pipeline's own log is the only account of which stage
+                # failed, and it is on stdout. Tail rather than dump: a run that
+                # went twenty minutes produces far more than a status line
+                # should carry, and the container log has the whole thing.
+                tail = (result.stdout or result.stderr).strip()[-2000:]
+                raise RuntimeError(
+                    f"attractor exited {result.returncode}: {tail}"
+                )
+            if not answer.exists():
+                raise RuntimeError(
+                    f"attractor exited 0 without writing {self.OUT_ANSWER}; "
+                    "the graph reached its exit node without an answer stage, "
+                    "which is a graph bug rather than a model refusal"
+                )
+            return answer.read_text(encoding="utf-8")
+        finally:
+            # The scratch holds a copy of the prompt, which holds the page and
+            # the diff. Nothing downstream reads it, and a container that
+            # processes several pages would otherwise accumulate all of them.
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 def load() -> Backend:
     """Pick a backend from MODEL_BACKEND (default: anthropic)."""
     choice = os.environ.get("MODEL_BACKEND", "anthropic").strip().lower()
@@ -248,4 +366,6 @@ def load() -> Backend:
         return OpenAICompatBackend()
     if choice in ("claude-cli", "cli"):
         return ClaudeCliBackend()
+    if choice == "attractor":
+        return AttractorBackend()
     raise RuntimeError(f"unknown MODEL_BACKEND: {choice!r}")

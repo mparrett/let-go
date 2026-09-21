@@ -74,6 +74,24 @@ def note_partial(reason: str, **fields: object) -> None:
     log(f"  incomplete: {reason}{' (' + detail + ')' if detail else ''}")
 
 
+# Pages the model was asked about and whose reply broke the output contract, so
+# the page was dropped. Counted rather than merely logged because it is the
+# measurement that separates the generation strategies: a single call that
+# answers without frontmatter, wrapped in a code fence, or as frontmatter with
+# no body costs the page outright, while the attractor backend's graph hands
+# the same reply back with the complaint and spends an iteration instead.
+# Comparing the two by reading two container logs was the alternative, and the
+# deploy workflow's own summary step already notes that downloading artifacts
+# to compare runs is the friction worth removing.
+_CONTRACT_SKIPS: list[str] = []
+
+
+def note_contract_skip(page: object, reason: str) -> None:
+    """Record a reply that was dropped for breaking the output contract."""
+    _CONTRACT_SKIPS.append(reason)
+    log(f"  {page}: SKIPPED, {reason}")
+
+
 # The backend in use, so every terminal status can report what the run spent.
 # A failed run still cost money, and a cost line that only appears on success
 # would systematically under-count exactly the runs worth investigating.
@@ -103,6 +121,10 @@ def emit_status(action: str, **fields: object) -> None:
     if _PARTIAL_REASONS:
         parts.append(f"partial_reasons={','.join(_PARTIAL_REASONS)}")
     parts.extend(f"{k}={v}" for k, v in fields.items())
+    # Omitted when zero, like usage, so its presence means something went wrong
+    # rather than every clean run carrying a field reading contract_skips=0.
+    if _CONTRACT_SKIPS:
+        parts.append(f"contract_skips={len(_CONTRACT_SKIPS)}")
 
     usage = getattr(_BACKEND, "usage", None)
     # Omitted entirely when no call was made, rather than reported as zero:
@@ -531,13 +553,16 @@ def update_page(
         log(f"  {rel}: no change needed")
         return False
     if not reply.startswith("---"):
-        log(f"  {rel}: SKIPPED, reply did not start with frontmatter")
+        note_contract_skip(rel, "reply did not start with frontmatter")
         return False
     if reply == body.strip():
+        # Not a contract break: the model looked and chose not to change the
+        # page. Counting it as a skip would flatter whichever strategy proposes
+        # fewer edits.
         log(f"  {rel}: identical to current content")
         return False
     if is_frontmatter_only(reply):
-        log(f"  {rel}: SKIPPED, reply was frontmatter with no page body")
+        note_contract_skip(rel, "reply was frontmatter with no page body")
         return False
 
     page.write_text(reply + "\n", encoding="utf-8")
@@ -689,7 +714,7 @@ def create_page(
 
     match = CREATE_REPLY.match(reply)
     if not match:
-        log(f"  {path}: SKIPPED, reply did not match the PATH/INDEX/body shape")
+        note_contract_skip(path, "reply did not match the PATH/INDEX/body shape")
         return None
 
     rel = Path(match.group("path").strip().lstrip("/"))

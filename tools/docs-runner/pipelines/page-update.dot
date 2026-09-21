@@ -1,0 +1,106 @@
+// Draft, mechanically check, critique, revise -- one wiki page.
+//
+// This is the whole experiment. The docs runner's other backends answer
+// SYSTEM_PROMPT + USER_PROMPT with a single model call and take whatever comes
+// back; runner.py then applies four contract checks to the reply and, when one
+// fails, SKIPS the page. This graph puts those same four checks inside the loop
+// instead, so a reply that would have been dropped is handed back to the model
+// with the reason, and adds a critique pass over replies that are structurally
+// fine. Same harness, same page selection, same pull request -- the generation
+// step is the only thing that differs.
+//
+// Called by backends.AttractorBackend, which writes task.system.md and
+// task.user.md into a fresh working directory and reads state/answer.md back.
+// The file names are the interface between the two and must agree.
+
+digraph WikiPageUpdate {
+    graph [
+        goal="Produce the updated wiki page demanded by task.system.md and task.user.md, as state/answer.md, satisfying the reply contract the docs runner enforces and surviving a critique against the task's own rules.",
+
+        default_max_retries=2,
+        default_fidelity="truncate",
+
+        // Nothing routes here on its own; every loop below re-enters through
+        // the contract gate, which is where the iteration budget lives.
+        retry_target="give_up"
+    ]
+
+    node [timeout="20m"]
+    start [shape=Mdiamond]
+    done  [shape=Msquare]
+
+    // The budget is deliberately small. Each iteration is a full model call
+    // over a diff plus a page body, this runs once per page, and a run does up
+    // to MAX_PAGES_PER_RUN of them -- so a generous budget here multiplies into
+    // real money and a job that outlives the Action's timeout. Three is enough
+    // for draft, one mechanical repair and one critique revision, which is the
+    // shape the failures actually take.
+    setup [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="if [ ! -s task.system.md ] || [ ! -s task.user.md ]; then printf missing; exit 0; fi; mkdir -p state || exit 1; B=${ATTRACTOR_PAGE_MAX_ITERATIONS:-3}; case \"$B\" in ''|*[!0-9]*) B=3;; esac; if [ \"$B\" -lt 1 ] || [ \"$B\" -gt 8 ]; then B=3; fi; echo \"$B\" > state/budget; printf ok"]
+
+    bad_input [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="echo 'FATAL: task.system.md or task.user.md missing or empty' >&2; exit 1"]
+
+    // `must_write` rather than trusting the prose: a maker stage that answers in
+    // chat instead of writing the file is a real failure mode, and catching it
+    // here names it instead of letting the contract gate report an empty answer.
+    draft [shape=box, class="maker", must_write="state/answer.md",
+        prompt="Read task.system.md IN FULL -- it is your system prompt and its output contract is binding. Then read task.user.md, which holds the commit, its diff, and the current body of one wiki page. Do exactly what task.system.md asks and write the result to state/answer.md. Write ONLY the deliverable: either the complete updated page starting with its frontmatter block, or the two words NO CHANGE and nothing else. No preamble, no explanation, no code fence around the whole thing -- state/answer.md is copied to the wiki verbatim."]
+
+    // The contract gate. Every one of these checks mirrors a check runner.py
+    // applies to a reply, and each corresponds to an observed model failure:
+    // a bare frontmatter block with no page (seen while evaluating candidate
+    // models), a reply that forgot the frontmatter, and a whole page wrapped in
+    // a Markdown fence. In the single-call backends each of these silently
+    // costs the page. Here it costs an iteration.
+    contract [shape=parallelogram, timeout="30s", class="gate", max_retries=0,
+        goal_gate=true,
+        tool_command="n=$(cat state/iter 2>/dev/null); n=$((${n:-0}+1)); echo $n > state/iter; B=$(cat state/budget 2>/dev/null); B=${B:-3}; if [ \"$n\" -gt \"$B\" ]; then printf exhausted; exit 0; fi; : > state/contract.log; A=state/answer.md; if [ ! -s \"$A\" ]; then echo 'answer.md is missing or empty' >> state/contract.log; elif [ \"$(tr -d '[:space:]' < \"$A\")\" = 'NOCHANGE' ]; then printf green; exit 0; else head -1 \"$A\" | grep -q '^---$' || echo 'the reply does not begin with a frontmatter delimiter line (---); runner.py drops such a page' >> state/contract.log; head -1 \"$A\" | grep -q '^[[:space:]]*```' && echo 'the reply is wrapped in a Markdown code fence; write the page itself, not a fenced block' >> state/contract.log; c=$(awk 'NR==1 && /^---$/{s=1; next} s==1 && /^---$/{s=2; next} s==2 && NF{n++} END{print n+0}' \"$A\"); [ \"${c:-0}\" -gt 0 ] || echo 'the reply is a frontmatter block with no page body after it; an empty page is worse than no page' >> state/contract.log; fi; if [ -s state/contract.log ]; then printf red; exit 1; fi; printf green"]
+
+    repair [shape=box, class="maker", must_write="state/answer.md",
+        prompt="Your previous answer violated the output contract. state/contract.log lists exactly what is wrong with state/answer.md; task.system.md states the contract it breaks. Fix state/answer.md so every complaint in state/contract.log is resolved. Change only what the contract requires -- the substance of the page was not what was rejected, its shape was. Do not add commentary to the file."]
+
+    critique [shape=box, class="maker", must_write="state/critique.md",
+        prompt="state/answer.md satisfies the mechanical contract. Now judge whether it is actually good. Re-read task.system.md for the rules the page must follow and task.user.md for what the commit actually changed. Check, specifically: does the page reflect what this commit did, or has it drifted into restating things the commit did not touch? Are the frontmatter fields still accurate, including citations and dates? Did it invent behaviour the diff does not show? Did it delete content that is still true? Is the edit proportionate -- a small commit should not rewrite a page. Write state/critique.md ending with a line reading exactly VERDICT: APPROVED or VERDICT: REVISE, and when it is REVISE, list the specific changes required above that line. Approve work that is correct and proportionate; you are not required to find fault, and a gratuitous revision costs a model call and risks making the page worse."]
+
+    verdict [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="grep -qE '^VERDICT: APPROVED' state/critique.md && printf approved || printf revise"]
+
+    revise [shape=box, class="maker", must_write="state/answer.md",
+        prompt="Apply the changes state/critique.md requires to state/answer.md, and nothing beyond them. Keep the output contract from task.system.md intact: the file stays a complete page beginning with its frontmatter, with no commentary. If on reflection a criticism is wrong, leave that part as it is and say why at the end of state/critique.md -- but do not simply ignore it."]
+
+    // Budget spent without the critic approving. The answer still goes back:
+    // it has passed the same contract checks the single-call backends apply, so
+    // it is no worse than the baseline's output, and refusing to emit it would
+    // turn a merely-unconverged page into a skipped one. The marker file and
+    // the stderr line are what keep that from being a silent quality claim --
+    // the container log is the run's only durable record.
+    give_up [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="if [ ! -s state/answer.md ]; then echo 'ABANDONED: iteration budget spent with no answer that satisfies the output contract' >&2; exit 1; fi; touch state/unconverged; echo \"UNCONVERGED: emitting the last answer after $(cat state/iter 2>/dev/null) iterations without critic approval; see state/critique.md\" >&2; printf emit"]
+
+    start -> setup
+    setup -> bad_input [condition="outcome=fail"]
+    setup -> bad_input [condition="context.tool.output=missing"]
+    setup -> draft     [condition="context.tool.output=ok"]
+
+    draft -> contract
+
+    contract -> critique [condition="context.tool.output=green && outcome=success"]
+    contract -> repair   [condition="outcome=fail"]
+    contract -> give_up  [condition="context.tool.output=exhausted && outcome=success", label="budget spent"]
+
+    // Back through the gate rather than onward: the repair is itself a model
+    // call and can violate the contract in a new way, and the gate is also
+    // where the iteration counter lives.
+    repair -> contract [loop_restart="true", fidelity="truncate", label="re-check the shape"]
+
+    critique -> verdict
+    verdict -> done   [condition="context.tool.output=approved"]
+    verdict -> revise [condition="context.tool.output=revise"]
+
+    // Same reason: a revision is a fresh page body and has to clear the
+    // contract again before it can be approved.
+    revise -> contract [loop_restart="true", fidelity="truncate", label="revised, re-check"]
+
+    give_up -> done
+}

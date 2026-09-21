@@ -24,6 +24,7 @@ import runner
 def _reset_run_state(monkeypatch):
     """The status contract is module state; keep tests independent of order."""
     monkeypatch.setattr(runner, "_PARTIAL_REASONS", [])
+    monkeypatch.setattr(runner, "_CONTRACT_SKIPS", [])
     monkeypatch.setattr(runner, "_REDACTIONS", [])
     monkeypatch.setattr(runner, "_BACKEND", None)
 
@@ -242,6 +243,42 @@ def test_status_is_a_single_line_marked_complete(capsys):
     assert len(lines) == 1
     assert "completeness=complete" in lines[0]
     assert "action=documented" in lines[0]
+
+
+def test_contract_skips_ride_on_the_terminal_status(capsys):
+    """Dropped pages are the measurement that separates the backends.
+
+    A single call that answers without frontmatter loses the page; the
+    attractor graph hands the same reply back with the complaint instead. The
+    comparison is only readable without downloading two container logs if the
+    count is on the status line.
+    """
+    runner.note_contract_skip("concepts/a.md", "reply did not start with frontmatter")
+    runner.note_contract_skip(
+        "concepts/b.md", "reply was frontmatter with no page body"
+    )
+    runner.emit_status("dry-run", sha="abc123", pages=1)
+
+    status = [
+        ln for ln in capsys.readouterr().out.splitlines()
+        if ln.startswith("DOCS_RUNNER_STATUS")
+    ]
+    assert len(status) == 1
+    assert "contract_skips=2" in status[0]
+    # A dropped page is not on its own an incomplete run: the commit was still
+    # documented as far as the model allowed.
+    assert "completeness=complete" in status[0]
+
+
+def test_status_omits_contract_skips_when_there_were_none(capsys):
+    """Presence has to mean something went wrong, so a clean run must not
+    carry contract_skips=0 -- the same rule usage follows."""
+    runner.emit_status("dry-run", sha="abc123", pages=2)
+    status = [
+        ln for ln in capsys.readouterr().out.splitlines()
+        if ln.startswith("DOCS_RUNNER_STATUS")
+    ]
+    assert "contract_skips" not in status[0]
 
 
 def test_partial_reasons_ride_on_the_terminal_status(capsys):
@@ -1041,3 +1078,127 @@ def test_status_omits_the_model_when_no_call_was_made(capsys):
 
     line = capsys.readouterr().out.strip()
     assert "model=" not in line
+
+
+# ---------------------------------------------------------------------------
+# AttractorBackend
+# ---------------------------------------------------------------------------
+# The binary is not in the test environment, so these exercise the parts that
+# are this project's: how the model id is built, what reaches the working
+# directory, what is read back, and what happens when the pipeline misbehaves.
+# The pipeline's own behaviour belongs to strange-lettractor.
+
+
+def _fake_attractor(tmp_path, script):
+    """A stand-in `attractor` binary that runs `script` in the run directory.
+
+    The real one is a 200MB let-go bundle built into the image. What this
+    project has to get right is the file contract on either side of it, and a
+    shell script exercises that contract exactly as the real binary would.
+    """
+    fake = tmp_path / "fake-attractor"
+    fake.write_text("#!/bin/sh\n" + script)
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_attractor_qualifies_a_bare_model_id(monkeypatch):
+    """MODEL_NAME is the bare id the Anthropic SDK takes; attractor wants
+    `provider/name`. Deriving it means a comparison run sets MODEL_NAME once
+    and both backends genuinely use the same model."""
+    import backends
+
+    monkeypatch.delenv("ATTRACTOR_MODEL", raising=False)
+    monkeypatch.delenv("ATTRACTOR_PROVIDER", raising=False)
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+    assert backends.AttractorBackend().model == "anthropic/claude-opus-5"
+
+
+def test_attractor_leaves_an_already_qualified_id_alone(monkeypatch):
+    import backends
+
+    monkeypatch.delenv("ATTRACTOR_MODEL", raising=False)
+    monkeypatch.setenv("MODEL_NAME", "openrouter/qwen/qwen3.5-9b")
+    assert backends.AttractorBackend().model == "openrouter/qwen/qwen3.5-9b"
+
+
+def test_attractor_writes_the_prompts_and_reads_the_answer(monkeypatch, tmp_path):
+    """The file names are the whole interface between this class and the DOT
+    graph. A rename on either side has to break a test, not a cluster run."""
+    import backends
+
+    monkeypatch.setenv(
+        "ATTRACTOR_BIN",
+        _fake_attractor(
+            tmp_path,
+            # Prove both inputs arrived, then answer using one of them.
+            'test -s task.system.md || exit 3\n'
+            'mkdir -p state\n'
+            '{ echo "SYS:$(cat task.system.md)"; echo "USR:$(cat task.user.md)"; } '
+            '> state/answer.md\n',
+        ),
+    )
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+
+    backend = backends.AttractorBackend()
+    reply = backend.complete(system="be careful", user="the diff")
+
+    assert reply == "SYS:be careful\nUSR:the diff\n"
+    # One record per page, matching what `calls` means for every other backend,
+    # with the tokens marked unavailable rather than reported as zero.
+    assert backend.usage.calls == 1
+    assert backend.usage.calls_without_usage == 1
+    assert backend.usage.input_tokens == 0
+
+
+def test_attractor_reports_a_failing_pipeline_with_its_output(monkeypatch, tmp_path):
+    import backends
+
+    monkeypatch.setenv(
+        "ATTRACTOR_BIN",
+        _fake_attractor(tmp_path, 'echo "verify gate failed"\nexit 1\n'),
+    )
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+
+    with pytest.raises(RuntimeError, match="verify gate failed"):
+        backends.AttractorBackend().complete(system="s", user="u")
+
+
+def test_attractor_refuses_a_clean_exit_with_no_answer(monkeypatch, tmp_path):
+    """A graph that reaches its exit node without an answer stage is a graph
+    bug. Returning "" would look like the model declining to change the page,
+    and runner.py would record a no-change for a page never considered."""
+    import backends
+
+    monkeypatch.setenv("ATTRACTOR_BIN", _fake_attractor(tmp_path, "exit 0\n"))
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+
+    with pytest.raises(RuntimeError, match="without writing"):
+        backends.AttractorBackend().complete(system="s", user="u")
+
+
+def test_attractor_removes_the_run_directory(monkeypatch, tmp_path):
+    """The scratch holds a copy of the prompt, which holds the page and the
+    diff, and a run processes several pages."""
+    import backends
+
+    marker = tmp_path / "where"
+    monkeypatch.setenv(
+        "ATTRACTOR_BIN",
+        _fake_attractor(
+            tmp_path,
+            f'pwd > "{marker}"\nmkdir -p state\necho ok > state/answer.md\n',
+        ),
+    )
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+
+    backends.AttractorBackend().complete(system="s", user="u")
+    assert not Path(marker.read_text().strip()).exists()
+
+
+def test_attractor_is_selectable_by_backend_name(monkeypatch):
+    import backends
+
+    monkeypatch.setenv("MODEL_BACKEND", "attractor")
+    monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
+    assert backends.load().name == "attractor"

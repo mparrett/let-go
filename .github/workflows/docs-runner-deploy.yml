@@ -34,7 +34,7 @@ on:
         required: false
         default: dry
         type: choice
-        options: [dry, prod, eval]
+        options: [dry, prod, eval, attractor]
       model_name:
         description: "Model to use (default: the MODEL_NAME repo variable; REQUIRED for eval)"
         required: false
@@ -45,6 +45,10 @@ on:
         type: string
       model_max_tokens:
         description: "Output cap for eval only (default: the template's 16000)"
+        required: false
+        type: string
+      page_iterations:
+        description: "Per-page iteration budget for attractor only (1-8; default: the template's 3)"
         required: false
         type: string
 
@@ -162,6 +166,12 @@ jobs:
       # this is a computed flag rather than a check at the call site.
       IS_EVAL: ${{ github.event_name == 'workflow_dispatch' && inputs.entrypoint == 'eval' }}
 
+      # Same shape, same reason. `attractor-page-max-iterations` is declared
+      # only on the attractor entrypoint, so `--set` against any other one is an
+      # error rather than a no-op.
+      IS_ATTRACTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.entrypoint == 'attractor' }}
+      PAGE_ITERATIONS: ${{ inputs.page_iterations }}
+
       # Reads as "dry unless someone dispatched this and explicitly named
       # another entrypoint". The default-to-dry fallthrough is deliberate and
       # load-bearing twice over: on any non-dispatch event `inputs.entrypoint`
@@ -187,6 +197,7 @@ jobs:
         ${{ github.event_name != 'workflow_dispatch' && 'local/monk-io-letgo/docs-runner-dry'
          || inputs.entrypoint == 'prod' && 'local/monk-io-letgo/docs-runner-prod'
          || inputs.entrypoint == 'eval' && 'local/monk-io-letgo/docs-runner-eval'
+         || inputs.entrypoint == 'attractor' && 'local/monk-io-letgo/docs-runner-attractor'
          || 'local/monk-io-letgo/docs-runner-dry' }}
 
     steps:
@@ -303,10 +314,21 @@ jobs:
           if [ "$IS_EVAL" = "true" ] && [ -n "${MODEL_MAX_TOKENS:-}" ]; then
             args+=(--set model-max-tokens="$MODEL_MAX_TOKENS")
           fi
+          # Only the attractor entrypoint declares it. The graph clamps an
+          # out-of-range value back to its own default rather than trusting
+          # this one, so a typo here costs a confusing log line rather than a
+          # run that silently burns eight iterations a page.
+          if [ "$IS_ATTRACTOR" = "true" ] && [ -n "${PAGE_ITERATIONS:-}" ]; then
+            args+=(--set attractor-page-max-iterations="$PAGE_ITERATIONS")
+          fi
 
           if [ "$IS_EVAL" = "true" ]; then
             echo "model: $MODEL_NAME" \
                  "max-tokens: ${MODEL_MAX_TOKENS:-<template default>}"
+          elif [ "$IS_ATTRACTOR" = "true" ]; then
+            echo "model: ${MODEL_NAME:-<template default>}" \
+                 "effort: ${MODEL_EFFORT:-<template default>}" \
+                 "page-iterations: ${PAGE_ITERATIONS:-<template default>}"
           else
             echo "model: ${MODEL_NAME:-<template default>}" \
                  "effort: ${MODEL_EFFORT:-<template default>}"
