@@ -45,17 +45,29 @@ digraph WikiPageUpdate {
     // chat instead of writing the file is a real failure mode, and catching it
     // here names it instead of letting the contract gate report an empty answer.
     draft [shape=box, class="maker", must_write="state/answer.md",
-        prompt="Read task.system.md IN FULL -- it is your system prompt and its output contract is binding. Then read task.user.md, which holds the commit, its diff, and the current body of one wiki page. Do exactly what task.system.md asks and write the result to state/answer.md. Write ONLY the deliverable: either the complete updated page starting with its frontmatter block, or the two words NO CHANGE and nothing else. No preamble, no explanation, no code fence around the whole thing -- state/answer.md is copied to the wiki verbatim."]
+        prompt="Read task.system.md IN FULL -- it is your system prompt and its output contract is binding, and it is the ONLY place that says which of two jobs this is. Updating an existing page asks for the complete updated page starting with its frontmatter block, or the exact words NO CHANGE. Deciding whether a source file needs a NEW page asks for a PATH: line, a SUMMARY: line, then the page starting with its frontmatter block, or the exact words NO PAGE. Then read task.user.md, which holds the commit and its diff. Do exactly what task.system.md asks and write the result to state/answer.md. Write ONLY the deliverable: no preamble, no explanation, no code fence around the whole thing -- state/answer.md is consumed verbatim."]
 
-    // The contract gate. Every one of these checks mirrors a check runner.py
-    // applies to a reply, and each corresponds to an observed model failure:
-    // a bare frontmatter block with no page (seen while evaluating candidate
-    // models), a reply that forgot the frontmatter, and a whole page wrapped in
-    // a Markdown fence. In the single-call backends each of these silently
-    // costs the page. Here it costs an iteration.
+    // The contract gate. Every check here mirrors one runner.py applies to a
+    // reply, and each corresponds to an observed model failure: a bare
+    // frontmatter block with no page (seen while evaluating candidate models),
+    // a reply that forgot the frontmatter, and a whole page wrapped in a
+    // Markdown fence. In the single-call backends each of these silently costs
+    // the page. Here it costs an iteration.
+    //
+    // There are TWO contracts, not one, and conflating them was a real bug: the
+    // first cluster run to reach a new-page decision failed here on a reply that
+    // was correct. `update_page` wants a page starting with `---`, or NO CHANGE.
+    // `create_page` wants `PATH:`, `SUMMARY:`, then the page, or NO PAGE -- a
+    // reply that never starts with `---`. A gate that knows only the first
+    // rejects every well-formed new-page answer, which would make this backend
+    // worse than the single call at exactly the job it is meant to improve.
+    //
+    // The shape is detected from the answer rather than passed in, because
+    // `Backend.complete(system, user)` carries no signal about which call it is
+    // and widening that interface would touch every other backend.
     contract [shape=parallelogram, timeout="30s", class="gate", max_retries=0,
         goal_gate=true,
-        tool_command="n=$(cat state/iter 2>/dev/null); n=$((${n:-0}+1)); echo $n > state/iter; B=$(cat state/budget 2>/dev/null); B=${B:-3}; if [ \"$n\" -gt \"$B\" ]; then printf exhausted; exit 0; fi; : > state/contract.log; A=state/answer.md; if [ ! -s \"$A\" ]; then echo 'answer.md is missing or empty' >> state/contract.log; elif [ \"$(tr -d '[:space:]' < \"$A\")\" = 'NOCHANGE' ]; then printf green; exit 0; else head -1 \"$A\" | grep -q '^---$' || echo 'the reply does not begin with a frontmatter delimiter line (---); runner.py drops such a page' >> state/contract.log; head -1 \"$A\" | grep -q '^[[:space:]]*```' && echo 'the reply is wrapped in a Markdown code fence; write the page itself, not a fenced block' >> state/contract.log; c=$(awk 'NR==1 && /^---$/{s=1; next} s==1 && /^---$/{s=2; next} s==2 && NF{n++} END{print n+0}' \"$A\"); [ \"${c:-0}\" -gt 0 ] || echo 'the reply is a frontmatter block with no page body after it; an empty page is worse than no page' >> state/contract.log; fi; if [ -s state/contract.log ]; then printf red; exit 1; fi; printf green"]
+        tool_command="n=$(cat state/iter 2>/dev/null); n=$((${n:-0}+1)); echo $n > state/iter; B=$(cat state/budget 2>/dev/null); B=${B:-3}; if [ \"$n\" -gt \"$B\" ]; then printf exhausted; exit 0; fi; : > state/contract.log; A=state/answer.md; T=$(tr -d '[:space:]' < \"$A\" 2>/dev/null); if [ ! -s \"$A\" ]; then echo 'answer.md is missing or empty' >> state/contract.log; elif [ \"$T\" = 'NOCHANGE' ] || [ \"$T\" = 'NOPAGE' ]; then printf green; exit 0; else head -1 \"$A\" | grep -q '^[[:space:]]*```' && echo 'the reply is wrapped in a Markdown code fence; write the deliverable itself, not a fenced block' >> state/contract.log; if head -1 \"$A\" | grep -q '^PATH:'; then grep -q '^SUMMARY:' \"$A\" || echo 'a new-page reply needs a SUMMARY: line after PATH:' >> state/contract.log; grep -q '^---$' \"$A\" || echo 'a new-page reply needs the page itself after SUMMARY:, starting with a frontmatter delimiter line (---)' >> state/contract.log; elif ! head -1 \"$A\" | grep -q '^---$'; then echo 'the reply begins with neither a frontmatter delimiter line (---) nor a PATH: line; runner.py drops such a reply' >> state/contract.log; fi; c=$(awk '/^---$/{ if(s==0){s=1; next} else if(s==1){s=2; next} } s==2 && NF{n++} END{print n+0}' \"$A\"); [ \"${c:-0}\" -gt 0 ] || echo 'there is no page body after the frontmatter block; an empty page is worse than no page' >> state/contract.log; fi; if [ -s state/contract.log ]; then printf red; exit 1; fi; printf green"]
 
     repair [shape=box, class="maker", must_write="state/answer.md",
         prompt="Your previous answer violated the output contract. state/contract.log lists exactly what is wrong with state/answer.md; task.system.md states the contract it breaks. Fix state/answer.md so every complaint in state/contract.log is resolved. Change only what the contract requires -- the substance of the page was not what was rejected, its shape was. Do not add commentary to the file."]
