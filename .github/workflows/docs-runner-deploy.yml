@@ -102,6 +102,7 @@ jobs:
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_TLS_VERIFY: ${{ secrets.REGISTRY_TLS_VERIFY }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           read -r tag source dockerfile <<<"$(
@@ -113,7 +114,10 @@ jobs:
           fi
           echo "building $tag from $source/$dockerfile"
 
-          podman build -t "$tag" -f "$source/$dockerfile" "$source"
+          # Stamps the image with the commit its sources came from, which the
+          # deploy job below checks before accepting a run. See the Dockerfile.
+          podman build --build-arg IMAGE_BUILD_SHA="$GITHUB_SHA" \
+            -t "$tag" -f "$source/$dockerfile" "$source"
           podman tag "$tag" "$REGISTRY_ADDRESS/$tag"
           podman push --tls-verify="${REGISTRY_TLS_VERIFY:-true}" \
             --creds="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
@@ -145,6 +149,10 @@ jobs:
       MONK_NO_INTERACTIVE: "true"
 
       SOURCE_SHA: ${{ inputs.sha || github.sha }}
+
+      # The commit this run built the image from -- distinct from SOURCE_SHA,
+      # which is the commit being documented and is usually a different one.
+      GITHUB_SHA: ${{ github.sha }}
 
       # Resolved the same way wiki-docs.yml resolves them, so a dispatch of
       # either workflow at the same commit runs the same model. Without this the
@@ -366,9 +374,48 @@ jobs:
               -v "$PWD:/work" -w /work/tools/docs-runner \
               --entrypoint monk "$MONK_CI_IMAGE" "$@"
           }
+          # Checked inside the loop rather than after it, because the whole
+          # point is to stop before paying for a model run. The runner prints
+          # this line before it does anything else.
+          #
+          # Measured 2026-09-21: the node served an older image across three
+          # deploys while the build job pushed a new one and reported success --
+          # "Checking/pulling images" took 0.5s each time, including on runs
+          # whose delete reported "deleted successfully", and including the
+          # untouched dry path. The job then documents a commit using code that
+          # never contained the change under test, and every step goes green.
+          # The IMAGE name now carries a bump to force a fresh pull; this is
+          # what proves the pull happened rather than assuming it did again.
+          check_image() {
+            marker=$(grep -m1 "^DOCS_RUNNER_IMAGE" run.log 2>/dev/null || true)
+            [ -n "$marker" ] || return 0
+            got=${marker##*build_sha=}
+            # An image built outside this workflow carries no stamp. Warn and
+            # continue: refusing would block a hand-built image that is
+            # legitimately what someone wants to run.
+            if [ "$got" = "unknown" ]; then
+              echo "::warning::image carries no build sha; cannot verify it is $GITHUB_SHA"
+              return 0
+            fi
+            if [ "$got" != "$GITHUB_SHA" ]; then
+              echo "::error::stale image: the cluster is running sources from" \
+                   "$got, but this run built and pushed $GITHUB_SHA. The node" \
+                   "served a cached copy instead of pulling. Bump the IMAGE" \
+                   "name in the MANIFEST and the matching image: in" \
+                   "template.yaml to force a pull." >&2
+              exit 1
+            fi
+            echo "image verified: built from $got"
+          }
+
           deadline=$(( $(date +%s) + 1800 ))
+          verified=
           while :; do
             monk logs --last 2000 "$WORKLOAD" > run.log 2>&1 || true
+            if [ -z "$verified" ] && grep -q "^DOCS_RUNNER_IMAGE" run.log; then
+              check_image
+              verified=yes
+            fi
             if grep -q '^DOCS_RUNNER_STATUS' run.log; then
               echo "terminal status reached"
               break

@@ -67,6 +67,18 @@ def log(msg: str) -> None:
 _PARTIAL_REASONS: list[str] = []
 
 
+def emit_image_marker() -> None:
+    """Announce which commit's sources this image holds, before doing any work.
+
+    The deploy workflow matches this against the commit it just built and
+    refuses the run on a mismatch. Without it a stale image is invisible: the
+    container runs old code, the job succeeds, and the status line describes a
+    commit that was documented by the wrong sources.
+    """
+    build_sha = os.environ.get("IMAGE_BUILD_SHA", "").strip()
+    log(f"DOCS_RUNNER_IMAGE build_sha={build_sha or 'unknown'}")
+
+
 def note_partial(reason: str, **fields: object) -> None:
     """Record that the run is incomplete, without ending it."""
     _PARTIAL_REASONS.append(reason)
@@ -1102,6 +1114,7 @@ def open_pull_request(
 
 
 def main() -> int:
+    emit_image_marker()
     cfg = Config.from_env()
     register_secret(cfg.github_token)
     register_secret(os.environ.get("ANTHROPIC_API_KEY"))

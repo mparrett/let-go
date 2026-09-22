@@ -135,4 +135,16 @@ RUN mkdir -p /work /work/attractor-home
 # machine, buffered output that never flushes is output that never existed.
 ENV PYTHONUNBUFFERED=1
 
+# Which commit's sources are actually inside this image. Last, so it invalidates
+# no earlier layer and costs nothing to vary.
+#
+# It exists because a mutable image name plus a node cache made staleness
+# silent: on 2026-09-21 the cluster ran old code across three deploys while the
+# build job pushed a new image and every step reported success. runner.py prints
+# this on startup and the deploy workflow refuses to accept a run whose image
+# does not carry the commit it just built. Unset in a local build, which is why
+# the runner treats an empty value as "unknown" rather than as a mismatch.
+ARG IMAGE_BUILD_SHA=""
+ENV IMAGE_BUILD_SHA=$IMAGE_BUILD_SHA
+
 ENTRYPOINT ["python", "/app/runner.py"]

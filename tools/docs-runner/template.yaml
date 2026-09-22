@@ -53,7 +53,8 @@ docs-runner:
 
   containers:
     runner:
-      image: docs-runner
+      # Must match the MANIFEST's IMAGE name exactly, bump included.
+      image: docs-runner-2
       # The job is supposed to exit. Without this, a clean exit(0) looks like a
       # crash and the container is started again, re-running the whole job.
       restart: 'no'
