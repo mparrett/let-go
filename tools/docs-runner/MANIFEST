@@ -58,20 +58,19 @@ SECRET anthropic-api-key docs-runner-github-token
 # Dockerfile and the sources it COPYs. Monk resolves it relative to this
 # MANIFEST, not to the git repository root two levels up.
 #
-# The `-2` is a cache-buster, and it has to be bumped whenever the image's
-# contents change until immutable tagging lands. Measured 2026-09-21: the node
-# kept serving an older `docs-runner:latest` across three deploys while the
-# build job pushed a new one and reported success. `Checking/pulling images`
-# completed in 0.5s every time, on the untouched `dry` path as well as on a new
-# entrypoint, and on runs where the delete reported `deleted successfully` --
-# so the delete-without-`--ignore-images` above is not evicting the node's copy,
+# The name is a base: the deploy workflow pushes `<base>-<commit>` and rewrites
+# this line and template.yaml's `image:` to it before loading, so every run uses
+# a name the node has never resolved. Measured 2026-09-21: the node kept serving
+# an older `docs-runner:latest` across three deploys while the build job pushed a
+# new one and reported success. `Checking/pulling images` completed in 0.5s
+# every time, on the untouched `dry` path as well as on a new entrypoint, and on
+# runs where the delete reported `deleted successfully` -- so the
+# delete-without-`--ignore-images` above is not evicting the node's copy,
 # whatever it did on 2026-09-13. The failure is silent: the container runs old
 # code and every step reports success.
 #
-# A name the node has never resolved cannot be answered from its cache, which is
-# the one property that holds without knowing why the eviction stopped working.
-# It is a bump, not a fix -- the new name is still mutable and will go stale the
-# same way on the next push. What makes that survivable is the build-sha check
-# in the deploy workflow, which now fails the run instead of quietly documenting
-# a commit with the wrong code. See docs-runner-deploy.yml.
-IMAGE docs-runner-4 monk-io-letgo/docs-runner,monk-io-letgo/docs-runner-anthropic,monk-io-letgo/docs-runner-dry,monk-io-letgo/docs-runner-prod,monk-io-letgo/docs-runner-eval,monk-io-letgo/docs-runner-attractor . Dockerfile
+# A hand-bumped suffix (`-2` to `-4`) worked around it until someone forgot the
+# bump. The build-sha check in the deploy workflow still backs the per-commit
+# name, failing the run rather than quietly documenting a commit with the wrong
+# code. See docs-runner-deploy.yml.
+IMAGE docs-runner monk-io-letgo/docs-runner,monk-io-letgo/docs-runner-anthropic,monk-io-letgo/docs-runner-dry,monk-io-letgo/docs-runner-prod,monk-io-letgo/docs-runner-eval,monk-io-letgo/docs-runner-attractor . Dockerfile

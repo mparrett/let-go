@@ -73,6 +73,8 @@ jobs:
     defaults:
       run:
         working-directory: tools/docs-runner
+    outputs:
+      image: ${{ steps.build.outputs.image }}
 
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +92,7 @@ jobs:
           fi
 
       - name: Build and push
+        id: build
         # Replicates monk-io/monk-actions/build-images rather than calling it.
         # That action is composite and its script requires MANIFEST in the
         # working directory, and `working-directory` is not honoured on a
@@ -97,6 +100,15 @@ jobs:
         # this project's MANIFEST lives. The tag, source and dockerfile are read
         # from the MANIFEST's IMAGE line so this stays in step with it rather
         # than hardcoding a name in two places.
+        #
+        # The pushed name is the MANIFEST's base name plus the commit, and the
+        # deploy job rewrites the MANIFEST and template to it. A name the node
+        # has never resolved cannot be answered from its cache -- the property
+        # the hand-bumped `-2`/`-3`/`-4` relied on, which was forgotten once
+        # after a graph change inside the image. The commit goes in the name
+        # rather than a `:tag` because a new name is the mechanism observed to
+        # force a pull on this cluster; how the node treats a new tag on a name
+        # it already holds was never verified (the CLI reference 404s).
         env:
           REGISTRY_ADDRESS: ${{ secrets.REGISTRY_ADDRESS }}
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
@@ -112,16 +124,18 @@ jobs:
             echo "::error::no usable IMAGE line in MANIFEST" >&2
             exit 1
           fi
-          echo "building $tag from $source/$dockerfile"
+          image="$tag-${GITHUB_SHA:0:12}"
+          echo "building $image from $source/$dockerfile"
 
           # Stamps the image with the commit its sources came from, which the
           # deploy job below checks before accepting a run. See the Dockerfile.
           podman build --build-arg IMAGE_BUILD_SHA="$GITHUB_SHA" \
-            -t "$tag" -f "$source/$dockerfile" "$source"
-          podman tag "$tag" "$REGISTRY_ADDRESS/$tag"
+            -t "$image" -f "$source/$dockerfile" "$source"
+          podman tag "$image" "$REGISTRY_ADDRESS/$image"
           podman push --tls-verify="${REGISTRY_TLS_VERIFY:-true}" \
             --creds="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
-            "$REGISTRY_ADDRESS/$tag"
+            "$REGISTRY_ADDRESS/$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
   deploy:
     name: deploy and run
@@ -153,6 +167,9 @@ jobs:
       # The commit this run built the image from -- distinct from SOURCE_SHA,
       # which is the commit being documented and is usually a different one.
       GITHUB_SHA: ${{ github.sha }}
+
+      # The per-commit image name the build job pushed. See its build step.
+      IMAGE: ${{ needs.build-image.outputs.image }}
 
       # Resolved the same way wiki-docs.yml resolves them, so a dispatch of
       # either workflow at the same commit runs the same model. Without this the
@@ -230,6 +247,25 @@ jobs:
             echo "::error::missing repository secrets:$missing - re-run monk.cicd.setup" >&2
             exit 1
           fi
+
+      - name: Point the MANIFEST and template at this run's image
+        # Both files carry the base name at rest; the build job pushed
+        # `<base>-<commit>`. The two must agree or the runnable names an image
+        # nothing built, so the rewrite is verified rather than assumed -- this
+        # also catches the two base names drifting apart in the repository.
+        working-directory: tools/docs-runner
+        run: |
+          set -euo pipefail
+          base=$(awk '$1=="IMAGE"{print $2; exit}' MANIFEST)
+          sed -i "s|^IMAGE $base |IMAGE $IMAGE |" MANIFEST
+          sed -i "s|^\( *image: \)$base\$|\1$IMAGE|" template.yaml
+          if ! grep -q "^IMAGE $IMAGE " MANIFEST \
+             || ! grep -q "^ *image: $IMAGE\$" template.yaml; then
+            echo "::error::could not point both MANIFEST and template.yaml at" \
+                 "$IMAGE; their image names must both be '$base' at rest" >&2
+            exit 1
+          fi
+          echo "deploying image $IMAGE"
 
       - name: Deploy the workload
         # `monk load` then `monk update`, which is exactly what Monk's own
@@ -384,8 +420,8 @@ jobs:
           # whose delete reported "deleted successfully", and including the
           # untouched dry path. The job then documents a commit using code that
           # never contained the change under test, and every step goes green.
-          # The IMAGE name now carries a bump to force a fresh pull; this is
-          # what proves the pull happened rather than assuming it did again.
+          # The image name now carries the commit to force a fresh pull; this
+          # is what proves the pull happened rather than assuming it did again.
           check_image() {
             marker=$(grep -m1 "^DOCS_RUNNER_IMAGE" run.log 2>/dev/null || true)
             [ -n "$marker" ] || return 0
@@ -399,10 +435,9 @@ jobs:
             fi
             if [ "$got" != "$GITHUB_SHA" ]; then
               echo "::error::stale image: the cluster is running sources from" \
-                   "$got, but this run built and pushed $GITHUB_SHA. The node" \
-                   "served a cached copy instead of pulling. Bump the IMAGE" \
-                   "name in the MANIFEST and the matching image: in" \
-                   "template.yaml to force a pull." >&2
+                   "$got, but this run built and pushed $GITHUB_SHA as" \
+                   "$IMAGE. A per-commit name should never be served from" \
+                   "cache, so check what the rewrite step deployed." >&2
               exit 1
             fi
             echo "image verified: built from $got"

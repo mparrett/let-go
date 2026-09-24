@@ -53,8 +53,9 @@ docs-runner:
 
   containers:
     runner:
-      # Must match the MANIFEST's IMAGE name exactly, bump included.
-      image: docs-runner-4
+      # Must match the MANIFEST's IMAGE base name exactly; the deploy workflow
+      # rewrites both to the per-commit name and fails if they disagree.
+      image: docs-runner
       # The job is supposed to exit. Without this, a clean exit(0) looks like a
       # crash and the container is started again, re-running the whole job.
       restart: 'no'
