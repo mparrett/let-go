@@ -276,6 +276,11 @@ class AttractorBackend:
     # interface carries no other signal of it. A test pins the two together.
     TARGET_LINE = re.compile(r"^Current contents of `([^`]+)`:$", re.MULTILINE)
 
+    # One line per stage outcome in `attractor run`'s stdout, e.g.
+    #   ✓ Stage 'contract' completed -> :success
+    #   ✗ Stage 'draft' failed!
+    STAGE_LINE = re.compile(r"Stage '([^']+)' (?:completed -> :(\w+)|(failed))")
+
     def __init__(self) -> None:
         self.binary = os.environ.get("ATTRACTOR_BIN", "attractor")
         self.graph = os.environ.get(
@@ -317,6 +322,38 @@ class AttractorBackend:
     def bind_wiki(self, wiki: Path) -> None:
         """Let the graph run the wiki's own validator over each answer."""
         self.wiki = wiki
+
+    def _log_trace(self, stdout: str, base: Path) -> None:
+        """Say which stages a successful page run went through.
+
+        A failure already carries the pipeline's output; a success used to
+        leave nothing, so whether the critique approved first time, a repair
+        happened, or the wiki_check gate ran at all was invisible in the log.
+        The gate completes successfully whether it validated or skipped, so
+        its own evidence is read from state: the baseline it writes only when
+        the validator really ran over the wiki copy.
+        """
+        stages = []
+        for name, outcome, failed in self.STAGE_LINE.findall(stdout):
+            if name in ("start", "done"):
+                continue
+            mark = "!" if failed else ("" if outcome == "success" else f":{outcome}")
+            stages.append(f"{name}{mark}")
+        print(f"  attractor path: {' > '.join(stages) or 'no stages reported'}",
+              flush=True)
+        if self.wiki is not None:
+            baseline = base / "state" / "wiki-baseline.txt"
+            if baseline.exists():
+                known = sum(1 for line in baseline.read_text().splitlines() if line)
+                print(f"  wiki_check: validator ran ({known} pre-existing "
+                      "complaint(s) ignored)", flush=True)
+            else:
+                print("  wiki_check: validator did not run "
+                      "(a NO CHANGE/NO PAGE answer, or it was unavailable)",
+                      flush=True)
+        if (base / "state" / "unconverged").exists():
+            print("  UNCONVERGED: budget spent without critic approval",
+                  flush=True)
 
     def complete(self, system: str, user: str) -> str:
         import shutil
@@ -377,6 +414,7 @@ class AttractorBackend:
                     "the graph reached its exit node without an answer stage, "
                     "which is a graph bug rather than a model refusal"
                 )
+            self._log_trace(result.stdout, base)
             return answer.read_text(encoding="utf-8")
         finally:
             # The scratch holds a copy of the prompt, which holds the page and

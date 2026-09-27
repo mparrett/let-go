@@ -156,3 +156,27 @@ def test_a_bound_backend_hands_the_gate_its_inputs(monkeypatch, tmp_path, wiki):
     assert Path(f"{seen}.wiki").read_text() == str(wiki.resolve())
     assert Path(f"{seen}.target").read_text() == "concepts/vm.md"
     assert Path(f"{seen}.check").read_text().strip().endswith("pipelines/wiki_check.py")
+
+
+def test_a_successful_run_logs_its_path_and_whether_the_gate_validated(
+    monkeypatch, tmp_path, wiki, capsys
+):
+    fake = tmp_path / "fake-attractor"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "echo \"  ✓ Stage 'start' completed -> :success\"\n"
+        "echo \"  ✓ Stage 'draft' completed -> :success\"\n"
+        "echo \"  ✗ Stage 'contract' failed!\"\n"
+        "echo \"  ✓ Stage 'repair' completed -> :success\"\n"
+        "echo \"  ✓ Stage 'wiki_check' completed -> :success\"\n"
+        "printf 'a: old complaint\\n' > state/wiki-baseline.txt\n"
+        "printf -- '---\\ntitle: vm\\n---\\nBody.\\n' > state/answer.md\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("ATTRACTOR_BIN", str(fake))
+    backend = backends.AttractorBackend()
+    backend.bind_wiki(wiki)
+    backend.complete(system="s", user="u")
+    out = capsys.readouterr().out
+    assert "attractor path: draft > contract! > repair > wiki_check" in out
+    assert "wiki_check: validator ran (1 pre-existing complaint(s) ignored)" in out
