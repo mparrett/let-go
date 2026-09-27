@@ -148,7 +148,24 @@ jobs:
             exit 1
           fi
           image="$tag-${GITHUB_SHA:0:12}"
-          echo "building $image from $source/$dockerfile"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          # The name is derived from the commit the image is built from, so an
+          # existing one already has exactly these sources. That is the common
+          # case when one revision of this workflow documents several let-go
+          # commits in a row. The deploy's build-sha check still verifies what
+          # the node actually runs, so a wrong skip would fail loudly.
+          insecure=()
+          if [ "${REGISTRY_TLS_VERIFY:-true}" = "false" ]; then insecure=(-k); fi
+          code=$(curl -sS "${insecure[@]}" -o /dev/null -w '%{http_code}' -I \
+            -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://$REGISTRY_ADDRESS/v2/$image/manifests/latest" || true)
+          if [ "$code" = "200" ]; then
+            echo "$image is already in the registry; not rebuilding"
+            exit 0
+          fi
+          echo "building $image from $source/$dockerfile (registry answered $code)"
 
           # Stamps the image with the commit its sources came from, which the
           # deploy job below checks before accepting a run. See the Dockerfile.
@@ -158,7 +175,6 @@ jobs:
           podman push --tls-verify="${REGISTRY_TLS_VERIFY:-true}" \
             --creds="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
             "$REGISTRY_ADDRESS/$image"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
 
   deploy:
     name: deploy and run
