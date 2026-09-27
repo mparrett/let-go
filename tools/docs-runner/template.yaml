@@ -286,3 +286,14 @@ docs-runner-attractor:
       type: string
       value: "1500"
       env: ATTRACTOR_TIMEOUT
+
+    # Seconds of silence tolerated between two chunks of one streamed reply.
+    # Attractor's own default is 30. Repair calls hit it on the cluster on
+    # 2026-09-21 (`http stream_read timeout after 30s`); those calls were a
+    # symptom of the since-fixed contract-gate bug, but the ceiling is real for
+    # any long generation. 120 matches attractor's own non-streamed request
+    # timeout.
+    attractor-stream-read-timeout:
+      type: string
+      value: "120"
+      env: ATTRACTOR_STREAM_READ_TIMEOUT
