@@ -180,3 +180,21 @@ def test_a_successful_run_logs_its_path_and_whether_the_gate_validated(
     out = capsys.readouterr().out
     assert "attractor path: draft > contract! > repair > wiki_check" in out
     assert "wiki_check: validator ran (1 pre-existing complaint(s) ignored)" in out
+
+
+def test_an_abandoned_page_reports_why(monkeypatch, tmp_path):
+    fake = tmp_path / "fake-attractor"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "echo 'the reply begins with neither --- nor PATH:' > state/contract.log\n"
+        "printf 'NO CHANGE.\\n' > state/answer.md\n"
+        "echo 'ABANDONED'\n"
+        "exit 1\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("ATTRACTOR_BIN", str(fake))
+    with pytest.raises(RuntimeError) as err:
+        backends.AttractorBackend().complete(system="s", user="u")
+    message = str(err.value)
+    assert "last gate complaint: the reply begins with neither" in message
+    assert "answer.md: 11 bytes, begins 'NO CHANGE.'" in message

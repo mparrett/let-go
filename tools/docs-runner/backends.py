@@ -323,6 +323,28 @@ class AttractorBackend:
         """Let the graph run the wiki's own validator over each answer."""
         self.wiki = wiki
 
+    def _state_evidence(self, base: Path) -> str:
+        """What the page's state said when the pipeline gave up.
+
+        The stage trace says which gate failed; only state/ says why, and
+        the working directory is deleted as soon as this returns. On
+        2026-09-27 a page was abandoned after three contract failures and
+        the reason went with it.
+        """
+        state = base / "state"
+        parts = []
+        log = state / "contract.log"
+        if log.exists() and log.read_text().strip():
+            parts.append("last gate complaint: " + log.read_text().strip()[:600])
+        answer = state / "answer.md"
+        if not answer.exists():
+            parts.append("answer.md: never written")
+        else:
+            text = answer.read_text(encoding="utf-8", errors="replace")
+            head = " | ".join(text.splitlines()[:3])[:200]
+            parts.append(f"answer.md: {len(text)} bytes, begins {head!r}")
+        return "; ".join(parts) or "no state recorded"
+
     def _log_trace(self, stdout: str, base: Path) -> None:
         """Say which stages a successful page run went through.
 
@@ -406,7 +428,8 @@ class AttractorBackend:
                 # should carry, and the container log has the whole thing.
                 tail = (result.stdout or result.stderr).strip()[-2000:]
                 raise RuntimeError(
-                    f"attractor exited {result.returncode}: {tail}"
+                    f"attractor exited {result.returncode}: "
+                    f"{self._state_evidence(base)}\n{tail}"
                 )
             if not answer.exists():
                 raise RuntimeError(
