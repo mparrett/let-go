@@ -1,0 +1,117 @@
+name: Registry maintenance (Monk)
+
+# Inspects, and on request prunes, the docs runner's images in the letgo-docs
+# cluster registry. Separate from docs-runner-deploy.yml on purpose: deletion
+# is something someone asks for, not a side effect of documenting a commit.
+#
+# The registry is a stock Docker Distribution (`registry/2.0` behind nginx
+# basic auth; probed 2026-09-27). Two properties of that software shape this:
+#  - DELETE works only if the registry was started with deletion enabled;
+#    otherwise every delete answers 405 UNSUPPORTED. `prune` reports which.
+#  - A deleted manifest frees no disk. Only `registry garbage-collect`, run
+#    inside the registry's container, removes the unreferenced layers, and
+#    nothing reachable from here can run it.
+#
+# Credentials are the REGISTRY_* secrets monk.cicd_setup pushed; they exist
+# nowhere else outside the cluster, which is why this is a workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "inspect (read-only) or prune (delete superseded docs-runner images)"
+        required: true
+        default: inspect
+        type: choice
+        options: [inspect, prune]
+      keep:
+        description: "prune only: the image name to keep (default: this ref's commit, as the deploy names it)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Shares the deploy's group so a prune can never delete an image a deploy is
+# about to load.
+concurrency:
+  group: docs-runner-deploy
+  cancel-in-progress: false
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REGISTRY_ADDRESS: ${{ secrets.REGISTRY_ADDRESS }}
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      REGISTRY_TLS_VERIFY: ${{ secrets.REGISTRY_TLS_VERIFY }}
+      MODE: ${{ inputs.mode }}
+      KEEP_INPUT: ${{ inputs.keep }}
+      GITHUB_SHA: ${{ github.sha }}
+    steps:
+      - name: Inspect${{ inputs.mode == 'prune' && ' and prune' || '' }}
+        run: |
+          set -euo pipefail
+          reg() {
+            local insecure=()
+            if [ "${REGISTRY_TLS_VERIFY:-true}" = "false" ]; then insecure=(-k); fi
+            curl -sS "${insecure[@]}" -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" "$@"
+          }
+          base="https://$REGISTRY_ADDRESS/v2"
+          accept='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+
+          repos=$(reg "$base/_catalog?n=1000" | jq -r '.repositories[]?')
+          echo "== $(wc -w <<<"$repos") repositories"
+
+          # Layer sizes per image, and the size of the union of their layers,
+          # which is the most the registry can be holding for them: images
+          # built from one Dockerfile share most layers.
+          declare -A blob_size=()
+          docs_runner=()
+          for repo in $repos; do
+            for tag in $(reg "$base/$repo/tags/list" | jq -r '.tags[]?'); do
+              manifest=$(reg -H "Accept: $accept" "$base/$repo/manifests/$tag")
+              size=$(jq '[.layers[]?.size] | add // 0' <<<"$manifest")
+              printf '%-40s %-8s %6d MB\n' "$repo" "$tag" $((size / 1048576))
+              while read -r digest bytes; do
+                [ -n "$digest" ] && blob_size[$digest]=$bytes
+              done < <(jq -r '.layers[]? | "\(.digest) \(.size)"' <<<"$manifest")
+            done
+            if [[ $repo =~ ^docs-runner-([0-9a-f]{12}|[0-9])$ ]]; then
+              docs_runner+=("$repo")
+            fi
+          done
+          total=0
+          for d in "${!blob_size[@]}"; do total=$((total + blob_size[$d])); done
+          echo "== ${#blob_size[@]} distinct layers, $((total / 1048576)) MB referenced"
+
+          if [ "$MODE" != "prune" ]; then
+            exit 0
+          fi
+
+          keep=${KEEP_INPUT:-docs-runner-${GITHUB_SHA:0:12}}
+          echo "== pruning docs-runner images other than $keep"
+          deleted=0
+          for repo in "${docs_runner[@]}"; do
+            [ "$repo" = "$keep" ] && continue
+            for tag in $(reg "$base/$repo/tags/list" | jq -r '.tags[]?'); do
+              digest=$(reg -I -H "Accept: $accept" "$base/$repo/manifests/$tag" \
+                | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              if [ -z "$digest" ]; then
+                echo "::warning::no digest for $repo:$tag; left in place"
+                continue
+              fi
+              code=$(reg -o /dev/null -w '%{http_code}' -X DELETE "$base/$repo/manifests/$digest")
+              echo "DELETE $repo:$tag -> $code"
+              case $code in
+                202) deleted=$((deleted + 1)) ;;
+                405)
+                  echo "::warning::the registry refuses deletes (405): deletion is not enabled on it"
+                  exit 0 ;;
+                *) echo "::warning::unexpected $code deleting $repo:$tag" ;;
+              esac
+            done
+          done
+          echo "== deleted $deleted manifest(s). Disk is freed only when the registry garbage-collects."
