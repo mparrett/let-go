@@ -363,6 +363,30 @@ class AttractorBackend:
             parts.append(f"answer.md: {len(text)} bytes, begins {head!r}")
         return "; ".join(parts) or "no state recorded"
 
+    def _log_stage_times(self, base: Path) -> None:
+        """How long each model stage took, from the files attractor leaves.
+
+        A model stage writes prompt.md as it starts and status.json as it
+        ends, so the gap between them is the stage's wall clock, and a
+        stage with no status.json was still running when this was called --
+        which after a timeout names the stage that held the page.
+        """
+        import time
+
+        now = time.time()
+        rows = []
+        for prompt in sorted(base.glob("attractor_runs/*/*/prompt.md"),
+                             key=lambda p: p.stat().st_mtime):
+            status = prompt.parent / "status.json"
+            if status.exists():
+                took = status.stat().st_mtime - prompt.stat().st_mtime
+                rows.append(f"{prompt.parent.name} {took:.0f}s")
+            else:
+                took = now - prompt.stat().st_mtime
+                rows.append(f"{prompt.parent.name} {took:.0f}s (still running)")
+        if rows:
+            print(f"  attractor stage times: {', '.join(rows)}", flush=True)
+
     def _log_trace(self, stdout: str, base: Path) -> None:
         """Say which stages a successful page run went through.
 
@@ -373,6 +397,7 @@ class AttractorBackend:
         its own evidence is read from state: the baseline it writes only when
         the validator really ran over the wiki copy.
         """
+        self._log_stage_times(base)
         stages = []
         for name, outcome, failed in self.STAGE_LINE.findall(stdout):
             if name in ("start", "done"):
@@ -432,10 +457,24 @@ class AttractorBackend:
                 "--llm",
                 "--model", self.model,
             ]
-            result = subprocess.run(
-                cmd, cwd=workdir, env=env, capture_output=True, text=True,
-                timeout=self.timeout, check=False,
-            )
+            try:
+                result = subprocess.run(
+                    cmd, cwd=workdir, env=env, capture_output=True, text=True,
+                    timeout=self.timeout, check=False,
+                )
+            except subprocess.TimeoutExpired as expired:
+                # A timeout used to report only the command line: on
+                # 2026-09-27 a page spent its whole 1500s budget and nothing
+                # said which stage held it. Report what a failure reports, plus
+                # where the time went, before the directory is removed.
+                self.usage.record(*self._pipeline_usage(base))
+                raw = expired.stdout or b""
+                partial = raw if isinstance(raw, str) else raw.decode(errors="replace")
+                self._log_trace(partial, base)
+                raise RuntimeError(
+                    f"attractor timed out after {self.timeout}s: "
+                    f"{self._state_evidence(base)}"
+                ) from None
             self.usage.record(*self._pipeline_usage(base))
 
             answer = base / self.OUT_ANSWER

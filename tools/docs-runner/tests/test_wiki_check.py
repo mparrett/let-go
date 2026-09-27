@@ -233,3 +233,28 @@ def test_one_unreported_turn_makes_the_page_unavailable(monkeypatch, tmp_path):
     backend.complete(system="s", user="u")
     assert backend.usage.calls_without_usage == 1
     assert backend.usage.input_tokens == 0
+
+
+def test_a_timed_out_page_names_the_stage_that_held_it(monkeypatch, tmp_path, capsys):
+    fake = tmp_path / "fake-attractor"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "mkdir -p attractor_runs/run_1/draft attractor_runs/run_1/critique\n"
+        "echo p > attractor_runs/run_1/draft/prompt.md\n"
+        "echo '{}' > attractor_runs/run_1/draft/status.json\n"
+        "echo p > attractor_runs/run_1/critique/prompt.md\n"
+        "echo \"  ✓ Stage 'draft' completed -> :success\"\n"
+        "echo 'VERDICT pending' > state/answer.md\n"
+        # exec, so the timeout's kill reaches the process holding the pipes
+        "exec sleep 5\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("ATTRACTOR_BIN", str(fake))
+    monkeypatch.setenv("ATTRACTOR_TIMEOUT", "1")
+    backend = backends.AttractorBackend()
+    with pytest.raises(RuntimeError) as err:
+        backend.complete(system="s", user="u")
+    assert "attractor timed out after 1s" in str(err.value)
+    out = capsys.readouterr().out
+    assert "critique" in out and "(still running)" in out
+    assert backend.usage.calls == 1
