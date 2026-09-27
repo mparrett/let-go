@@ -198,3 +198,38 @@ def test_an_abandoned_page_reports_why(monkeypatch, tmp_path):
     message = str(err.value)
     assert "last gate complaint: the reply begins with neither" in message
     assert "answer.md: 11 bytes, begins 'NO CHANGE.'" in message
+
+
+def _attractor_writing_usage(tmp_path, lines: list[str]) -> str:
+    body = "".join(f"echo '{line}' >> attractor_runs/run_1/$STAGE/usage.jsonl\n"
+                   for line in lines)
+    fake = tmp_path / "fake-attractor"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "for STAGE in draft critique; do mkdir -p attractor_runs/run_1/$STAGE; done\n"
+        "STAGE=draft\n" + body.replace("$STAGE", "draft", 1)
+        + "echo 'NO CHANGE' > state/answer.md\n"
+    )
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_pipeline_tokens_are_summed_from_the_stage_records(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATTRACTOR_BIN", _attractor_writing_usage(tmp_path, [
+        '{"stage":"draft","turns":2,"input_tokens":100,"output_tokens":10,"turns_missing_usage":0}',
+        '{"stage":"draft","turns":1,"input_tokens":50,"output_tokens":5,"turns_missing_usage":0}',
+    ]))
+    backend = backends.AttractorBackend()
+    backend.complete(system="s", user="u")
+    assert (backend.usage.input_tokens, backend.usage.output_tokens) == (150, 15)
+    assert backend.usage.calls_without_usage == 0
+
+
+def test_one_unreported_turn_makes_the_page_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATTRACTOR_BIN", _attractor_writing_usage(tmp_path, [
+        '{"stage":"draft","turns":1,"input_tokens":100,"output_tokens":10,"turns_missing_usage":1}',
+    ]))
+    backend = backends.AttractorBackend()
+    backend.complete(system="s", user="u")
+    assert backend.usage.calls_without_usage == 1
+    assert backend.usage.input_tokens == 0

@@ -307,11 +307,12 @@ class AttractorBackend:
 
         # One record per complete(), deliberately, even though each one spends
         # several model calls internally. `calls` then means the same thing it
-        # means for every other backend -- pages processed -- and the tokens are
-        # reported as unavailable rather than as an undercount that would read
-        # as a measurement. A cost comparison against the baseline has to come
-        # from the provider's own billing, and saying so here is cheaper than
-        # someone later trusting a number this cannot know.
+        # means for every other backend -- pages processed -- while the tokens
+        # are the sum over every model stage the pipeline ran for the page,
+        # read from the usage.jsonl attractor writes into each stage directory.
+        # When any stage turn reported no usage, or no record exists at all
+        # (an attractor too old to write one), the page counts as unavailable
+        # rather than as an undercount that would read as a measurement.
         self.usage = Usage()
 
         # Unbound, the wiki_check gate skips and the graph behaves as it did
@@ -322,6 +323,23 @@ class AttractorBackend:
     def bind_wiki(self, wiki: Path) -> None:
         """Let the graph run the wiki's own validator over each answer."""
         self.wiki = wiki
+
+    def _pipeline_usage(self, base: Path) -> tuple[int | None, int | None]:
+        """Tokens every model stage of this page's pipeline run spent."""
+        import json
+
+        records = []
+        for path in sorted(base.glob("attractor_runs/*/*/usage.jsonl")):
+            records += [json.loads(line) for line in path.read_text().splitlines()
+                        if line.strip()]
+        if not records or any(r.get("turns_missing_usage") for r in records):
+            return None, None
+        tokens_in = sum(int(r.get("input_tokens", 0)) for r in records)
+        tokens_out = sum(int(r.get("output_tokens", 0)) for r in records)
+        turns = sum(int(r.get("turns", 0)) for r in records)
+        print(f"  attractor usage: {turns} model turn(s) over {len(records)} "
+              f"stage run(s), {tokens_in} in / {tokens_out} out", flush=True)
+        return tokens_in, tokens_out
 
     def _state_evidence(self, base: Path) -> str:
         """What the page's state said when the pipeline gave up.
@@ -418,7 +436,7 @@ class AttractorBackend:
                 cmd, cwd=workdir, env=env, capture_output=True, text=True,
                 timeout=self.timeout, check=False,
             )
-            self.usage.record(None, None)
+            self.usage.record(*self._pipeline_usage(base))
 
             answer = base / self.OUT_ANSWER
             if result.returncode != 0:
