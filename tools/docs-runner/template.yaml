@@ -297,3 +297,13 @@ docs-runner-attractor:
       type: string
       value: "120"
       env: ATTRACTOR_STREAM_READ_TIMEOUT
+
+    # Per-response output cap for every model stage. Attractor's Anthropic
+    # adapter defaults to 4096, which truncated a draft's write-file tool call
+    # carrying an updated 11.6 KB page: on 2026-09-27 the draft stage retried
+    # 42 times, spent 124k output tokens and never wrote the page. 64000
+    # matches the one-shot Anthropic backend, so the comparison stays fair.
+    attractor-max-output-tokens:
+      type: string
+      value: "64000"
+      env: ATTRACTOR_MAX_OUTPUT_TOKENS

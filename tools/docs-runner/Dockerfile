@@ -23,12 +23,13 @@
 FROM --platform=linux/amd64 debian:bookworm-slim AS attractor
 ARG LETTRACTOR_REPO=https://github.com/mparrett/strange-lettractor.git
 # `container-build` as of 2026-09-20 (12286f7, the revision the container was
-# built and smoke-tested against) plus two commits on `stream-read-timeout-env`:
-# ATTRACTOR_STREAM_READ_TIMEOUT for the 30s stream-read ceiling, and a
-# usage.jsonl per model stage, which backends.AttractorBackend sums. A branch
-# name here would make the image silently track later pushes, which an
-# evaluation must not do.
-ARG LETTRACTOR_SHA=b02b13ab4b1f4f5a08d8afb99e9bf54c83c8e6bf
+# built and smoke-tested against) plus three commits on `stream-read-timeout-env`:
+# ATTRACTOR_STREAM_READ_TIMEOUT for the 30s stream-read ceiling, a usage.jsonl
+# per model stage (which backends.AttractorBackend sums), and
+# ATTRACTOR_MAX_OUTPUT_TOKENS for the 4096 per-response cap that truncated
+# whole-page tool calls. A branch name here would make the image silently
+# track later pushes, which an evaluation must not do.
+ARG LETTRACTOR_SHA=88052795a172d01bdd7c3b7aa69ebc98fe1d6499
 ARG LETGO_VERSION=1.13.0
 ARG LGX_VERSION=0.3.1
 RUN apt-get update \
