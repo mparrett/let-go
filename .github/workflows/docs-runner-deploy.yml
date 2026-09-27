@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: Commit to document (defaults to the triggering commit)
+        description: Commit to document, short or full (defaults to the triggering commit)
         required: false
         type: string
       entrypoint:
@@ -162,7 +162,8 @@ jobs:
       MONK_CLI_NO_COLOR: "true"
       MONK_NO_INTERACTIVE: "true"
 
-      SOURCE_SHA: ${{ inputs.sha || github.sha }}
+      # Expanded to the full commit as SOURCE_SHA by the resolve step below.
+      SOURCE_SHA_INPUT: ${{ inputs.sha || github.sha }}
 
       # The commit this run built the image from -- distinct from SOURCE_SHA,
       # which is the commit being documented and is usually a different one.
@@ -247,6 +248,24 @@ jobs:
             echo "::error::missing repository secrets:$missing - re-run monk.cicd.setup" >&2
             exit 1
           fi
+
+      - name: Resolve the commit to document
+        # The runner fetches the commit by hash, and a fetch by hash needs all
+        # forty characters: a short SHA got as far as the model's container on
+        # 2026-09-27 and died there on "couldn't find remote ref". The API
+        # accepts any unambiguous prefix, so expand it here, where a typo costs
+        # seconds instead of a deploy. The runner fetches from the template's
+        # source-repo, which is this repository.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          full=$(gh api "repos/${{ github.repository }}/commits/$SOURCE_SHA_INPUT" --jq .sha) || {
+            echo "::error::'$SOURCE_SHA_INPUT' is not a commit in ${{ github.repository }}" >&2
+            exit 1
+          }
+          echo "resolved $SOURCE_SHA_INPUT to $full"
+          echo "SOURCE_SHA=$full" >> "$GITHUB_ENV"
 
       - name: Point the MANIFEST and template at this run's image
         # Both files carry the base name at rest; the build job pushed
