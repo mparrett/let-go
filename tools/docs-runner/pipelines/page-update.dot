@@ -69,6 +69,15 @@ digraph WikiPageUpdate {
         goal_gate=true,
         tool_command="n=$(cat state/iter 2>/dev/null); n=$((${n:-0}+1)); echo $n > state/iter; B=$(cat state/budget 2>/dev/null); B=${B:-3}; if [ \"$n\" -gt \"$B\" ]; then printf exhausted; exit 0; fi; : > state/contract.log; A=state/answer.md; T=$(tr -d '[:space:]' < \"$A\" 2>/dev/null); if [ ! -s \"$A\" ]; then echo 'answer.md is missing or empty' >> state/contract.log; elif [ \"$T\" = 'NOCHANGE' ] || [ \"$T\" = 'NOPAGE' ]; then printf green; exit 0; else head -1 \"$A\" | grep -q '^[[:space:]]*```' && echo 'the reply is wrapped in a Markdown code fence; write the deliverable itself, not a fenced block' >> state/contract.log; if head -1 \"$A\" | grep -q '^PATH:'; then grep -q '^SUMMARY:' \"$A\" || echo 'a new-page reply needs a SUMMARY: line after PATH:' >> state/contract.log; grep -q '^---$' \"$A\" || echo 'a new-page reply needs the page itself after SUMMARY:, starting with a frontmatter delimiter line (---)' >> state/contract.log; elif ! head -1 \"$A\" | grep -q '^---$'; then echo 'the reply begins with neither a frontmatter delimiter line (---) nor a PATH: line; runner.py drops such a reply' >> state/contract.log; fi; c=$(awk '/^---$/{ if(s==0){s=1; next} else if(s==1){s=2; next} } s==2 && NF{n++} END{print n+0}' \"$A\"); [ \"${c:-0}\" -gt 0 ] || echo 'there is no page body after the frontmatter block; an empty page is worse than no page' >> state/contract.log; fi; if [ -s state/contract.log ]; then printf red; exit 1; fi; printf green"]
 
+    // The wiki's own validator, the one verifier here that is not a model.
+    // runner.py runs it too, but once, after every page is written, where a
+    // complaint fails the whole run. Here it costs an iteration. The script
+    // works on a private copy of the wiki and counts only complaints the copy
+    // did not already have; it prints `skip` when the backend was given no
+    // wiki (tests, local experiments), which routes on like a pass.
+    wiki_check [shape=parallelogram, timeout="2m", class="gate", max_retries=0,
+        tool_command="if [ -z \"${DOCS_WIKI_CHECK:-}\" ]; then printf skip; exit 0; fi; \"${DOCS_WIKI_PYTHON:-python3}\" \"$DOCS_WIKI_CHECK\""]
+
     repair [shape=box, class="maker", must_write="state/answer.md",
         prompt="Your previous answer violated the output contract. state/contract.log lists exactly what is wrong with state/answer.md; task.system.md states the contract it breaks. Fix state/answer.md so every complaint in state/contract.log is resolved. Change only what the contract requires -- the substance of the page was not what was rejected, its shape was. Do not add commentary to the file."]
 
@@ -97,9 +106,14 @@ digraph WikiPageUpdate {
 
     draft -> contract
 
-    contract -> critique [condition="context.tool.output=green && outcome=success"]
+    contract -> wiki_check [condition="context.tool.output=green && outcome=success"]
     contract -> repair   [condition="outcome=fail"]
     contract -> give_up  [condition="context.tool.output=exhausted && outcome=success", label="budget spent"]
+
+    // A validator complaint is repaired like a contract break, and the repair
+    // goes back through the contract gate, where the budget is counted.
+    wiki_check -> critique [condition="outcome=success"]
+    wiki_check -> repair   [condition="outcome=fail"]
 
     // Back through the gate rather than onward: the repair is itself a model
     // call and can violate the contract in a new way, and the gate is also

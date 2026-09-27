@@ -10,6 +10,7 @@ the OpenAI SDK for what it actually is.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Protocol
@@ -267,6 +268,14 @@ class AttractorBackend:
     IN_USER = "task.user.md"
     OUT_ANSWER = "state/answer.md"
 
+    # Inputs to the graph's wiki_check gate; see pipelines/wiki_check.py.
+    IN_WIKI = "task.wiki"
+    IN_TARGET = "task.target"
+
+    # runner.USER_PROMPT names the page being updated on this line, and the
+    # interface carries no other signal of it. A test pins the two together.
+    TARGET_LINE = re.compile(r"^Current contents of `([^`]+)`:$", re.MULTILINE)
+
     def __init__(self) -> None:
         self.binary = os.environ.get("ATTRACTOR_BIN", "attractor")
         self.graph = os.environ.get(
@@ -300,9 +309,19 @@ class AttractorBackend:
         # someone later trusting a number this cannot know.
         self.usage = Usage()
 
+        # Unbound, the wiki_check gate skips and the graph behaves as it did
+        # before the gate existed -- which is what a caller without a wiki
+        # checkout (the tests, a local experiment) wants.
+        self.wiki: Path | None = None
+
+    def bind_wiki(self, wiki: Path) -> None:
+        """Let the graph run the wiki's own validator over each answer."""
+        self.wiki = wiki
+
     def complete(self, system: str, user: str) -> str:
         import shutil
         import subprocess
+        import sys
         import tempfile
 
         # A fresh directory per page. Attractor's setup gate refuses to start
@@ -315,6 +334,15 @@ class AttractorBackend:
             (base / "state").mkdir()
             (base / self.IN_SYSTEM).write_text(system, encoding="utf-8")
             (base / self.IN_USER).write_text(user, encoding="utf-8")
+            env = dict(os.environ)
+            if self.wiki is not None:
+                (base / self.IN_WIKI).write_text(str(self.wiki.resolve()))
+                target = self.TARGET_LINE.search(user)
+                (base / self.IN_TARGET).write_text(target.group(1) if target else "")
+                # The same interpreter runner.py validates with, so the gate
+                # and the final check cannot disagree over a missing module.
+                env["DOCS_WIKI_PYTHON"] = sys.executable
+                env["DOCS_WIKI_CHECK"] = str(Path(self.graph).parent / "wiki_check.py")
 
             cmd = [
                 self.binary, "run", self.graph,
@@ -328,7 +356,7 @@ class AttractorBackend:
                 "--model", self.model,
             ]
             result = subprocess.run(
-                cmd, cwd=workdir, capture_output=True, text=True,
+                cmd, cwd=workdir, env=env, capture_output=True, text=True,
                 timeout=self.timeout, check=False,
             )
             self.usage.record(None, None)

@@ -1190,6 +1190,10 @@ def main() -> int:
 
     backend = backends.load()
     set_backend(backend)
+    # Only the attractor backend can use the wiki mid-generation; the others
+    # answer in one call and are checked once, after every page is written.
+    if isinstance(backend, backends.AttractorBackend):
+        backend.bind_wiki(wiki)
 
     updated = [
         page for page in to_edit
