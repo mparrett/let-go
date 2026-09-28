@@ -630,9 +630,61 @@ def update_page(
         note_contract_skip(rel, "reply was frontmatter with no page body")
         return False
 
+    reply, restored = restore_verified_dates(body, reply, diff)
+    if restored:
+        log(f"  {rel}: kept {restored} last-verified date(s) the commit does not move")
+        if reply.strip() == body.strip():
+            log(f"  {rel}: identical to current content")
+            return False
+
     page.write_text(reply + "\n", encoding="utf-8")
     log(f"  {rel}: updated")
     return True
+
+
+_VERIFIED_RE = re.compile(r"(last-verified[:\s]+)(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+
+
+def restore_verified_dates(old: str, new: str, diff: str) -> tuple[str, int]:
+    """Undo edits to a page's "last-verified <date>" claims about another doc.
+
+    That date is what the upstream doc says about itself, not when this page
+    was edited. Models read it as a freshness stamp and bump it to today: on
+    436b407d both Sonnet runs wrote 2026-09-28 where the doc still said
+    2026-08-05, and critique approved it. Only the commit can move it, so a
+    change is kept only when the diff itself adds a last-verified line.
+
+    Returns the corrected text and how many dates were put back.
+    """
+    if any(
+        line.startswith("+") and _VERIFIED_RE.search(line)
+        for line in diff.splitlines()
+    ):
+        return new, 0
+    before = [m.group(2) for m in _VERIFIED_RE.finditer(old)]
+    after = [m.group(2) for m in _VERIFIED_RE.finditer(new)]
+    if before == after or not before:
+        return new, 0
+    if len(before) == len(after):
+        replacements = iter(before)
+    elif len(set(before)) == 1:
+        # The model added or dropped a mention; with one date on the page,
+        # every mention can only mean that date.
+        replacements = iter([before[0]] * len(after))
+    else:
+        log("  last-verified mentions changed in number across several dates; "
+            "leaving them for review")
+        return new, 0
+    restored = 0
+
+    def put_back(match: re.Match[str]) -> str:
+        nonlocal restored
+        original = next(replacements)
+        if match.group(2) != original:
+            restored += 1
+        return match.group(1) + original
+
+    return _VERIFIED_RE.sub(put_back, new), restored
 
 
 _PAGE_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n?(?P<rest>.*)$", re.DOTALL)

@@ -1246,3 +1246,39 @@ def test_no_upstream_means_no_lookup(monkeypatch):
     monkeypatch.setattr(runner, "github_get_anonymous", boom)
     assert runner.citation_repo(cfg) == "o/r"
     assert cfg.cite_repo == "o/r"
+
+
+# --------------------------------------------------------------------------
+# last-verified dates belong to the upstream doc
+# --------------------------------------------------------------------------
+
+PAGE = (
+    "Active doc (last-verified 2026-08-04). Body.\n"
+    "- doc (last-verified 2026-08-04)\n"
+)
+
+
+def test_bumped_verified_date_is_put_back():
+    new = PAGE.replace("2026-08-04", "2026-09-28") + "New fact.\n"
+    fixed, n = runner.restore_verified_dates(PAGE, new, "+code change\n")
+    assert n == 2
+    assert "2026-09-28" not in fixed
+    assert fixed.endswith("New fact.\n")
+
+
+def test_commit_that_moves_the_date_keeps_the_edit():
+    new = PAGE.replace("2026-08-04", "2026-09-28")
+    diff = "-last-verified: 2026-08-05\n+last-verified: 2026-09-28\n"
+    assert runner.restore_verified_dates(PAGE, new, diff) == (new, 0)
+
+
+def test_added_mention_takes_the_single_existing_date():
+    new = PAGE + "Also (last-verified 2026-09-28).\n"
+    fixed, n = runner.restore_verified_dates(PAGE, new, "")
+    assert n == 1
+    assert fixed.count("2026-08-04") == 3
+
+
+def test_page_without_verified_dates_is_untouched():
+    new = "Now claims last-verified 2026-09-28.\n"
+    assert runner.restore_verified_dates("plain\n", new, "") == (new, 0)
