@@ -1048,7 +1048,10 @@ def open_pull_request(
 
     if cfg.dry_run:
         log(f"DRY_RUN set: built branch {branch} but not pushing")
-        log(run(["git", "show", "--stat", "HEAD"], cwd=wiki))
+        # The whole patch, not just the stat: a dry run's branch dies with the
+        # container, and the log is the only place two strategies' pages can
+        # be compared afterwards.
+        log(run(["git", "show", "--stat", "--patch", "HEAD"], cwd=wiki))
         return ""
 
     # The remote was cloned anonymously; attach the token only now, so it lives
