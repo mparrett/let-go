@@ -1282,3 +1282,62 @@ def test_added_mention_takes_the_single_existing_date():
 def test_page_without_verified_dates_is_untouched():
     new = "Now claims last-verified 2026-09-28.\n"
     assert runner.restore_verified_dates("plain\n", new, "") == (new, 0)
+
+
+# --------------------------------------------------------------------------
+# Page ranking: specificity over volume
+# --------------------------------------------------------------------------
+
+def _page(wiki, rel, title, description="", sources=()):
+    path = wiki / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    srcs = ", ".join(f'"{s}"' for s in sources)
+    path.write_text(
+        f'---\ntitle: "{title}"\ndescription: "{description}"\n'
+        f"sources: [{srcs}]\n---\n\n# {title}\n"
+    )
+
+
+def test_hub_pages_do_not_crowd_out_the_page_the_commit_is_about(tmp_path):
+    """The 4b9b1588 shape: hubs cite everything, the real page cites nothing."""
+    wiki = tmp_path
+    changed = ["pkg/rt/core/core.lg", "pkg/vm/cancelled.go",
+               "test/e2e/scope_test.go"]
+    for i in range(runner.MAX_PAGES_PER_RUN + 2):
+        _page(wiki, f"concepts/hub{i}.md", f"Hub {i}", "Overview",
+              ["repo: pkg/rt/core/core.lg"])
+    _page(wiki, "concepts/concurrency-model.md", "Concurrency Model",
+          "Scoped async supervision", ["repo: pkg/vm/scope.go"])
+    to_edit, _uncovered, _total = runner.map_pages(wiki, changed)
+    assert wiki / "concepts/concurrency-model.md" in to_edit
+
+
+def test_a_page_citing_a_rare_path_outranks_one_citing_common_paths(tmp_path):
+    wiki = tmp_path
+    changed = ["pkg/rt/core/core.lg", "pkg/rt/lang.go", "cmd/ratchet/main.go"]
+    for i in range(3):
+        _page(wiki, f"concepts/hub{i}.md", f"Hub {i}", "",
+              ["pkg/rt/core/core.lg", "pkg/rt/lang.go"])
+    _page(wiki, "concepts/ratchet.md", "Ratchet", "", ["cmd/ratchet"])
+    to_edit, _, _ = runner.map_pages(wiki, changed)
+    assert to_edit[0] == wiki / "concepts/ratchet.md"
+
+
+def test_a_weak_topic_match_alone_does_not_select_a_page(tmp_path):
+    """436b407d: pages that merely mention "ratchet" once stay out."""
+    wiki = tmp_path
+    changed = ["cmd/ratchet-scope/main.go"]
+    _page(wiki, "concepts/perf-ratchet.md", "Performance Ratchet", "",
+          ["cmd/ratchet-scope"])
+    for i in range(3):
+        _page(wiki, f"concepts/other{i}.md", f"Other {i}",
+              "Mentions the ratchet in passing")
+    to_edit, _, total = runner.map_pages(wiki, changed)
+    assert to_edit == [wiki / "concepts/perf-ratchet.md"]
+    assert total == 1
+
+
+def test_topic_words_stem_enough_to_meet():
+    assert runner.related("scope", next(iter(runner.topic_words("scoped"))))
+    assert runner.topic_words("cancelled") == runner.topic_words("cancellation")
+    assert runner.topic_words("class") == {"class"}

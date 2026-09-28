@@ -456,10 +456,19 @@ def map_pages(
     The wiki's own schema requires every page to cite where its claims come
     from (`resource:` / `sources:`), so those citations are the mapping - no
     separate index to keep in sync.
-    """
-    hits: dict[Path, int] = {}
-    covered: set[str] = set()
 
+    Ranking is by specificity, not volume. Counting cited paths let hub pages
+    fill the cap: on 4b9b1588 (#924, scope cancellation) twenty pages cited a
+    changed file, sixteen of them only through core.lg, and the five chosen
+    were overviews with nothing to update, while concurrency-model.md, which
+    the commit makes stale, cites none of the changed files at all. So a
+    cited path is worth 1/(pages citing it), and the changed files' names
+    (tests included) are matched against each page's name, title and
+    description, each word worth 1/(pages it matches).
+    """
+    pages: list[Path] = []
+    cited: dict[Path, list[str]] = {}
+    about: dict[Path, set[str]] = {}
     for page in sorted(wiki.rglob("*.md")):
         if not is_wiki_content(wiki, page):
             continue
@@ -467,11 +476,45 @@ def map_pages(
             text = page.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        citations = citation_text(parse_frontmatter(text))
-        matched = [p for p in changed if page_covers(citations, p)]
-        if matched:
-            hits[page] = len(matched)
-            covered.update(matched)
+        fields = parse_frontmatter(text)
+        pages.append(page)
+        citations = citation_text(fields)
+        cited[page] = [p for p in changed if page_covers(citations, p)]
+        about[page] = topic_words(
+            f"{page.stem} {fields.get('title', '')} {fields.get('description', '')}"
+        )
+
+    citing: dict[str, int] = {}
+    for paths in cited.values():
+        for path in paths:
+            citing[path] = citing.get(path, 0) + 1
+    covered = set(citing)
+
+    words = set()
+    for path in changed:
+        if Path(path).suffix in TOPIC_SUFFIXES and not any(
+            part in SKIP_PATH_PARTS for part in Path(path).parts
+        ):
+            words |= topic_words(Path(path).stem) - TOPIC_NOISE
+    matching = {
+        w: sum(1 for page in pages if any(related(w, a) for a in about[page]))
+        for w in words
+    }
+
+    scores: dict[Path, float] = {}
+    for page in pages:
+        score = sum(1 / citing[path] for path in cited[page])
+        topical = sum(
+            1 / matching[w] for w in words
+            if matching[w] and any(related(w, a) for a in about[page])
+        )
+        # A topic word alone is weak evidence; one that picks out this page
+        # among very few is not. Below this, a page that cites nothing is
+        # left out rather than spending a model call.
+        if cited[page] or topical >= MIN_TOPIC_ONLY_SCORE:
+            score += topical
+        if score:
+            scores[page] = score
 
     # Second chance by filename: a page about WASM may cite `wasm/` while the
     # commit touches `wasm.go`. Citation matching misses that, and creating a
@@ -483,14 +526,44 @@ def map_pages(
         if by_topic is None:
             uncovered.append(path)
         else:
-            hits[by_topic] = hits.get(by_topic, 0) + 1
+            scores[by_topic] = scores.get(by_topic, 0) + 1
 
-    ranked = sorted(hits.items(), key=lambda pair: (-pair[1], str(pair[0])))
+    ranked = sorted(scores.items(), key=lambda pair: (-pair[1], str(pair[0])))
     to_edit = [page for page, _ in ranked[:MAX_PAGES_PER_RUN]]
     # The total, so the caller can tell "we processed every match, and there
     # happened to be exactly the cap" from "we dropped some". Comparing the
     # truncated length against the cap cannot distinguish those.
     return to_edit, uncovered, len(ranked)
+
+
+TOPIC_SUFFIXES = (".go", ".lg", ".clj", ".md")
+# Words every file name could carry; matching on them says nothing.
+TOPIC_NOISE = {"test", "main", "util", "utils", "helper", "helpers"}
+MIN_TOPIC_ONLY_SCORE = 1.0
+_STEM_SUFFIXES = ("ations", "ation", "ing", "ed", "es", "s")
+
+
+def topic_words(text: str) -> set[str]:
+    """Lower-cased words of four letters or more, crudely stemmed.
+
+    Enough to make `scope_test.go` meet "scoped async supervision" and
+    `cancelled.go` meet `cancellation_test.go`; not a real stemmer.
+    """
+    out = set()
+    for word in re.split(r"[^a-z0-9]+", text.lower()):
+        if len(word) < MIN_TOPIC_TOKEN:
+            continue
+        for suffix in _STEM_SUFFIXES:
+            if (word.endswith(suffix) and not word.endswith("ss")
+                    and len(word) - len(suffix) >= MIN_TOPIC_TOKEN):
+                word = word[: -len(suffix)]
+                break
+        out.add(word)
+    return out
+
+
+def related(a: str, b: str) -> bool:
+    return a.startswith(b) or b.startswith(a)
 
 
 # Two- and three-letter tokens ("ir", "vm") collide with too many slugs to be
