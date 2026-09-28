@@ -33,8 +33,8 @@ digraph WikiPageUpdate {
     // over a diff plus a page body, this runs once per page, and a run does up
     // to MAX_PAGES_PER_RUN of them -- so a generous budget here multiplies into
     // real money and a job that outlives the Action's timeout. Three is enough
-    // for draft, one mechanical repair and one critique revision, which is the
-    // shape the failures actually take.
+    // for draft, one mechanical repair and one critique revision (when
+    // critique is on), which is the shape the failures actually take.
     setup [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
         tool_command="if [ ! -s task.system.md ] || [ ! -s task.user.md ]; then printf missing; exit 0; fi; mkdir -p state || exit 1; B=${ATTRACTOR_PAGE_MAX_ITERATIONS:-3}; case \"$B\" in ''|*[!0-9]*) B=3;; esac; if [ \"$B\" -lt 1 ] || [ \"$B\" -gt 8 ]; then B=3; fi; echo \"$B\" > state/budget; printf ok"]
 
@@ -81,6 +81,17 @@ digraph WikiPageUpdate {
     repair [shape=box, class="maker", must_write="state/answer.md",
         prompt="Your previous answer violated the output contract. state/contract.log lists exactly what is wrong with state/answer.md; task.system.md states the contract it breaks. Fix state/answer.md so every complaint in state/contract.log is resolved. Change only what the contract requires -- the substance of the page was not what was rejected, its shape was. Do not add commentary to the file."]
 
+    // Critique is opt-in (ATTRACTOR_CRITIQUE=1). It came with the loop shape
+    // borrowed from strange-lettractor's task-runner example, where it judges
+    // code against a definition of done. For a wiki page it earned nothing:
+    // on 436b407d it approved every page on the first pass, took longer than
+    // the draft on two of three, and passed both real defects (a redundant new
+    // page and a fabricated last-verified date). The two mechanical gates
+    // above are what have caught things, so by default a page that clears
+    // them is done.
+    critique_switch [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="case \"${ATTRACTOR_CRITIQUE:-0}\" in 1|true|yes) printf critique;; *) printf skip;; esac"]
+
     critique [shape=box, class="maker", must_write="state/critique.md",
         prompt="state/answer.md satisfies the mechanical contract. Now judge whether it is actually good. Re-read task.system.md for the rules the page must follow and task.user.md for what the commit actually changed. Check, specifically: does the page reflect what this commit did, or has it drifted into restating things the commit did not touch? Are the frontmatter fields still accurate, including citations and dates? Did it invent behaviour the diff does not show? Did it delete content that is still true? Is the edit proportionate -- a small commit should not rewrite a page. Write state/critique.md ending with a line reading exactly VERDICT: APPROVED or VERDICT: REVISE, and when it is REVISE, list the specific changes required above that line. Approve work that is correct and proportionate; you are not required to find fault, and a gratuitous revision costs a model call and risks making the page worse."]
 
@@ -112,7 +123,9 @@ digraph WikiPageUpdate {
 
     // A validator complaint is repaired like a contract break, and the repair
     // goes back through the contract gate, where the budget is counted.
-    wiki_check -> critique [condition="outcome=success"]
+    wiki_check -> critique_switch [condition="outcome=success"]
+    critique_switch -> critique [condition="context.tool.output=critique"]
+    critique_switch -> done     [condition="context.tool.output=skip"]
     wiki_check -> repair   [condition="outcome=fail"]
 
     // Back through the gate rather than onward: the repair is itself a model

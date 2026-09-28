@@ -51,6 +51,11 @@ on:
         description: "Per-page iteration budget for attractor only (1-8; default: the template's 3)"
         required: false
         type: string
+      attractor_critique:
+        description: "Attractor only: add the critique/revise stages (off by default)"
+        required: false
+        type: boolean
+        default: false
 
 # Nothing here writes to this repository. The cluster holds the credentials the
 # job itself needs (anthropic-api-key, docs-runner-github-token) and injects
@@ -236,6 +241,7 @@ jobs:
       # error rather than a no-op.
       IS_ATTRACTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.entrypoint == 'attractor' }}
       PAGE_ITERATIONS: ${{ inputs.page_iterations }}
+      ATTRACTOR_CRITIQUE: ${{ inputs.attractor_critique }}
 
       # Reads as "dry unless someone dispatched this and explicitly named
       # another entrypoint". The default-to-dry fallthrough is deliberate and
@@ -405,6 +411,9 @@ jobs:
           if [ "$IS_ATTRACTOR" = "true" ] && [ -n "${PAGE_ITERATIONS:-}" ]; then
             args+=(--set attractor-page-max-iterations="$PAGE_ITERATIONS")
           fi
+          if [ "$IS_ATTRACTOR" = "true" ] && [ "${ATTRACTOR_CRITIQUE:-}" = "true" ]; then
+            args+=(--set attractor-critique=1)
+          fi
 
           if [ "$IS_EVAL" = "true" ]; then
             echo "model: $MODEL_NAME" \
@@ -412,7 +421,8 @@ jobs:
           elif [ "$IS_ATTRACTOR" = "true" ]; then
             echo "model: ${MODEL_NAME:-<template default>}" \
                  "effort: ${MODEL_EFFORT:-<template default>}" \
-                 "page-iterations: ${PAGE_ITERATIONS:-<template default>}"
+                 "page-iterations: ${PAGE_ITERATIONS:-<template default>}" \
+                 "critique: ${ATTRACTOR_CRITIQUE:-false}"
           else
             echo "model: ${MODEL_NAME:-<template default>}" \
                  "effort: ${MODEL_EFFORT:-<template default>}"

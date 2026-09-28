@@ -283,6 +283,14 @@ docs-runner-attractor:
       value: "3"
       env: ATTRACTOR_PAGE_MAX_ITERATIONS
 
+    # "1" adds the critique/revise stages after the two mechanical gates.
+    # Off by default: on 436b407d critique was most of attractor's 5.5x cost
+    # over one-shot and changed nothing (see pipelines/page-update.dot).
+    attractor-critique:
+      type: string
+      value: "0"
+      env: ATTRACTOR_CRITIQUE
+
     # Per-page wall clock for the whole pipeline, not for one call. The graph
     # caps a single model stage at 20m on its own, so a value near that would
     # kill runs that were still making progress; this is the sum of a few such
