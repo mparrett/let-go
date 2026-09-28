@@ -29,6 +29,13 @@ docs-runner:
       type: string
       value: mparrett/let-go
       env: SOURCE_REPO
+    # Where source-repo's commits land once merged. A commit found on this
+    # repo's default branch is cited as upstream's, not the fork's; empty
+    # disables the check.
+    upstream-repo:
+      type: string
+      value: nooga/let-go
+      env: UPSTREAM_REPO
     # This default exists only so a local test run has a real commit to
     # document; it is not the commit anyone actually wants documented. Once the
     # pipeline is wired up, the GitHub Action overrides this per commit.

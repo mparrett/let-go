@@ -311,7 +311,7 @@ BASE_ENV = {
 
 
 def _set_env(monkeypatch, **overrides):
-    for key in (*BASE_ENV, "GITHUB_TOKEN", "DRY_RUN"):
+    for key in (*BASE_ENV, "GITHUB_TOKEN", "DRY_RUN", "UPSTREAM_REPO"):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**BASE_ENV, **overrides}.items():
         monkeypatch.setenv(key, value)
@@ -1202,3 +1202,47 @@ def test_attractor_is_selectable_by_backend_name(monkeypatch):
     monkeypatch.setenv("MODEL_BACKEND", "attractor")
     monkeypatch.setenv("MODEL_NAME", "claude-opus-5")
     assert backends.load().name == "attractor"
+
+
+# --------------------------------------------------------------------------
+# Which repo to cite
+# --------------------------------------------------------------------------
+
+def _fake_github(status):
+    def get(path):
+        if path.endswith("/compare/main...deadbeef"):
+            if isinstance(status, Exception):
+                raise status
+            return {"status": status}
+        return {"default_branch": "main"}
+    return get
+
+
+@pytest.mark.parametrize("status", ["behind", "identical"])
+def test_commit_on_upstream_is_cited_as_upstream(monkeypatch, status):
+    cfg = _cfg(monkeypatch, UPSTREAM_REPO="up/r")
+    monkeypatch.setattr(runner, "github_get_anonymous", _fake_github(status))
+    assert runner.citation_repo(cfg) == "up/r"
+
+
+@pytest.mark.parametrize("status", ["ahead", "diverged"])
+def test_fork_only_commit_is_cited_as_the_fork(monkeypatch, status):
+    cfg = _cfg(monkeypatch, UPSTREAM_REPO="up/r")
+    monkeypatch.setattr(runner, "github_get_anonymous", _fake_github(status))
+    assert runner.citation_repo(cfg) == "o/r"
+
+
+def test_unreachable_upstream_falls_back_to_the_fork(monkeypatch):
+    cfg = _cfg(monkeypatch, UPSTREAM_REPO="up/r")
+    err = runner.urllib.error.URLError("offline")
+    monkeypatch.setattr(runner, "github_get_anonymous", _fake_github(err))
+    assert runner.citation_repo(cfg) == "o/r"
+
+
+def test_no_upstream_means_no_lookup(monkeypatch):
+    cfg = _cfg(monkeypatch)
+    def boom(path):
+        raise AssertionError("must not call GitHub")
+    monkeypatch.setattr(runner, "github_get_anonymous", boom)
+    assert runner.citation_repo(cfg) == "o/r"
+    assert cfg.cite_repo == "o/r"

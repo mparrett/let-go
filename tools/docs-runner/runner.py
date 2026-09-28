@@ -15,7 +15,7 @@ import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
@@ -185,6 +185,10 @@ class Config:
     github_token: str
     workdir: Path
     dry_run: bool
+    upstream_repo: str = ""
+    # The repo named in prompts, log.md, the commit and the PR. Set once the
+    # commit's home is known (see citation_repo); until then, the source repo.
+    cite_repo: str = ""
 
     @classmethod
     def from_env(cls) -> Config:
@@ -207,6 +211,8 @@ class Config:
             github_token=os.environ.get("GITHUB_TOKEN", ""),
             workdir=Path(os.environ.get("WORKDIR", "/work")),
             dry_run=dry_run,
+            upstream_repo=os.environ.get("UPSTREAM_REPO", ""),
+            cite_repo=os.environ["SOURCE_REPO"],
         )
 
     def clone_url(self, repo: str) -> str:
@@ -253,6 +259,53 @@ def clone_source(cfg: Config) -> Path:
 
     run(["git", "checkout", "--quiet", "FETCH_HEAD"], cwd=dest)
     return dest
+
+
+def github_get_anonymous(path: str) -> object:
+    """GET a public GitHub API path with no credential, so dry runs stay clean."""
+    request = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "let-go-docs-runner",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def citation_repo(cfg: Config) -> str:
+    """The repo a reader should follow to find this commit.
+
+    The runner clones a fork, but a commit that has landed upstream belongs to
+    upstream: its PR number, its links and its history live there. Naming the
+    fork sent a model to link `mparrett/let-go/tree/<sha>` for an upstream PR.
+
+    GitHub serves any commit in a fork network from every repo in it, so a
+    commit resolving on upstream proves nothing. Ask instead whether it is an
+    ancestor of upstream's default branch. Any failure falls back to the
+    source repo: a fork link is still a working link.
+    """
+    upstream = cfg.upstream_repo
+    if not upstream or upstream == cfg.source_repo:
+        return cfg.source_repo
+    try:
+        info = github_get_anonymous(f"/repos/{upstream}")
+        branch = info["default_branch"]  # type: ignore[index]
+        compare = github_get_anonymous(
+            f"/repos/{upstream}/compare/"
+            f"{urllib.parse.quote(branch)}...{cfg.source_sha}"
+        )
+        status = compare["status"]  # type: ignore[index]
+    except (urllib.error.URLError, OSError, KeyError, TypeError, ValueError) as err:
+        log(f"could not tell whether {upstream} has this commit ({err}); "
+            f"citing {cfg.source_repo}")
+        return cfg.source_repo
+    if status in ("behind", "identical"):
+        log(f"commit is on {upstream}@{branch}; citing {upstream}")
+        return upstream
+    log(f"commit is not on {upstream}@{branch} ({status}); citing {cfg.source_repo}")
+    return cfg.source_repo
 
 
 def clone_wiki(cfg: Config) -> Path:
@@ -555,7 +608,7 @@ def update_page(
     reply = backend.complete(
         system=SYSTEM_PROMPT.format(agents=agents, taxonomy=taxonomy),
         user=USER_PROMPT.format(
-            sha=cfg.source_sha, repo=cfg.source_repo, message=message,
+            sha=cfg.source_sha, repo=cfg.cite_repo, message=message,
             changed="\n".join(f"- {c}" for c in changed), diff=diff,
             today=date.today().isoformat(), page=rel, body=body,
         ),
@@ -714,7 +767,7 @@ def create_page(
     reply = backend.complete(
         system=CREATE_SYSTEM_PROMPT.format(agents=agents, taxonomy=taxonomy),
         user=CREATE_USER_PROMPT.format(
-            sha=cfg.source_sha, repo=cfg.source_repo, message=message,
+            sha=cfg.source_sha, repo=cfg.cite_repo, message=message,
             path=path, contents=contents, diff=diff, existing=existing,
             today=date.today().isoformat(),
         ),
@@ -843,7 +896,7 @@ def append_log(wiki: Path, cfg: Config, updated: list[Path]) -> None:
     pages = ", ".join(str(p.relative_to(wiki)) for p in updated)
     entry = (
         f"\n## [{date.today().isoformat()}] docs-runner | {cfg.source_sha[:12]}\n\n"
-        f"Updated from `{cfg.source_repo}@{cfg.source_sha[:12]}`: {pages}\n"
+        f"Updated from `{cfg.cite_repo}@{cfg.source_sha[:12]}`: {pages}\n"
     )
     with log_file.open("a", encoding="utf-8") as handle:
         handle.write(entry)
@@ -921,7 +974,7 @@ def commit_branch(cfg: Config, wiki: Path) -> str:
     run(["git", "add", "--all"], cwd=wiki)
     run(
         ["git", "commit", "--quiet", "-m",
-         f"docs: update wiki for {cfg.source_repo}@{cfg.source_sha[:12]}"],
+         f"docs: update wiki for {cfg.cite_repo}@{cfg.source_sha[:12]}"],
         cwd=wiki,
     )
     return branch
@@ -1081,7 +1134,7 @@ def open_pull_request(
 
     body = textwrap.dedent(f"""\
         Generated by the let-go docs runner from
-        `{cfg.source_repo}@{cfg.source_sha[:12]}`.
+        `{cfg.cite_repo}@{cfg.source_sha[:12]}`.
 
         Pages updated:
         {pages}
@@ -1125,6 +1178,7 @@ def main() -> int:
     cfg.workdir.mkdir(parents=True, exist_ok=True)
 
     source = clone_source(cfg)
+    cfg = replace(cfg, cite_repo=citation_repo(cfg))
     changed, message, diff = commit_context(source, cfg.source_sha)
     log(f"commit touches {len(changed)} file(s)")
     if not changed:
