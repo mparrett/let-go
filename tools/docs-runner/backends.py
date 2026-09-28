@@ -445,6 +445,13 @@ class AttractorBackend:
                 # and the final check cannot disagree over a missing module.
                 env["DOCS_WIKI_PYTHON"] = sys.executable
                 env["DOCS_WIKI_CHECK"] = str(Path(self.graph).parent / "wiki_check.py")
+            # The same effort the one-shot backend sends, so a comparison
+            # between the two differs in strategy alone. Attractor's sessions
+            # accept only these three; anything else leaves its per-model
+            # default in place rather than failing every stage.
+            effort = os.environ.get("MODEL_EFFORT", "").strip().lower()
+            if effort in ("low", "medium", "high"):
+                env["ATTRACTOR_REASONING_EFFORT"] = effort
 
             cmd = [
                 self.binary, "run", self.graph,

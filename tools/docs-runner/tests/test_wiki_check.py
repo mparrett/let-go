@@ -258,3 +258,24 @@ def test_a_timed_out_page_names_the_stage_that_held_it(monkeypatch, tmp_path, ca
     out = capsys.readouterr().out
     assert "critique" in out and "(still running)" in out
     assert backend.usage.calls == 1
+
+
+@pytest.mark.parametrize(
+    "effort, passed", [("medium", "medium"), ("xhigh", ""), ("", "")]
+)
+def test_the_one_shot_effort_reaches_attractor_stages(
+    monkeypatch, tmp_path, effort, passed
+):
+    seen = tmp_path / "effort"
+    fake = tmp_path / "fake-attractor"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s" "${{ATTRACTOR_REASONING_EFFORT:-}}" > "{seen}"\n'
+        "echo 'NO CHANGE' > state/answer.md\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("ATTRACTOR_BIN", str(fake))
+    monkeypatch.setenv("MODEL_EFFORT", effort)
+    monkeypatch.delenv("ATTRACTOR_REASONING_EFFORT", raising=False)
+    backends.AttractorBackend().complete(system="s", user="u")
+    assert seen.read_text() == passed
