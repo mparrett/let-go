@@ -134,6 +134,21 @@ func LookupVar(nsName, symName string) *vm.Var {
 	return out
 }
 
+// CachedVar lazily resolves a Var ONCE, memoizing it through the caller's
+// package-level pointer, and returns it (nil, uncached, while the var does not
+// exist yet). Lowered code uses it for global var reads:
+// ec.Deref(rt.CachedVar(&__v, "ns", "name")) replaces a per-read
+// ec.Deref(rt.LookupVar("ns", "name")). Like CachedVarFn it caches the *Var,
+// not its value, so root changes and dynamic bindings are still seen.
+func CachedVar(ptr **vm.Var, nsName, symName string) *vm.Var {
+	if v := *ptr; v != nil {
+		return v
+	}
+	v := LookupVar(nsName, symName)
+	*ptr = v
+	return v
+}
+
 // CachedVarFn lazily resolves a cross-namespace Var ONCE — memoizing it through
 // the caller-supplied package-level pointer — then returns that var's CURRENT
 // fn root for invocation. The lowered Go calls it as

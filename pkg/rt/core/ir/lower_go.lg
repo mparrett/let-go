@@ -49,6 +49,7 @@
 (declare go-export-name)
 (declare param-inferred-type)
 (declare param-go-spec)
+(declare record-cross-ns-var!)
 
 ;; Injected function references for cross-namespace resolution workaround (PR #232).
 ;; ir.passes.pipeline sets these at module load time.
@@ -941,15 +942,28 @@
    binding (e.g. inside a future or with-scope) is honoured, and derefs to the
    value-typed root. This is the RHS of the var's one-time snapshot local;
    :load-var is materialised (see local-carrying-op?), not re-emitted at uses."
-  (let [sym (symbol aux)
-        sns (namespace sym)
-        sn  (name sym)]
+  ;; With the package var cache active (pass 2, *cross-ns-vars-used* bound)
+  ;; the *vm.Var is memoized in the same package-level __v_* pointer the call
+  ;; trampoline uses — rt.CachedVar(&__v, ns, name) — instead of a namespace
+  ;; map lookup on every evaluation. Deref still goes through ec, so dynamic
+  ;; bindings and later root changes are seen exactly as before.
+  (let [sym  (symbol aux)
+        sns  (namespace sym)
+        sn   (name sym)
+        nsx  (if (nil? sns) "core" sns)
+        base (record-cross-ns-var! nsx sn)]
     (gogen/call
       (gogen/field-sel (gogen/ident "ec") "Deref")
-      [(gogen/call
-         (gogen/field-sel (gogen/ident "rt") "LookupVar")
-         [(gogen/string-lit (if (nil? sns) "core" sns))
-          (gogen/string-lit sn)])])))
+      [(if base
+         (gogen/call
+           (gogen/field-sel (gogen/ident "rt") "CachedVar")
+           [(gogen/unary "&" (gogen/ident base))
+            (gogen/string-lit nsx)
+            (gogen/string-lit sn)])
+         (gogen/call
+           (gogen/field-sel (gogen/ident "rt") "LookupVar")
+           [(gogen/string-lit nsx)
+            (gogen/string-lit sn)]))])))
 
 (defn- value-expr [f closed-exprs nid]
   (let [op  (ir/op nid f)
