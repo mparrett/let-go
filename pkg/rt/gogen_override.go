@@ -6,6 +6,9 @@
 package rt
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/nooga/let-go/pkg/vm"
 )
 
@@ -41,7 +44,7 @@ func RegisterGoOverrides(nsName string, defs map[string]vm.Value) {
 	}
 	if ns := LookupNS(nsName); ns != nil {
 		for name, fn := range defs {
-			ns.Def(name, fn)
+			defGoOverride(ns, name, fn)
 		}
 		return
 	}
@@ -64,7 +67,7 @@ func ApplyGoOverrides(ns *vm.Namespace) {
 	}
 	if defs := pendingGoOverrides[ns.Name()]; defs != nil {
 		for name, fn := range defs {
-			ns.Def(name, fn)
+			defGoOverride(ns, name, fn)
 		}
 		delete(pendingGoOverrides, ns.Name())
 	}
@@ -72,6 +75,43 @@ func ApplyGoOverrides(ns *vm.Namespace) {
 		freezeNativeMultiFns(ns, names)
 		delete(pendingNativeMultiFns, ns.Name())
 	}
+}
+
+// Guarded overrides. A lowered fn with natively typed parameters (int64,
+// float64, string) can only take the native path when every argument has that
+// runtime type; the generated adapter checks, and on a mismatch calls
+// InvokeGoOverrideFallback, which runs the definition the override replaced
+// (the bytecode/source fn). So a typed-param override never changes what a
+// call with other argument types does.
+var (
+	goOverrideFallbackMu sync.RWMutex
+	goOverrideFallbacks  = map[string]vm.Value{}
+)
+
+// defGoOverride Defs fn as name in ns, first remembering the root it replaces
+// so a guarded adapter can fall back to it.
+func defGoOverride(ns *vm.Namespace, name string, fn vm.Value) {
+	if v := ns.LookupLocal(vm.Symbol(name)); v != nil && v.IsBound() {
+		if old := v.Root(); old != nil && old != vm.NIL {
+			goOverrideFallbackMu.Lock()
+			goOverrideFallbacks[ns.Name()+"/"+name] = old
+			goOverrideFallbackMu.Unlock()
+		}
+	}
+	ns.Def(name, fn)
+}
+
+// InvokeGoOverrideFallback calls the definition the Go override nsName/name
+// replaced. Generated guarded adapters call it when an argument does not have
+// the type the lowered fn's native parameter needs.
+func InvokeGoOverrideFallback(ec *vm.ExecContext, nsName, name string, args []vm.Value) (vm.Value, error) {
+	goOverrideFallbackMu.RLock()
+	old := goOverrideFallbacks[nsName+"/"+name]
+	goOverrideFallbackMu.RUnlock()
+	if old == nil {
+		return nil, fmt.Errorf("%s/%s: arguments do not match the native signature and no fallback definition was recorded", nsName, name)
+	}
+	return InvokeValueEC(ec, old, args)
 }
 
 // Native-baked multimethods (gogen_ir): a lowered package emitting native

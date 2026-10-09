@@ -1026,6 +1026,92 @@
     (= spec "vm.Char") expr
     :else              expr))
 
+(def ^:private guardable-param-asserts
+  ;; Native param spec -> the vm type a guarded adapter asserts args[i] to, and
+  ;; the Go conversion applied to the asserted value.
+  {"int64"   ["vm.Int" "int64"]
+   "float64" ["vm.Float" "float64"]
+   "string"  ["vm.String" "string"]})
+
+(defn- override-guarded? [r]
+  "A single-arity lowered fn the plain adapters cannot take — typed params, or
+   a typed return that can error — but whose params are each vm.Value or a
+   primitive in guardable-param-asserts, and whose result is vm.Value or
+   boxable. Its adapter type-checks every typed arg and, on any mismatch,
+   calls the definition the override replaced (rt.InvokeGoOverrideFallback),
+   so a call the native signature cannot take behaves exactly as before."
+  (let [ps  (:param-specs r)
+        ret (:result-spec r)]
+    (and (:fn-name r)
+         (not (:multi-arity? r))
+         (not (:variadic? r))
+         (not (:override-eligible? r))
+         (not (and (:override-boxable-return? r) (not (:needs-error? r))))
+         (some? ps)
+         (= (count ps) (:arity r))
+         (every? (fn [s] (or (= "vm.Value" s) (contains? guardable-param-asserts s))) ps)
+         (or (= "vm.Value" ret)
+             (contains? #{"bool" "int64" "float64" "string" "vm.Char"} ret)))))
+
+(defn- guarded-override-wrapper-fn-lit [ns-name entry]
+  "Adapter for an override-guarded? fn:
+     if len(args) != N { return nil, fmt.Errorf(…) }
+     g0, ok0 := args[0].(vm.Float)
+     if !ok0 { return rt.InvokeGoOverrideFallback(ec, \"ns\", \"name\", args) }
+     …
+     r, err := Fn(ec, float64(g0), args[1])   // or without err
+     if err != nil { return nil, err }
+     return vm.Float(r), nil"
+  (let [arity    (:arity entry)
+        ps       (:param-specs entry)
+        ret-spec (:result-spec entry)
+        needs-error? (:needs-error? entry)
+        args-id  (gogen/ident "args")
+        len-call (gogen/call (gogen/ident "len") [args-id])
+        len-check (gogen/if-stmt
+                    nil
+                    (gogen/binary "!=" len-call (gogen/int-lit arity))
+                    [(gogen/return-stmt
+                       [(gogen/ident "nil")
+                        (gogen/call (gogen/field-sel (gogen/ident "fmt") "Errorf")
+                                    [(gogen/string-lit (str (:fn-name entry) ": wrong number of arguments %d (expected " arity ")"))
+                                     len-call])])]
+                    nil)
+        fallback (gogen/return-stmt
+                   [(gogen/call (gogen/field-sel (gogen/ident "rt") "InvokeGoOverrideFallback")
+                                [(gogen/ident "ec") (gogen/string-lit ns-name)
+                                 (gogen/string-lit (:fn-name entry)) args-id])])
+        guards   (vec (mapcat
+                        (fn [i]
+                          (when-let [[vt _] (get guardable-param-asserts (nth ps i))]
+                            (let [g  (gogen/ident (str "g" i))
+                                  ok (gogen/ident (str "ok" i))]
+                              [(gogen/multi-assign ":=" [g ok]
+                                                   [(gogen/type-assert (gogen/index args-id (gogen/int-lit i))
+                                                                       (gogen/type vt))])
+                               (gogen/if-stmt nil (gogen/unary "!" ok) [fallback] nil)])))
+                        (range arity)))
+        arg-exprs (mapv (fn [i]
+                          (if-let [[_ conv] (get guardable-param-asserts (nth ps i))]
+                            (gogen/call (gogen/ident conv) [(gogen/ident (str "g" i))])
+                            (gogen/index args-id (gogen/int-lit i))))
+                        (range arity))
+        inner    (gogen/call (gogen/ident (:go-name entry)) (into [(gogen/ident "ec")] arg-exprs))
+        r-id     (gogen/ident "r")
+        err-id   (gogen/ident "err")
+        tail     (if needs-error?
+                   [(gogen/multi-assign ":=" [r-id err-id] [inner])
+                    (gogen/if-stmt nil (gogen/binary "!=" err-id (gogen/ident "nil"))
+                                   [(gogen/return-stmt [(gogen/ident "nil") err-id])] nil)
+                    (gogen/return-stmt [(box-return-expr ret-spec r-id) (gogen/ident "nil")])]
+                   [(gogen/return-stmt [(box-return-expr ret-spec inner) (gogen/ident "nil")])])]
+    (gogen/func-lit
+      [(gogen/param "ec" (gogen/type "*vm.ExecContext"))
+       (gogen/param "args" (gogen/type "[]vm.Value"))]
+      [(gogen/result (gogen/type "vm.Value"))
+       (gogen/result (gogen/type "error"))]
+      (into (into [len-check] guards) tail))))
+
 (defn- override-wrapper-fn-lit [entry]
   "Build the per-defn `func(args []vm.Value) (vm.Value, error)` adapter:
    arity-check, then call the generated typed fn, supplying `, nil` when
@@ -1153,7 +1239,9 @@
                            (gogen/kv-expr
                              (gogen/string-lit (:fn-name e))
                              (gogen/call (gogen/ident "__gogen_wrap")
-                                         [(override-wrapper-fn-lit e)])))
+                                         [(if (override-guarded? e)
+                                            (guarded-override-wrapper-fn-lit ns-name e)
+                                            (override-wrapper-fn-lit e))])))
                          entries)
         multi-kvs  (mapv (fn [[nm arities]]
                            (gogen/kv-expr
@@ -1202,7 +1290,8 @@
   (filterv (fn [r] (and (:fn-name r)
                         (or (:override-eligible? r)
                             (and (:override-boxable-return? r)
-                                 (not (:needs-error? r))))
+                                 (not (:needs-error? r)))
+                            (override-guarded? r))
                         (not (:multi-arity? r))))
            valid-results))
 

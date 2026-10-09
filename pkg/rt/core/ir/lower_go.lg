@@ -3817,6 +3817,7 @@
        :fn-name (str (ir/fn-name f))
        :go-name emit-go-name
        :arity (ir/fn-arity f)
+       :variadic? (ir/fn-variadic? f)
        :needs-error? needs-error?
        :override-eligible? (override-uniform-value? f)
        ;; Uniform params but a typed RETURN: the wrapper boxes the result and
