@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
 // Opcodes
@@ -66,10 +68,16 @@ const (
 	OP_INC // inc (1 arg)
 	OP_DEC // dec (1 arg)
 	OP_BIT_NOT
-	OP_QUOT // quot — integer quotient, truncated toward zero (2 args)
-	OP_DIV  // / — true division; int/int yields a Ratio (or Int when exact), any float yields Float (2 args)
+	OP_QUOT          // quot — integer quotient, truncated toward zero (2 args)
+	OP_DIV           // / — true division; int/int yields a Ratio (or Int when exact), any float yields Float (2 args)
+	OP_UNCHECKED_ADD // unchecked-add — Int + Int wrapping at the platform width, never promoted (2 args)
+	OP_UNCHECKED_SUB // unchecked-subtract — Int - Int wrapping at the platform width, never promoted (2 args)
+	OP_UNCHECKED_MUL // unchecked-multiply — Int * Int wrapping at the platform width, never promoted (2 args)
 
 	OP_FINALLY_END // end of a finally block (finallyOffset int32, negative): rethrow the pending error after an abnormal entry
+
+	OP_AGET // aget on a typed array (2 args: array, index)
+	OP_ASET // aset on a typed array (3 args: array, index, value); leaves the value
 
 	OP_COUNT // sentinel — keep last; must equal len(opcodeNames) (enforced at init)
 )
@@ -122,7 +130,12 @@ var opcodeNames = []string{
 	"BIT_NOT",
 	"QUOT",
 	"DIV",
+	"UNCHECKED_ADD",
+	"UNCHECKED_SUB",
+	"UNCHECKED_MUL",
 	"FINALLY_END",
+	"AGET",
+	"ASET",
 }
 
 // A new opcode must land in both the const block and opcodeNames; the
@@ -183,6 +196,66 @@ type CodeChunk struct {
 	localVars []LocalVar
 }
 
+// multiArityAt returns the multi-arity fn for a literal built from fns. When
+// every arm is a constant *Func the literal closes over nothing, so every
+// evaluation of it would build the same fn: it is built once and kept on its
+// first arm, and the literal is one object, as a capture-free single-arity
+// literal is one constant. Keeping it on the arm costs no allocation, so a
+// literal evaluated once (a top-level defn) pays nothing for the sharing. A
+// literal whose arms capture is made per evaluation.
+func (c *CodeChunk) multiArityAt(fns []Value) (*MultiArityFn, error) {
+	first, ok := fns[0].(*Func)
+	if !ok {
+		return MakeMultiArity(fns)
+	}
+	for _, f := range fns[1:] {
+		if _, ok := f.(*Func); !ok {
+			return MakeMultiArity(fns)
+		}
+	}
+	if p := atomic.LoadPointer(&first.multi); p != nil {
+		if ma := (*MultiArityFn)(p); ma.builtFrom(fns) {
+			return ma, nil
+		}
+	}
+	ma, err := MakeMultiArity(fns)
+	if err != nil {
+		return nil, err
+	}
+	// Concurrent first evaluations race to cache; the loser returns the
+	// winner's fn so every caller gets one object. A cache built from other
+	// arms is left alone and this fn is returned unshared.
+	if atomic.CompareAndSwapPointer(&first.multi, nil, unsafe.Pointer(ma)) {
+		return ma, nil
+	}
+	if w := (*MultiArityFn)(atomic.LoadPointer(&first.multi)); w.builtFrom(fns) {
+		return w, nil
+	}
+	return ma, nil
+}
+
+// builtFrom reports whether l holds exactly the arms fns.
+func (l *MultiArityFn) builtFrom(fns []Value) bool {
+	n := len(l.fns)
+	if l.rest != nil {
+		n++
+	}
+	if n != len(fns) {
+		return false
+	}
+	for _, v := range fns {
+		f := v.(*Func)
+		if f.isVariadric {
+			if l.rest != Fn(f) {
+				return false
+			}
+		} else if l.fns[f.arity] != Fn(f) {
+			return false
+		}
+	}
+	return true
+}
+
 func NewCodeChunk(consts *Consts) *CodeChunk {
 	return &CodeChunk{
 		consts: consts,
@@ -220,36 +293,56 @@ func (c *CodeChunk) AddLocalVar(slot int, name string) {
 // LocalVars returns the chunk's local-variable debug table (may be nil).
 func (c *CodeChunk) LocalVars() []LocalVar { return c.localVars }
 
+// OpcodeStride returns the width in words of the instruction whose opcode
+// word is op: the opcode itself plus its inline argument words. It is the
+// walker every code scan uses (Debug, the disassembler, the bundle encoder's
+// namespace reachability); a new opcode with inline arguments must be added
+// here or those scans desynchronize from the VM.
+func OpcodeStride(op int32) int {
+	switch op & 0xff {
+	case OP_TRY_PUSH:
+		return 3 // catchOffset, finallyOffset
+	case OP_RECUR:
+		return 4 // offset, argc, ignore
+	case OP_LOAD_ARG, OP_BRANCH_TRUE, OP_BRANCH_FALSE, OP_JUMP, OP_POP_N, OP_DUP_NTH,
+		OP_INVOKE, OP_LOAD_CLOSEDOVER, OP_RECUR_FN, OP_MAKE_MULTI_ARITY, OP_TAIL_CALL,
+		OP_LOAD_CONST, OP_LOAD_VAR, OP_FINALLY_END:
+		return 2 // one int32 arg
+	default:
+		return 1
+	}
+}
+
+// ReadsConst reports whether the instruction whose opcode word is op takes a
+// const-pool index as its argument word. OP_LOAD_CONST and OP_LOAD_VAR are the
+// only readers of the pool in the interpreter loop.
+func ReadsConst(op int32) bool {
+	switch op & 0xff {
+	case OP_LOAD_CONST, OP_LOAD_VAR:
+		return true
+	}
+	return false
+}
+
 func (c *CodeChunk) Debug() {
 	consts := c.consts
 	fmt.Println("code:")
 	i := 0
 	for i < len(c.code) {
 		op, _ := c.Get(i)
-		switch op & 0xff {
-		case OP_TRY_PUSH:
-			arg, _ := c.Get32(i + 1)
-			arg2, _ := c.Get32(i + 2)
-			fmt.Println("  ", i, ":", OpcodeToString(op), arg, arg2)
-			i += 3
-		case OP_RECUR:
-			arg, _ := c.Get32(i + 1)
-			arg2, _ := c.Get32(i + 2)
-			arg3, _ := c.Get32(i + 3)
-			fmt.Println("  ", i, ":", OpcodeToString(op), arg, arg2, arg3)
-			i += 4
-		case OP_LOAD_ARG, OP_BRANCH_TRUE, OP_BRANCH_FALSE, OP_JUMP, OP_POP_N, OP_DUP_NTH, OP_INVOKE, OP_LOAD_CLOSEDOVER, OP_RECUR_FN, OP_MAKE_MULTI_ARITY, OP_TAIL_CALL, OP_FINALLY_END:
-			arg, _ := c.Get32(i + 1)
-			fmt.Println("  ", i, ":", OpcodeToString(op), arg)
-			i += 2
-		case OP_LOAD_CONST, OP_LOAD_VAR:
-			arg, _ := c.Get32(i + 1)
-			fmt.Println("  ", i, ":", OpcodeToString(op), arg, "<-", consts.get(arg))
-			i += 2
-		default:
-			fmt.Println("  ", i, ":", OpcodeToString(op))
-			i++
+		stride := OpcodeStride(op)
+		args := make([]any, 0, stride+2)
+		args = append(args, "  ", i, ":", OpcodeToString(op))
+		for j := 1; j < stride; j++ {
+			arg, _ := c.Get32(i + j)
+			args = append(args, arg)
 		}
+		if ReadsConst(op) {
+			arg, _ := c.Get32(i + 1)
+			args = append(args, "<-", consts.get(arg))
+		}
+		fmt.Println(args...)
+		i += stride
 	}
 }
 
@@ -375,6 +468,8 @@ type exHandler struct {
 type Frame struct {
 	stack       []Value
 	args        []Value
+	argbuf      []Value // frame-owned arguments used by same-frame tail replacement
+	prepArgs    []Value // argument slots owned by a PreparedCall; kept across pool reuse so preparing allocates nothing once warm
 	closedOvers []Value
 	argc        int
 	consts      *Consts
@@ -385,6 +480,9 @@ type Frame struct {
 	debug       bool
 	handlers    []exHandler  // exception handler stack (nil when unused)
 	ec          *ExecContext // per-execution context (dynamic bindings); nil = none installed
+	parent      *Frame       // suspended caller while the dispatch loop runs this frame
+	prevOp      uint8        // opcode profiler state, preserved while this frame is suspended
+	profileOn   bool         // profiler gate sampled at frame entry
 }
 
 // Frame reuse via a mutex-guarded LIFO.
@@ -430,8 +528,25 @@ func releaseFrame(f *Frame) {
 	framePoolMu.Unlock()
 }
 
+// NewFrameIn is NewFrame with the given execution context installed, so the
+// frame resolves dynamic bindings and its structured-concurrency scope against
+// the caller rather than the root. Used by eval-style natives that compile a
+// form and must run it where the caller is.
+func NewFrameIn(code *CodeChunk, args []Value, ec *ExecContext) *Frame {
+	f := NewFrame(code, args)
+	f.ec = ec.orRoot()
+	return f
+}
+
 func NewFrame(code *CodeChunk, args []Value) *Frame {
-	f := acquireFrame()
+	return initFrame(acquireFrame(), code, args)
+}
+
+// initFrame prepares an acquired frame to run code with args. Split from
+// NewFrame so a caller that must hold a frame before it knows the code (see
+// PrepareCallInto, which resolves the callee using the frame's own argument
+// slots) can acquire first and initialize afterwards.
+func initFrame(f *Frame, code *CodeChunk, args []Value) *Frame {
 	needed := max(code.maxStack, 4)
 	if cap(f.stack) >= needed {
 		f.stack = f.stack[:needed]
@@ -439,6 +554,7 @@ func NewFrame(code *CodeChunk, args []Value) *Frame {
 		f.stack = make([]Value, needed)
 	}
 	f.args = args
+	f.argbuf = f.argbuf[:0]
 	f.argc = len(args)
 	f.closedOvers = nil
 	f.consts = code.consts
@@ -448,6 +564,9 @@ func NewFrame(code *CodeChunk, args []Value) *Frame {
 	f.sp = 0
 	f.debug = false
 	f.ec = nil
+	f.parent = nil
+	f.prevOp = 0
+	f.profileOn = false
 	if f.handlers != nil {
 		f.handlers = f.handlers[:0]
 	}
@@ -459,17 +578,69 @@ func NewFrame(code *CodeChunk, args []Value) *Frame {
 // We only nil out the large reference fields to avoid pinning code/const objects.
 func ReleaseFrame(f *Frame) {
 	f.args = nil
+	clear(f.argbuf)
+	f.argbuf = nil
+	clear(f.prepArgs) // drop the values, keep the capacity for the next PrepareCallInto
 	f.closedOvers = nil
 	f.consts = nil
 	f.code = nil
 	f.handlers = nil
+	f.ec = nil
+	f.parent = nil
 	releaseFrame(f)
+}
+
+// newFrameForBytecodeCall is the non-tail transition for a prepared bytecode
+// target. Fixed-arity target.args may borrow the suspended parent's operand
+// stack; that is safe for a child frame because the parent does not resume
+// until the child has completed.
+func newFrameForBytecodeCall(target bytecodeCallTarget, ec *ExecContext) *Frame {
+	child := NewFrame(target.fn.chunk, target.args)
+	child.closedOvers = target.closedOvers
+	child.ec = ec
+	return child
+}
+
+// installBytecodeCall is the same-frame transition used by the existing
+// direct-*Func tail-call path. target.args may be a window into f.stack, so
+// copy it into the frame-owned buffer before resetting or reusing that stack.
+func installBytecodeCall(f *Frame, target bytecodeCallTarget) {
+	argc := len(target.args)
+	if cap(f.argbuf) < argc {
+		f.argbuf = make([]Value, argc)
+	} else {
+		clear(f.argbuf)
+		f.argbuf = f.argbuf[:argc]
+	}
+	copy(f.argbuf, target.args)
+
+	f.args = f.argbuf
+	f.argc = argc
+	f.closedOvers = target.closedOvers
+	f.code = target.fn.chunk
+	f.consts = f.code.consts
+	f.constsc = f.code.consts.count()
+	f.ip = 0
+	f.sp = 0
+	needed := max(f.code.maxStack, 4)
+	if cap(f.stack) < needed {
+		f.stack = make([]Value, needed)
+	} else {
+		f.stack = f.stack[:needed]
+	}
 }
 
 func NewDebugFrame(code *CodeChunk, args []Value) *Frame {
 	f := NewFrame(code, args)
 	f.debug = true
 	return f
+}
+
+// SetExecContext installs the dynamic execution state used when the frame
+// invokes bytecode and context-aware native functions. A nil context retains
+// the normal RootExecContext fallback.
+func (f *Frame) SetExecContext(ec *ExecContext) {
+	f.ec = ec
 }
 
 // Fast-path stack operations. The compiler guarantees correct stack depth,
@@ -618,10 +789,58 @@ func (f *Frame) RunProtected() (result Value, err error) {
 	return f.Run()
 }
 
-func (f *Frame) Run() (Value, error) {
+// suspendedCallArity validates the continuation stored in a suspended parent.
+// Returning an error here is preferable to either panicking or trusting corrupt
+// bytecode and silently dropping an arbitrary number of operand-stack values.
+func suspendedCallArity(f *Frame) (int, *ExecutionError) {
+	if f == nil || f.code == nil {
+		return 0, NewExecutionError("invalid suspended call: missing frame code")
+	}
+	if f.ip < 0 || f.ip >= len(f.code.code) {
+		return 0, NewExecutionError(fmt.Sprintf("invalid suspended call: instruction pointer %d is out of bounds", f.ip))
+	}
+	if f.ip+1 >= len(f.code.code) {
+		return 0, NewExecutionError(fmt.Sprintf("invalid suspended call at %d: missing arity operand", f.ip))
+	}
+	if f.sp < 0 || f.sp > len(f.stack) {
+		return 0, NewExecutionError(fmt.Sprintf("invalid suspended call at %d: stack depth %d is out of bounds", f.ip, f.sp))
+	}
+	op := f.code.code[f.ip] & 0xff
+	if op != OP_INVOKE && op != OP_TAIL_CALL {
+		return 0, NewExecutionError(fmt.Sprintf("invalid suspended call at %d: found %s", f.ip, OpcodeToString(f.code.code[f.ip])))
+	}
+	arity := int(f.code.code[f.ip+1])
+	if arity < 0 || arity+1 > f.sp {
+		return 0, NewExecutionError(fmt.Sprintf("invalid suspended call at %d: arity %d exceeds stack depth %d", f.ip, arity, f.sp))
+	}
+	return arity, nil
+}
+
+// wrapCallSite attributes err to the call currently under f.ip. The callee is
+// still on f's operand stack (the call opcodes peek rather than pop), so the
+// name is recoverable without extra bookkeeping.
+func wrapCallSite(f *Frame, err error) error {
+	arity, siteErr := suspendedCallArity(f)
+	if siteErr != nil {
+		return NewExecutionError(siteErr.message).Wrap(err)
+	}
+	srcInfo := f.code.LookupSource(f.ip)
+	name := "fn"
+	calleeIndex := f.sp - 1 - arity
+	if fn, ok := AsFn(f.stack[calleeIndex]); ok {
+		name = fnName(fn)
+	}
+	return NewExecutionError(fmt.Sprintf("calling %s", name)).WithSource(srcInfo).Wrap(err)
+}
+
+type frameRunState struct {
+	root    *Frame
+	current *Frame
+}
+
+func enterFrame(f *Frame) {
 	if allocAttrEnabled {
 		attrPushFrame(f)
-		defer attrPopFrame()
 	}
 	// Dynamically-scoped tracing (*lg-trace*). Coarse gate first: TraceArmed is
 	// false until *lg-trace* is first set truthy, so the precise per-frame Deref
@@ -637,21 +856,227 @@ func (f *Frame) Run() (Value, error) {
 		fmt.Print("run", f.args, "\n")
 		f.code.Debug()
 	}
-	// Profiler state: previous opcode byte (0 at frame entry). Only
-	// touched when ProfilingEnabled — the load is a single atomic
-	// branch per opcode, well-predicted in the disabled case.
-	var prevOp uint8
-	profileOn := ProfilingEnabled.Load()
+	// The newly entered frame starts a fresh opcode-pair sequence at zero.
+	// Suspended parents retain prevOp on their own Frame, so resuming records
+	// the next parent-local pair; cross-frame pairs are intentionally omitted.
+	f.prevOp = 0
+	f.profileOn = ProfilingEnabled.Load()
+}
+
+// leaveFrame takes no frame on purpose: attribution keeps its own shadow
+// stack, and a parameter here invites passing a frame that may already be
+// back in the pool (OP_RETURN releases the child before state.current is
+// rebound). No parameter, no use-after-release to reason about.
+func leaveFrame() {
+	if allocAttrEnabled {
+		attrPopFrame()
+	}
+}
+
+// releaseFailedFrames drops the current failed frame and each unhandled
+// suspended parent. The root is owned by Run's caller and is never pooled here.
+// It returns the first parent whose handler accepts err, or nil if none does.
+func releaseFailedFrames(state *frameRunState, err error) (*Frame, error) {
+	failed := state.current
+	parent := failed.parent
+	failed.parent = nil
+	if failed != state.root {
+		ReleaseFrame(failed)
+	}
+	for parent != nil {
+		next := parent.parent
+		err = wrapCallSite(parent, err)
+		if parent.handleError(err) {
+			state.current = parent
+			return parent, err
+		}
+		leaveFrame()
+		parent.parent = nil
+		if parent != state.root {
+			ReleaseFrame(parent)
+		}
+		parent = next
+	}
+	return nil, err
+}
+
+func releasePanickedFrames(state *frameRunState) {
+	failed := state.current
+	parent := failed.parent
+	failed.parent = nil
+	if failed != state.root {
+		ReleaseFrame(failed)
+	}
+	for parent != nil {
+		next := parent.parent
+		leaveFrame()
+		parent.parent = nil
+		if parent != state.root {
+			ReleaseFrame(parent)
+		}
+		parent = next
+	}
+}
+
+// Run executes this frame to completion. The dispatch loop descends into bytecode
+// callees within one dispatch loop, keeping the Go stack flat. A parent link
+// on each live frame carries the suspended call chain without a retained slice.
+func (f *Frame) Run() (result Value, resultErr error) {
+	f.parent = nil
+	state := frameRunState{root: f, current: f}
+	// A defer statement in this function would cost deferreturn scaffolding on
+	// every host->VM entry even when never registered (the compiler emits the
+	// return-path walk unconditionally), so the panic-cleanup defer lives in a
+	// separate wrapper taken only when allocation attribution is on. Without
+	// attribution, a Go panic leaks the chain's pooled frames to GC — exactly
+	// what pre-#645 did when a panic skipped runBytecodeCallTarget's
+	// ReleaseFrame; the panic itself is preserved either way.
+	if allocAttrEnabled {
+		return runChainProtected(&state)
+	}
+	return runChain(&state)
+}
+
+// runChainProtected owns the panic-path cleanup that keeps allocation
+// attribution balanced and pooled frames released. Kept out of Run and
+// runChain so their fast paths carry no defer scaffolding.
+func runChainProtected(state *frameRunState) (result Value, resultErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// runLoopAttr already left the current frame. Balance and
+			// release every suspended child-owned frame before preserving the panic.
+			releasePanickedFrames(state)
+			panic(r)
+		}
+	}()
+	return runChain(state)
+}
+
+// runChain drives the dispatch loop and the error-resume protocol for the
+// frame chain rooted at state.root. The attribution gate lives here, hoisted
+// out of the loop: a dispatcher function between runChain and the loop would
+// be too big to inline (runLoopInner far exceeds the inlining budget), so it
+// would cost a real call on every host->VM entry and every error-resume
+// iteration. A defer statement inside the bare loop itself would cost
+// deferreturn scaffolding on every VM entry, so the deferring variant stays
+// a separate function.
+func runChain(state *frameRunState) (result Value, resultErr error) {
+	entering := true
+	attr := allocAttrEnabled
+	for {
+		if attr {
+			result, resultErr = state.current.runLoopAttr(state, entering)
+		} else {
+			result, resultErr = state.current.runLoopInner(state, entering)
+		}
+		entering = false
+		if resultErr == nil {
+			return result, nil
+		}
+		var resumed *Frame
+		resumed, resultErr = releaseFailedFrames(state, resultErr)
+		if resumed == nil {
+			return NIL, resultErr
+		}
+	}
+}
+
+// runLoopAttr balances attrPopFrame for whichever logical frame is current
+// when the loop unwinds; suspended parents remain active. Attribution keeps
+// its own frame stack, so the wrapper can leave on behalf of the loop without
+// tracking its final frame.
+func (f *Frame) runLoopAttr(state *frameRunState, entering bool) (Value, error) {
+	defer leaveFrame()
+	return f.runLoopInner(state, entering)
+}
+
+// Cold-path error constructors, kept out of runLoopInner. Error construction
+// only runs on failure, but when the constructor bodies (fmt varargs setup,
+// struct literals, source-map lookups) are inlined into the ~25KB dispatch
+// function they enlarge it and degrade its register allocation (the #706/#719
+// FrameDispatch fragility). //go:noinline keeps each body a plain call so the
+// hot function stays small.
+
+//go:noinline
+func execErr(msg string) error {
+	return NewExecutionError(msg)
+}
+
+//go:noinline
+func execWrap(msg string, err error) error {
+	return NewExecutionError(msg).Wrap(err)
+}
+
+//go:noinline
+func errNotAFunction(v Value) error {
+	return NewTypeError(v, "is not a function", nil)
+}
+
+// wrapCallErr attributes err to the call at f.ip, naming the callee. Same
+// message shape as wrapCallSite, but for the in-arm sites where the callee fn
+// is already in hand.
+//
+//go:noinline
+func wrapCallErr(f *Frame, fn Fn, err error) error {
+	srcInfo := f.code.LookupSource(f.ip)
+	return NewExecutionError(fmt.Sprintf("calling %s", fnName(fn))).WithSource(srcInfo).Wrap(err)
+}
+
+//go:noinline
+func errIntOverflow() error {
+	return NewExecutionError("integer overflow")
+}
+
+//go:noinline
+func errDivByZero() error {
+	return NewExecutionError("integer division by zero")
+}
+
+//go:noinline
+func errBitOpType(name string) error {
+	return fmt.Errorf("%s expected Int", name)
+}
+
+// errUncheckedOpType is the type error for an operand ToInt rejects; every
+// unchecked-* path reports it through numUnchecked, so the wording is one.
+func uncheckedOpName(op int32) string {
+	switch op {
+	case OP_UNCHECKED_ADD:
+		return "unchecked-add"
+	case OP_UNCHECKED_SUB:
+		return "unchecked-subtract"
+	default:
+		return "unchecked-multiply"
+	}
+}
+
+func errUncheckedOpType(name string, v Value) error {
+	return fmt.Errorf("%s expected integer, got %s", name, v.Type().Name())
+}
+
+// debugTraceInst prints the per-instruction trace when frame tracing is on.
+// Kept out of line so the fmt varargs boxing does not sit at the top of the
+// dispatch loop's hottest block.
+//
+//go:noinline
+func debugTraceInst(f *Frame, inst int32) {
+	f.stackDbg()
+	fmt.Println("#", f.ip, OpcodeToString(inst))
+}
+
+func (f *Frame) runLoopInner(state *frameRunState, entering bool) (Value, error) {
+	if entering {
+		enterFrame(f)
+	}
 	for {
 		inst := f.code.code[f.ip]
 		if f.debug {
-			f.stackDbg()
-			fmt.Println("#", f.ip, OpcodeToString(inst))
+			debugTraceInst(f, inst)
 		}
-		if profileOn {
+		if f.profileOn {
 			currOp := uint8(inst & 0xff)
-			RecordOpcode(prevOp, currOp)
-			prevOp = currOp
+			RecordOpcode(f.prevOp, currOp)
+			f.prevOp = currOp
 		}
 		switch inst & 0xff {
 		case OP_NOOP:
@@ -660,31 +1085,54 @@ func (f *Frame) Run() (Value, error) {
 		case OP_LOAD_CONST:
 			idx := f.code.code[f.ip+1]
 			if int(idx) >= f.constsc {
-				return NIL, NewExecutionError("const lookup out of bounds")
+				return NIL, execErr("const lookup out of bounds")
 			}
 			err := f.push(f.consts.get(int(idx)))
 			if err != nil {
-				return NIL, NewExecutionError("const push failed").Wrap(err)
+				return NIL, execWrap("const push failed", err)
 			}
 			f.ip += 2
 
 		case OP_LOAD_ARG:
 			idx := f.code.code[f.ip+1]
 			if int(idx) >= f.argc {
-				return NIL, NewExecutionError("argument lookup out of bounds")
+				return NIL, execErr("argument lookup out of bounds")
 			}
 			err := f.push(f.args[idx])
 			if err != nil {
-				return NIL, NewExecutionError("argument push failed").Wrap(err)
+				return NIL, execWrap("argument push failed", err)
 			}
 			f.ip += 2
 
 		case OP_RETURN:
 			v, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("return failed").Wrap(err)
+				return NIL, execWrap("return failed", err)
 			}
-			return v, nil
+			if f.parent == nil {
+				return v, nil
+			}
+			child := f
+			parent := child.parent
+			child.parent = nil
+			leaveFrame()
+			ReleaseFrame(child)
+			f = parent
+			state.current = f
+			callArity, callErr := suspendedCallArity(f)
+			if callErr != nil {
+				if f.handleError(callErr) {
+					continue
+				}
+				return NIL, callErr
+			}
+			if e := f.drop(callArity + 1); e != nil {
+				return NIL, execWrap("cleaning stack after call", e)
+			}
+			if e := f.push(v); e != nil {
+				return NIL, execWrap("pushing return value failed", e)
+			}
+			f.ip += 2
 
 		case OP_INVOKE:
 			arity := f.code.code[f.ip+1]
@@ -692,20 +1140,35 @@ func (f *Frame) Run() (Value, error) {
 			if arity > 0 {
 				fraw, err := f.nth(int(arity))
 				if err != nil {
-					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
+					return NIL, execWrap("invoke instruction failed", err)
 				}
 				fn, ok := AsFn(fraw)
 				if !ok {
-					return NIL, NewTypeError(fraw, "is not a function", nil)
+					return NIL, errNotAFunction(fraw)
 				}
 				a, err := f.mult(0, int(arity))
 				if err != nil {
-					return NIL, NewExecutionError("popping arguments failed").Wrap(err)
+					return NIL, execWrap("popping arguments failed", err)
+				}
+				target, direct, cerr := resolveBytecodeCall(fn, a)
+				if cerr != nil {
+					wrapped := wrapCallErr(f, fn, cerr)
+					if f.handleError(wrapped) {
+						continue
+					}
+					return NIL, wrapped
+				}
+				if direct {
+					child := newFrameForBytecodeCall(target, f.ec)
+					child.parent = f
+					f = child
+					state.current = f
+					enterFrame(f)
+					continue
 				}
 				out, err = f.ec.Invoke(fn, a)
 				if err != nil {
-					srcInfo := f.code.LookupSource(f.ip)
-					wrapped := NewExecutionError(fmt.Sprintf("calling %s", fnName(fn))).WithSource(srcInfo).Wrap(err)
+					wrapped := wrapCallErr(f, fn, err)
 					if f.handleError(wrapped) {
 						continue
 					}
@@ -713,21 +1176,41 @@ func (f *Frame) Run() (Value, error) {
 				}
 				err = f.drop(int(arity) + 1)
 				if err != nil {
-					return NIL, NewExecutionError("cleaning stack after call").Wrap(err)
+					return NIL, execWrap("cleaning stack after call", err)
 				}
 			} else {
-				fraw, err := f.pop()
+				// Peek rather than pop, so the callee slot remains for the
+				// uniform drop(arity+1) when a descended child returns.
+				fraw, err := f.nth(0)
 				if err != nil {
-					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
+					return NIL, execWrap("invoke instruction failed", err)
 				}
 				fn, ok := AsFn(fraw)
 				if !ok {
-					return NIL, NewTypeError(fraw, "is not a function", nil)
+					return NIL, errNotAFunction(fraw)
+				}
+				target, direct, cerr := resolveBytecodeCall(fn, nil)
+				if cerr != nil {
+					wrapped := wrapCallErr(f, fn, cerr)
+					if f.handleError(wrapped) {
+						continue
+					}
+					return NIL, wrapped
+				}
+				if direct {
+					child := newFrameForBytecodeCall(target, f.ec)
+					child.parent = f
+					f = child
+					state.current = f
+					enterFrame(f)
+					continue
+				}
+				if _, perr := f.pop(); perr != nil {
+					return NIL, execWrap("invoke instruction failed", perr)
 				}
 				out, err = f.ec.Invoke(fn, nil)
 				if err != nil {
-					srcInfo := f.code.LookupSource(f.ip)
-					wrapped := NewExecutionError(fmt.Sprintf("calling %s", fnName(fn))).WithSource(srcInfo).Wrap(err)
+					wrapped := wrapCallErr(f, fn, err)
 					if f.handleError(wrapped) {
 						continue
 					}
@@ -736,130 +1219,79 @@ func (f *Frame) Run() (Value, error) {
 			}
 			err := f.push(out)
 			if err != nil {
-				return NIL, NewExecutionError("pushing return value failed").Wrap(err)
+				return NIL, execWrap("pushing return value failed", err)
 			}
 			f.ip += 2
 
 		case OP_TAIL_CALL:
 			arity := f.code.code[f.ip+1]
-			var out Value
+			// Keep the callee on the operand stack when descending so the
+			// return path can use one drop(arity+1) protocol for every arity.
+			fraw, err := f.nth(int(arity))
+			if err != nil {
+				return NIL, execWrap("invoke instruction failed", err)
+			}
+			fn, ok := AsFn(fraw)
+			if !ok {
+				return NIL, errNotAFunction(fraw)
+			}
+			var a []Value
 			if arity > 0 {
-				fraw, err := f.nth(int(arity))
+				a, err = f.mult(0, int(arity))
 				if err != nil {
-					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
-				}
-				fn, ok := AsFn(fraw)
-				if !ok {
-					return NIL, NewTypeError(fraw, "is not a function", nil)
-				}
-				a, err := f.mult(0, int(arity))
-				if err != nil {
-					return NIL, NewExecutionError("popping arguments failed").Wrap(err)
-				}
-				if _, ok := fn.(*Func); !ok {
-					out, err = f.ec.Invoke(fn, a)
-					if err != nil {
-						srcInfo := f.code.LookupSource(f.ip)
-						wrapped := NewExecutionError(fmt.Sprintf("calling %s", fnName(fn))).WithSource(srcInfo).Wrap(err)
-						if f.handleError(wrapped) {
-							continue
-						}
-						return NIL, wrapped
-					}
-					// TAIL_CALL is terminal: builtin's result is this
-					// frame's result. (The compiler still emits RETURN
-					// after TAIL_CALL but it's now dead code.)
-					return out, nil
-				} else {
-					ff := fn.(*Func)
-					// Package variadic args for direct frame reuse
-					if ff.isVariadric {
-						if len(a) < ff.arity-1 {
-							return NIL, NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got %d", ff, ff.arity-1, len(a)))
-						}
-						sargs := a[0 : ff.arity-1]
-						rest := a[ff.arity-1:]
-						restlist, boxErr := boxRest(rest)
-						if boxErr != nil {
-							return NIL, boxErr
-						}
-						a = append(sargs, restlist)
-					}
-					f.code = ff.chunk
-					f.consts = f.code.consts
-					f.constsc = f.code.consts.count()
-					f.ip = 0
-					f.sp = 0
-					if len(f.stack) < f.code.maxStack {
-						f.stack = make([]Value, f.code.maxStack)
-						f.args = a
-						f.argc = len(a)
-					} else {
-						la := len(a)
-						if la <= f.argc {
-							copy(f.args, a)
-						} else {
-							f.args = make([]Value, la)
-							copy(f.args, a)
-						}
-						f.argc = len(a)
-					}
-					continue
-				}
-			} else {
-				fraw, err := f.pop()
-				if err != nil {
-					return NIL, NewExecutionError("invoke instruction failed").Wrap(err)
-				}
-				fn, ok := AsFn(fraw)
-				if !ok {
-					return NIL, NewTypeError(fraw, "is not a function", nil)
-				}
-				if _, ok := fn.(*Func); !ok {
-					out, err = f.ec.Invoke(fn, nil)
-					if err != nil {
-						srcInfo := f.code.LookupSource(f.ip)
-						wrapped := NewExecutionError(fmt.Sprintf("calling %s", fnName(fn))).WithSource(srcInfo).Wrap(err)
-						if f.handleError(wrapped) {
-							continue
-						}
-						return NIL, wrapped
-					}
-					// TAIL_CALL is terminal: builtin's result is this
-					// frame's result.
-					return out, nil
-				} else {
-					ff := fn.(*Func)
-					// Package the (nil) rest binding for variadic
-					// functions, exactly like the arity > 0 path above;
-					// without it the reused frame runs LOAD_ARG against
-					// zero args.
-					var a []Value
-					if ff.isVariadric {
-						if ff.arity > 1 {
-							return NIL, NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got 0", ff, ff.arity-1))
-						}
-						a = []Value{NIL}
-					}
-					f.code = ff.chunk
-					f.consts = f.code.consts
-					f.constsc = f.code.consts.count()
-					f.ip = 0
-					f.sp = 0
-					if len(f.stack) < f.code.maxStack {
-						f.stack = make([]Value, f.code.maxStack)
-					}
-					f.args = a
-					f.argc = len(a)
-					continue
+					return NIL, execWrap("popping arguments failed", err)
 				}
 			}
+
+			target, direct, resolveErr := resolveBytecodeCall(fn, a)
+			if resolveErr != nil {
+				wrapped := wrapCallErr(f, fn, resolveErr)
+				if f.handleError(wrapped) {
+					continue
+				}
+				return NIL, wrapped
+			}
+			if direct {
+				if _, reuse := fn.(*Func); reuse {
+					installBytecodeCall(f, target)
+					continue
+				}
+				// Closure, multi-arity, and metadata-wrapped bytecode
+				// callees descend without re-entering Frame.Run. #620 will
+				// move these targets onto the same-frame transition.
+				child := newFrameForBytecodeCall(target, f.ec)
+				child.parent = f
+				f = child
+				state.current = f
+				enterFrame(f)
+				continue
+			}
+
+			out, err := f.ec.Invoke(fn, a)
+			if err != nil {
+				wrapped := wrapCallErr(f, fn, err)
+				if f.handleError(wrapped) {
+					continue
+				}
+				return NIL, wrapped
+			}
+			// A native/non-bytecode tail call is terminal. Land its result
+			// on the compiler-emitted RETURN so frame-chain unwind remains
+			// centralized in OP_RETURN.
+			if e := f.drop(int(arity) + 1); e != nil {
+				return NIL, execWrap("cleaning stack after call", e)
+			}
+			if e := f.push(out); e != nil {
+				return NIL, execWrap("pushing return value failed", e)
+			}
+			f.ip += 2
+			continue
 
 		case OP_BRANCH_TRUE:
 			offset := f.code.code[f.ip+1]
 			v, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("BRANCH_TRUE pop condition").Wrap(err)
+				return NIL, execWrap("BRANCH_TRUE pop condition", err)
 			}
 			if !IsTruthy(v) {
 				f.ip += 2
@@ -871,7 +1303,7 @@ func (f *Frame) Run() (Value, error) {
 			offset := f.code.code[f.ip+1]
 			v, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("BRANCH_FALSE pop condition").Wrap(err)
+				return NIL, execWrap("BRANCH_FALSE pop condition", err)
 			}
 			if IsTruthy(v) {
 				f.ip += 2
@@ -886,23 +1318,23 @@ func (f *Frame) Run() (Value, error) {
 		case OP_POP:
 			_, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("POP failed").Wrap(err)
+				return NIL, execWrap("POP failed", err)
 			}
 			f.ip++
 
 		case OP_POP_N:
 			v, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("POP_N top value").Wrap(err)
+				return NIL, execWrap("POP_N top value", err)
 			}
 			num := f.code.code[f.ip+1]
 			err = f.drop(int(num))
 			if err != nil {
-				return NIL, NewExecutionError("POP_N drop").Wrap(err)
+				return NIL, execWrap("POP_N drop", err)
 			}
 			err = f.push(v)
 			if err != nil {
-				return NIL, NewExecutionError("POP_N push").Wrap(err)
+				return NIL, execWrap("POP_N push", err)
 			}
 			f.ip += 2
 
@@ -910,26 +1342,26 @@ func (f *Frame) Run() (Value, error) {
 			num := f.code.code[f.ip+1]
 			val, err := f.nth(int(num))
 			if err != nil {
-				return NIL, NewExecutionError("DUP_NTH get nth").Wrap(err)
+				return NIL, execWrap("DUP_NTH get nth", err)
 			}
 			err = f.push(val)
 			if err != nil {
-				return NIL, NewExecutionError("DUP_NTH push").Wrap(err)
+				return NIL, execWrap("DUP_NTH push", err)
 			}
 			f.ip += 2
 
 		case OP_SET_VAR:
 			val, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("SET_VAR pop value failed").Wrap(err)
+				return NIL, execWrap("SET_VAR pop value failed", err)
 			}
 			varr, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("SET_VAR pop var failed").Wrap(err)
+				return NIL, execWrap("SET_VAR pop var failed", err)
 			}
 			varrd, ok := varr.(*Var)
 			if !ok {
-				return NIL, NewExecutionError("SET_VAR invalid Var").Wrap(err)
+				return NIL, execWrap("SET_VAR invalid Var", err)
 			}
 			// (set! *v* val) mutates the current execution's top dynamic
 			// binding (thread-local, matching Clojure) when one is active.
@@ -946,32 +1378,32 @@ func (f *Frame) Run() (Value, error) {
 			armTraceIfTruthy(varrd, val)
 			err = f.push(varr)
 			if err != nil {
-				return NIL, NewExecutionError("SET_VAR push var failed").Wrap(err)
+				return NIL, execWrap("SET_VAR push var failed", err)
 			}
 			f.ip++
 
 		case OP_LOAD_VAR:
 			idx := f.code.code[f.ip+1]
 			if int(idx) >= f.constsc {
-				return NIL, NewExecutionError("const lookup out of bounds")
+				return NIL, execErr("const lookup out of bounds")
 			}
 			err := f.push(f.ec.deref(f.consts.get(int(idx)).(*Var)))
 			if err != nil {
-				return NIL, NewExecutionError("const push failed").Wrap(err)
+				return NIL, execWrap("const push failed", err)
 			}
 			f.ip += 2
 
 		case OP_MAKE_CLOSURE:
 			idx := f.sp - 1
 			if idx < 0 {
-				return NIL, NewExecutionError("MAKE_CLOSURE stack underflow")
+				return NIL, execErr("MAKE_CLOSURE stack underflow")
 			}
 			type closureCreator interface {
 				MakeClosure() Fn
 			}
 			fn, ok := f.stack[idx].(closureCreator)
 			if !ok {
-				return NIL, NewExecutionError("MAKE_CLOSURE invalid func on stack")
+				return NIL, execErr("MAKE_CLOSURE invalid func on stack")
 			}
 			f.stack[idx] = fn.MakeClosure()
 			f.ip++
@@ -979,30 +1411,30 @@ func (f *Frame) Run() (Value, error) {
 		case OP_LOAD_CLOSEDOVER:
 			idx := f.code.code[f.ip+1]
 			if int(idx) >= len(f.closedOvers) {
-				return NIL, NewExecutionError("closed over lookup out of bounds")
+				return NIL, execErr("closed over lookup out of bounds")
 			}
 			err := f.push(f.closedOvers[idx])
 			if err != nil {
-				return NIL, NewExecutionError("closed over push failed").Wrap(err)
+				return NIL, execWrap("closed over push failed", err)
 			}
 			f.ip += 2
 
 		case OP_PUSH_CLOSEDOVER:
 			val, err := f.pop()
 			if err != nil {
-				return NIL, NewExecutionError("popping closed over value failed").Wrap(err)
+				return NIL, execWrap("popping closed over value failed", err)
 			}
 			idx := f.sp - 1
 			if idx < 0 {
-				return NIL, NewExecutionError("PUSH_CLOSEDOVER stack overflow").Wrap(err)
+				return NIL, execWrap("PUSH_CLOSEDOVER stack overflow", err)
 			}
 			cls := f.stack[idx]
 			if cls.Type() != FuncType {
-				return NIL, NewExecutionError("PUSH_CLOSEDOVER expected a Fn")
+				return NIL, execErr("PUSH_CLOSEDOVER expected a Fn")
 			}
 			fun, ok := cls.(*Closure)
 			if !ok {
-				return NIL, NewExecutionError("PUSH_CLOSEDOVER invalid closure on stack")
+				return NIL, execErr("PUSH_CLOSEDOVER invalid closure on stack")
 			}
 			fun.closedOvers = append(fun.closedOvers, val)
 			f.ip++
@@ -1011,7 +1443,7 @@ func (f *Frame) Run() (Value, error) {
 			arity := f.code.code[f.ip+1]
 			a, err := f.mult(0, int(arity))
 			if err != nil {
-				return NIL, NewExecutionError("popping arguments failed").Wrap(err)
+				return NIL, execWrap("popping arguments failed", err)
 			}
 			copy(f.args, a)
 			f.argc = int(arity)
@@ -1024,15 +1456,15 @@ func (f *Frame) Run() (Value, error) {
 			ignore := f.code.code[f.ip+3]
 			a, err := f.mult(0, int(argc))
 			if err != nil {
-				return NIL, NewExecutionError("RECUR popping arguments failed").Wrap(err)
+				return NIL, execWrap("RECUR popping arguments failed", err)
 			}
 			err = f.drop(int(argc)*2 + int(ignore))
 			if err != nil {
-				return NIL, NewExecutionError("RECUR popping old locals").Wrap(err)
+				return NIL, execWrap("RECUR popping old locals", err)
 			}
 			err = f.pushMult(a)
 			if err != nil {
-				return NIL, NewExecutionError("RECUR pushing new locals").Wrap(err)
+				return NIL, execWrap("RECUR pushing new locals", err)
 			}
 
 			f.ip -= int(offset)
@@ -1042,18 +1474,18 @@ func (f *Frame) Run() (Value, error) {
 			n := int(nfns)
 			fns, err := f.mult(0, n)
 			if err != nil {
-				return NIL, NewExecutionError("MAKE_MULTI_ARITY popping arguments failed").Wrap(err)
+				return NIL, execWrap("MAKE_MULTI_ARITY popping arguments failed", err)
 			}
 			f.sp -= n
 
-			fn, err := MakeMultiArity(fns)
+			fn, err := f.code.multiArityAt(fns)
 			if err != nil {
-				return NIL, NewExecutionError("MAKE_MULTI_ARITY failed").Wrap(err)
+				return NIL, execWrap("MAKE_MULTI_ARITY failed", err)
 			}
 
 			err = f.push(fn)
 			if err != nil {
-				return NIL, NewExecutionError("MAKE_MULTI_ARITY push failed").Wrap(err)
+				return NIL, execWrap("MAKE_MULTI_ARITY push failed", err)
 			}
 
 			f.ip += 2
@@ -1123,12 +1555,15 @@ func (f *Frame) Run() (Value, error) {
 				if bi, ok := b.(Int); ok {
 					r, ok := checkedAddInt(ai, bi)
 					if !ok {
-						if f.handleError(NewExecutionError("integer overflow")) {
+						if f.handleError(errIntOverflow()) {
 							continue
 						}
-						return NIL, NewExecutionError("integer overflow")
+						return NIL, errIntOverflow()
 					}
-					f.stack[f.sp-2] = r
+					// Through the cache rather than a bare store: on a 32-bit host an
+					// 8-byte Int does not fit the interface word, so every bare store
+					// would allocate. Same for the other Int fast paths below.
+					f.stack[f.sp-2] = MakeInt64(int64(r))
 					f.sp--
 					f.ip++
 					continue
@@ -1152,12 +1587,12 @@ func (f *Frame) Run() (Value, error) {
 				if bi, ok := b.(Int); ok {
 					r, ok := checkedSubInt(ai, bi)
 					if !ok {
-						if f.handleError(NewExecutionError("integer overflow")) {
+						if f.handleError(errIntOverflow()) {
 							continue
 						}
-						return NIL, NewExecutionError("integer overflow")
+						return NIL, errIntOverflow()
 					}
-					f.stack[f.sp-2] = r
+					f.stack[f.sp-2] = MakeInt64(int64(r))
 					f.sp--
 					f.ip++
 					continue
@@ -1181,12 +1616,12 @@ func (f *Frame) Run() (Value, error) {
 				if bi, ok := b.(Int); ok {
 					r, ok := checkedMulInt(ai, bi)
 					if !ok {
-						if f.handleError(NewExecutionError("integer overflow")) {
+						if f.handleError(errIntOverflow()) {
 							continue
 						}
-						return NIL, NewExecutionError("integer overflow")
+						return NIL, errIntOverflow()
 					}
-					f.stack[f.sp-2] = r
+					f.stack[f.sp-2] = MakeInt64(int64(r))
 					f.sp--
 					f.ip++
 					continue
@@ -1208,19 +1643,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-and expected Int")) {
+				if f.handleError(errBitOpType("bit-and")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-and expected Int")
+				return NIL, errBitOpType("bit-and")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-and expected Int")) {
+				if f.handleError(errBitOpType("bit-and")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-and expected Int")
+				return NIL, errBitOpType("bit-and")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) & int(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) & int64(bi))
 			f.sp--
 			f.ip++
 
@@ -1229,19 +1664,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-or expected Int")) {
+				if f.handleError(errBitOpType("bit-or")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-or expected Int")
+				return NIL, errBitOpType("bit-or")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-or expected Int")) {
+				if f.handleError(errBitOpType("bit-or")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-or expected Int")
+				return NIL, errBitOpType("bit-or")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) | int(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) | int64(bi))
 			f.sp--
 			f.ip++
 
@@ -1250,19 +1685,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-xor expected Int")) {
+				if f.handleError(errBitOpType("bit-xor")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-xor expected Int")
+				return NIL, errBitOpType("bit-xor")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-xor expected Int")) {
+				if f.handleError(errBitOpType("bit-xor")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-xor expected Int")
+				return NIL, errBitOpType("bit-xor")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) ^ int(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) ^ int64(bi))
 			f.sp--
 			f.ip++
 
@@ -1271,19 +1706,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-and-not expected Int")) {
+				if f.handleError(errBitOpType("bit-and-not")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-and-not expected Int")
+				return NIL, errBitOpType("bit-and-not")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-and-not expected Int")) {
+				if f.handleError(errBitOpType("bit-and-not")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-and-not expected Int")
+				return NIL, errBitOpType("bit-and-not")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) &^ int(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) &^ int64(bi))
 			f.sp--
 			f.ip++
 
@@ -1292,19 +1727,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-shift-left expected Int")) {
+				if f.handleError(errBitOpType("bit-shift-left")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-shift-left expected Int")
+				return NIL, errBitOpType("bit-shift-left")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-shift-left expected Int")) {
+				if f.handleError(errBitOpType("bit-shift-left")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-shift-left expected Int")
+				return NIL, errBitOpType("bit-shift-left")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) << uint(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) << uint(bi))
 			f.sp--
 			f.ip++
 
@@ -1313,19 +1748,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-shift-right expected Int")) {
+				if f.handleError(errBitOpType("bit-shift-right")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-shift-right expected Int")
+				return NIL, errBitOpType("bit-shift-right")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-shift-right expected Int")) {
+				if f.handleError(errBitOpType("bit-shift-right")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-shift-right expected Int")
+				return NIL, errBitOpType("bit-shift-right")
 			}
-			f.stack[f.sp-2] = MakeInt(int(ai) >> uint(bi))
+			f.stack[f.sp-2] = MakeInt64(int64(ai) >> uint(bi))
 			f.sp--
 			f.ip++
 
@@ -1334,19 +1769,19 @@ func (f *Frame) Run() (Value, error) {
 			a := f.stack[f.sp-2]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("unsigned-bit-shift-right expected Int")) {
+				if f.handleError(errBitOpType("unsigned-bit-shift-right")) {
 					continue
 				}
-				return NIL, fmt.Errorf("unsigned-bit-shift-right expected Int")
+				return NIL, errBitOpType("unsigned-bit-shift-right")
 			}
 			bi, ok := b.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("unsigned-bit-shift-right expected Int")) {
+				if f.handleError(errBitOpType("unsigned-bit-shift-right")) {
 					continue
 				}
-				return NIL, fmt.Errorf("unsigned-bit-shift-right expected Int")
+				return NIL, errBitOpType("unsigned-bit-shift-right")
 			}
-			f.stack[f.sp-2] = MakeInt(int(uint(ai) >> uint(bi)))
+			f.stack[f.sp-2] = MakeInt64(int64(uint64(ai) >> uint(bi)))
 			f.sp--
 			f.ip++
 
@@ -1356,14 +1791,14 @@ func (f *Frame) Run() (Value, error) {
 			if ai, ok := a.(Int); ok {
 				if bi, ok := b.(Int); ok {
 					if bi == 0 {
-						if f.handleError(NewExecutionError("integer division by zero")) {
+						if f.handleError(errDivByZero()) {
 							continue
 						}
-						return NIL, NewExecutionError("integer division by zero")
+						return NIL, errDivByZero()
 					}
 					// Int quot is truncated toward zero — Go's / on
 					// signed ints matches Clojure's quot semantics.
-					f.stack[f.sp-2] = Int(int64(ai) / int64(bi))
+					f.stack[f.sp-2] = MakeInt64(int64(ai) / int64(bi))
 					f.sp--
 					f.ip++
 					continue
@@ -1398,16 +1833,44 @@ func (f *Frame) Run() (Value, error) {
 			f.sp--
 			f.ip++
 
+		case OP_UNCHECKED_ADD, OP_UNCHECKED_SUB, OP_UNCHECKED_MUL:
+			// Wrapping integer arithmetic (clojure.core/unchecked-*). Same shape
+			// as OP_ADD: inline the Int/Int path, and fall back to the generic
+			// implementation the core fn uses (numUnchecked, which coerces
+			// through ToInt) for anything else, so the opcode is never stricter
+			// than the var it replaces.
+			b := f.stack[f.sp-1]
+			a := f.stack[f.sp-2]
+			op := inst & 0xff
+			if ai, ok := a.(Int); ok {
+				if bi, ok := b.(Int); ok {
+					f.stack[f.sp-2] = uncheckedIntOp(op, ai, bi)
+					f.sp--
+					f.ip++
+					continue
+				}
+			}
+			r, err := numUnchecked(op, a, b)
+			if err != nil {
+				if f.handleError(err) {
+					continue
+				}
+				return NIL, err
+			}
+			f.stack[f.sp-2] = r
+			f.sp--
+			f.ip++
+
 		case OP_BIT_NOT:
 			a := f.stack[f.sp-1]
 			ai, ok := a.(Int)
 			if !ok {
-				if f.handleError(fmt.Errorf("bit-not expected Int")) {
+				if f.handleError(errBitOpType("bit-not")) {
 					continue
 				}
-				return NIL, fmt.Errorf("bit-not expected Int")
+				return NIL, errBitOpType("bit-not")
 			}
-			f.stack[f.sp-1] = MakeInt(^int(ai))
+			f.stack[f.sp-1] = MakeInt64(^int64(ai))
 			f.ip++
 
 		case OP_LT:
@@ -1528,12 +1991,12 @@ func (f *Frame) Run() (Value, error) {
 			if ai, ok := a.(Int); ok {
 				r, ok := checkedAddInt(ai, 1)
 				if !ok {
-					if f.handleError(NewExecutionError("integer overflow")) {
+					if f.handleError(errIntOverflow()) {
 						continue
 					}
-					return NIL, NewExecutionError("integer overflow")
+					return NIL, errIntOverflow()
 				}
-				f.stack[f.sp-1] = r
+				f.stack[f.sp-1] = MakeInt64(int64(r))
 				f.ip++
 				continue
 			}
@@ -1552,12 +2015,12 @@ func (f *Frame) Run() (Value, error) {
 			if ai, ok := a.(Int); ok {
 				r, ok := checkedSubInt(ai, 1)
 				if !ok {
-					if f.handleError(NewExecutionError("integer overflow")) {
+					if f.handleError(errIntOverflow()) {
 						continue
 					}
-					return NIL, NewExecutionError("integer overflow")
+					return NIL, errIntOverflow()
 				}
-				f.stack[f.sp-1] = r
+				f.stack[f.sp-1] = MakeInt64(int64(r))
 				f.ip++
 				continue
 			}
@@ -1571,8 +2034,43 @@ func (f *Frame) Run() (Value, error) {
 			f.stack[f.sp-1] = r
 			f.ip++
 
+		case OP_AGET:
+			// (aget arr i) without LOAD_VAR, INVOKE, or the variadic
+			// argument slice. The helper carries the core fn's exact
+			// checks and error text, so the opcode is never stricter than
+			// the var it replaces; the compiler only emits it for two args,
+			// so nested aget stays an ordinary call.
+			idx := f.stack[f.sp-1]
+			arr := f.stack[f.sp-2]
+			r, err := agetValue(arr, idx)
+			if err != nil {
+				if f.handleError(err) {
+					continue
+				}
+				return NIL, err
+			}
+			f.stack[f.sp-2] = r
+			f.sp--
+			f.ip++
+
+		case OP_ASET:
+			// (aset arr i v): like aset, the result is v as given, not the
+			// coerced element.
+			val := f.stack[f.sp-1]
+			idx := f.stack[f.sp-2]
+			arr := f.stack[f.sp-3]
+			if err := asetValue(arr, idx, val); err != nil {
+				if f.handleError(err) {
+					continue
+				}
+				return NIL, err
+			}
+			f.stack[f.sp-3] = val
+			f.sp -= 2
+			f.ip++
+
 		default:
-			return NIL, NewExecutionError("unknown instruction")
+			return NIL, execErr("unknown instruction")
 		}
 	}
 }

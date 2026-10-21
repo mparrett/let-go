@@ -1,5 +1,6 @@
 (ns test.readme-limitations-test
-  (:require [test :refer :all]))
+  (:require
+   [test :refer :all]))
 
 (defn unsupported? [source]
   (try
@@ -33,15 +34,17 @@
     (is (= () (chunk-rest (range 5))))
     (is (nil? (chunk-next (range 5))))))
 
-(deftest custom-tagged-literal-readers-not-implemented
-  (testing "built-in tags work, but custom reader hooks do not"
+(deftest custom-tagged-literal-readers
+  (testing "built-in and dynamically registered tags work"
     (is (uuid? (read-string "#uuid \"550e8400-e29b-41d4-a716-446655440000\"")))
     (is (inst? (read-string "#inst \"2024-01-01T00:00:00Z\"")))
-    (is (unsupported? "*data-readers*"))
-    (is (unsupported? "*default-data-reader-fn*")))
-  (testing "unknown tags do not create tagged literals or call custom readers"
-    (is (= {:x 1} (read-string "#test/unknown {:x 1}")))
-    (is (not (tagged-literal? (read-string "#test/unknown {:x 1}"))))))
+    (binding [*data-readers* {'test/readme (fn [value] [:readme value])}]
+      (is (= [:readme {:x 1}]
+             (read-string "#test/readme {:x 1}")))))
+  (testing "an unregistered tag throws unless *default-data-reader-fn* handles it"
+    (is (unsupported? "(read-string \"#test/unknown {:x 1}\")"))
+    (is (tagged-literal? (binding [*default-data-reader-fn* tagged-literal]
+                           (read-string "#test/unknown {:x 1}"))))))
 
 (defprotocol ReadmeLimitationProtocol
   (readme-value [this]))
@@ -54,10 +57,11 @@
               (readme-value [this] 42))]
       (is (satisfies? ReadmeLimitationProtocol r))
       (is (= 42 (readme-value r)))))
-  (testing "Java-style host method bodies and host interfaces do not"
+  (testing "Java-style host method bodies on deftype and host interfaces do not"
     (is (unsupported? "(deftype ReadmeLimitationToString [x] Object (toString [this] \"x\"))"))
-    (is (unsupported? "(deftype ReadmeLimitationRunnable [] java.lang.Runnable (run [this] nil))"))
-    (is (unsupported? "(reify Object (toString [this] \"x\"))"))))
+    (is (unsupported? "(deftype ReadmeLimitationRunnable [] java.lang.Runnable (run [this] nil))")))
+  (testing "reify accepts Object method overrides (toString wired into str)"
+    (is (= "x" (load-string "(str (reify Object (toString [this] \"x\")))")))))
 
 (deftest spec-not-implemented
   (testing "clojure.spec APIs are not available"

@@ -17,15 +17,45 @@ import (
 	"github.com/nooga/let-go/pkg/vm"
 )
 
+// invokeMacro runs a macro expander with core/*macro-form* bound to the
+// call form, which defmacro exposes as &form. The binding is pushed on the
+// root binding stack (package-level Var API) because the compiler has no
+// ExecContext of its own; expansion is synchronous so push/pop pair here.
+func invokeMacro(macroVar *vm.Var, callForm vm.Value, args []vm.Value) (vm.Value, error) {
+	if mf := macroFormVar(); mf != nil {
+		mf.PushBinding(callForm)
+		defer mf.PopBinding()
+	}
+	return macroVar.Deref().(vm.Fn).Invoke(args)
+}
+
+var macroFormVarCache *vm.Var
+
+func macroFormVar() *vm.Var {
+	if macroFormVarCache == nil {
+		if ns := rt.NS(rt.NameCoreNS); ns != nil {
+			if v := ns.LookupLocal(vm.Symbol("*macro-form*")); v != nil {
+				macroFormVarCache = v
+			}
+		}
+	}
+	return macroFormVarCache
+}
+
 type Context struct {
 	parent     *Context
 	consts     *vm.Consts
 	chunk      *vm.CodeChunk
 	formalArgs map[vm.Symbol]int
-	argCount   int // total fixed-arity parameter slots, including `_`s
-	source     string
-	variadric  bool
-	locals     []map[vm.Symbol]int
+	// knownArgs marks the formal args whose host type is statically known
+	// (they carried a :tag hint); knownLocals mirrors locals the same way.
+	// Only the reflection warning consults them.
+	knownArgs   map[vm.Symbol]bool
+	argCount    int // total fixed-arity parameter slots, including `_`s
+	source      string
+	variadric   bool
+	locals      []map[vm.Symbol]int
+	knownLocals []map[vm.Symbol]bool
 	// localSlotCounts mirrors locals: each entry is the raw count of stack
 	// slots in that scope. We track this separately because shadowed bindings
 	// (e.g. `(let [[a w] ... [b w] ...])`) overwrite the symbol→slot map
@@ -33,30 +63,34 @@ type Context struct {
 	// counts in that case, but the stack footprint is bindn (matching
 	// let/loop's OP_POP_N). recurCompiler reads from here to compute its
 	// `ignore` operand correctly.
-	localSlotCounts []int
-	sp              int
-	spMax           int
-	isFunction      bool
-	isClosure       bool
-	closedOversC    int
-	closedOvers     map[vm.Symbol]*closureCell
-	closedOversSeq  []vm.Symbol
-	recurPoints     []*recurPoint
-	tailPosition    bool
-	debug           bool
-	defName         string
-	currentForm     vm.Value // tracks the form being compiled for error source info
-	currentList     vm.Value // tracks the enclosing list form for error source info
+	localSlotCounts    []int
+	sp                 int
+	spMax              int
+	isFunction         bool
+	isClosure          bool
+	closedOversC       int
+	closedOvers        map[vm.Symbol]*closureCell
+	closedOversSeq     []vm.Symbol
+	recurPoints        []*recurPoint
+	tailPosition       bool
+	debug              bool
+	defName            string
+	currentForm        vm.Value // tracks the form being compiled for error source info
+	currentList        vm.Value // tracks the enclosing list form for error source info
+	taggedReaders      *TaggedReaderRegistry
+	dataReaderResolver taggedDataReaderResolver
+	execContext        *vm.ExecContext
 }
 
 func NewCompiler(consts *vm.Consts, ns *vm.Namespace) *Context {
 	rt.CurrentNS.SetRoot(ns)
 	return &Context{
-		consts:      consts,
-		source:      "<default>",
-		locals:      []map[vm.Symbol]int{},
-		closedOvers: map[vm.Symbol]*closureCell{},
-		debug:       false,
+		consts:             consts,
+		source:             "<default>",
+		locals:             []map[vm.Symbol]int{},
+		closedOvers:        map[vm.Symbol]*closureCell{},
+		debug:              false,
+		dataReaderResolver: rootDataReaderResolver,
 	}
 }
 
@@ -96,12 +130,59 @@ func (c *Context) ChildForEval() *Context {
 	child := NewTransientCompiler(c.consts, c.CurrentNS())
 	child.debug = c.debug
 	child.source = c.source
+	child.taggedReaders = c.taggedReaders
+	child.dataReaderResolver = c.dataReaderResolver
+	child.execContext = c.execContext
+	return child
+}
+
+// ChildForLoad returns a fresh top-level context for compiling a required
+// namespace. Required namespaces share the parent's long-lived constant pool
+// and reader/execution configuration, but start with independent compiler
+// state and the supplied scratch namespace.
+func (c *Context) ChildForLoad(ns *vm.Namespace) *Context {
+	child := NewCompiler(c.consts, ns)
+	child.debug = c.debug
+	child.taggedReaders = c.taggedReaders
+	child.dataReaderResolver = c.dataReaderResolver
+	child.execContext = c.execContext
 	return child
 }
 
 func (c *Context) SetSource(source string) *Context {
 	c.source = source
 	return c
+}
+
+// SetTaggedReaders installs explicit Go tagged readers for subsequent Compile
+// and CompileMultiple calls. The registry is shared with child eval contexts.
+func (c *Context) SetTaggedReaders(registry *TaggedReaderRegistry) *Context {
+	c.taggedReaders = registry
+	return c
+}
+
+func (c *Context) setDataReaderResolver(resolver taggedDataReaderResolver) *Context {
+	c.dataReaderResolver = resolver
+	return c
+}
+
+func (c *Context) setExecContext(ec *vm.ExecContext) *Context {
+	c.execContext = ec
+	return c
+}
+
+func (c *Context) evaluationExecContext() *vm.ExecContext {
+	ec := c.execContext
+	if ec == nil {
+		ec = vm.RootExecContext
+	}
+	return execContextWithTaggedReaders(ec, c.taggedReaders)
+}
+
+// EvaluationExecContext returns the execution context configured for compiled
+// code, including the context-local tagged-reader registry binding.
+func (c *Context) EvaluationExecContext() *vm.ExecContext {
+	return c.evaluationExecContext()
 }
 
 func (c *Context) Consts() *vm.Consts {
@@ -119,7 +200,7 @@ func (c *Context) SetCurrentNS(ns *vm.Namespace) {
 func (c *Context) Compile(s string) (chunk *vm.CodeChunk, err error) {
 	defer vm.RecoverPanic(&err)
 	vm.SourceRegistry.Register(c.source, s)
-	r := NewLispReader(strings.NewReader(s), c.source)
+	r := newLispReaderWithResolvers(strings.NewReader(s), c.source, c.taggedReaders, c.dataReaderResolver)
 	o, err := r.Read()
 	if err != nil {
 		return nil, err
@@ -137,6 +218,25 @@ func (c *Context) Compile(s string) (chunk *vm.CodeChunk, err error) {
 }
 
 func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, result vm.Value, err error) {
+	return c.compileMultiple(reader, nil)
+}
+
+// CompileMultipleForEntryFrame compiles a program bundle whose native entry
+// frame will invoke namespace/name after replay. Only top-level calls to that
+// selected entry are omitted from the emitted chunk; every other top-level
+// form, including runtime initialization in required namespaces, remains.
+// Ordinary CompileMultiple and its bytecode bundles retain their usual entry
+// invocation semantics.
+func (c *Context) CompileMultipleForEntryFrame(reader io.Reader, namespace, name string) (compiled *vm.CodeChunk, result vm.Value, err error) {
+	return c.compileMultiple(reader, &entryFrameCall{namespace: namespace, name: name})
+}
+
+type entryFrameCall struct {
+	namespace string
+	name      string
+}
+
+func (c *Context) compileMultiple(reader io.Reader, entry *entryFrameCall) (compiled *vm.CodeChunk, result vm.Value, err error) {
 	defer vm.RecoverPanic(&err)
 	// Buffer source for error display
 	srcBytes, err := io.ReadAll(reader)
@@ -145,8 +245,9 @@ func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, res
 	}
 	src := string(srcBytes)
 	vm.SourceRegistry.Register(c.source, src)
-	r := NewLispReader(strings.NewReader(src), c.source)
+	r := newLispReaderWithResolvers(strings.NewReader(src), c.source, c.taggedReaders, c.dataReaderResolver)
 	chunk := vm.NewCodeChunk(c.consts)
+	ec := c.evaluationExecContext()
 	result = vm.NIL
 	compiledForms := 0
 	var evalTopForm func(o vm.Value) error
@@ -166,6 +267,9 @@ func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, res
 				}
 				return nil
 			}
+		}
+		if entry != nil && c.CurrentNS().Name() == entry.namespace {
+			o, _ = omitTopLevelEntryCall(o, *entry)
 		}
 		if compiledForms > 0 {
 			chunk.Append(vm.OP_POP)
@@ -187,6 +291,7 @@ func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, res
 		} else {
 			f = vm.NewFrame(formchunk, nil)
 		}
+		f.SetExecContext(ec)
 		result, err = f.RunProtected()
 		vm.ReleaseFrame(f)
 		if err != nil {
@@ -195,17 +300,40 @@ func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, res
 		compiledForms++
 		return nil
 	}
+	sawVoid := false
 	for {
-		o, err := r.Read()
-		if err != nil {
+		// EOF while skipping whitespace is the clean end of input. Read wraps
+		// an EOF inside an unfinished form in a syntax error that also
+		// satisfies isErrorEOF, so only this check may end the loop.
+		if _, err := r.eatWhitespace(); err != nil {
 			if isErrorEOF(err) {
 				break
 			}
 			return nil, result, err
 		}
+		if err := r.unread(); err != nil {
+			return nil, result, err
+		}
+		o, err := r.Read()
+		if err != nil {
+			return nil, result, err
+		}
+		// Comments, #_ discards, and empty reader conditionals read as the
+		// VOID sentinel. Compiling them would emit a dead LOAD_CONST/POP pair
+		// per occurrence (and let a trailing comment clobber the last value),
+		// so skip them here like every other read loop does.
+		if o.Type() == vm.VoidType {
+			sawVoid = true
+			continue
+		}
 		if err := evalTopForm(o); err != nil {
 			return nil, result, err
 		}
+	}
+	// Input that held only no-value forms still evaluates to VOID (not nil),
+	// so the REPL keeps echoing nothing for a comment-only line.
+	if compiledForms == 0 && sawVoid {
+		result = vm.VOID
 	}
 
 	c.chunk = chunk
@@ -213,6 +341,55 @@ func (c *Context) CompileMultiple(reader io.Reader) (compiled *vm.CodeChunk, res
 	c.emit(vm.OP_RETURN)
 	c.decSP(1)
 	return c.chunk, result, nil
+}
+
+// omitTopLevelEntryCall removes only a call to the selected entry from a
+// top-level expression. The documented guard and sequential do forms are
+// traversed, while fn bodies, quotes, and other nested expressions are left
+// untouched. Replacing a call with nil preserves sibling side effects and the
+// surrounding form's result shape.
+func omitTopLevelEntryCall(form vm.Value, entry entryFrameCall) (vm.Value, bool) {
+	lst, ok := form.(*vm.List)
+	if !ok || lst.RawCount() == 0 {
+		return form, false
+	}
+	head, ok := lst.First().(vm.Symbol)
+	if !ok {
+		return form, false
+	}
+	name := string(head)
+	if name == entry.name || name == entry.namespace+"/"+entry.name {
+		return vm.NIL, true
+	}
+	var start int
+	switch name {
+	case "do", "clojure.core/do":
+		start = 1
+	case "when-not", "clojure.core/when-not":
+		parts := lst.Unbox().([]vm.Value)
+		if len(parts) < 3 || !isCompilingAOTGuard(parts[1]) {
+			return form, false
+		}
+		start = 2
+	default:
+		return form, false
+	}
+	parts := lst.Unbox().([]vm.Value)
+	changed := false
+	for i := start; i < len(parts); i++ {
+		var omitted bool
+		parts[i], omitted = omitTopLevelEntryCall(parts[i], entry)
+		changed = changed || omitted
+	}
+	if !changed {
+		return form, false
+	}
+	return vm.NewList(parts).(*vm.List).WithMeta(lst.Meta()), true
+}
+
+func isCompilingAOTGuard(form vm.Value) bool {
+	sym, ok := form.(vm.Symbol)
+	return ok && (sym == "*compiling-aot*" || sym == "clojure.core/*compiling-aot*")
 }
 
 func (c *Context) emit(op int32) {
@@ -244,6 +421,7 @@ func (c *Context) enterFn(args []vm.Value) (*Context, error) {
 		consts:         c.consts,
 		chunk:          fchunk,
 		formalArgs:     make(map[vm.Symbol]int),
+		knownArgs:      make(map[vm.Symbol]bool),
 		locals:         []map[vm.Symbol]int{},
 		closedOvers:    make(map[vm.Symbol]*closureCell),
 		closedOversSeq: []vm.Symbol{},
@@ -252,15 +430,11 @@ func (c *Context) enterFn(args []vm.Value) (*Context, error) {
 	}
 
 	for i := range args {
-		a := args[i]
 		// Strip metadata wrappers from arg symbols: `[^String s]` is read as
-		// `[(with-meta s {:tag String})]`. We don't yet attach meta to locals,
-		// just drop it so the symbol check below succeeds.
-		if lst, ok := a.(*vm.List); ok && lst.First() == vm.Symbol("with-meta") {
-			if rest := lst.Next(); rest != nil {
-				a = rest.First()
-			}
-		}
+		// `[(with-meta s {:tag String})]`. We don't yet attach meta to locals;
+		// a :tag only marks the arg as a known host target for the reflection
+		// warning, and dispatch stays dynamic.
+		a, tagged := stripBindingMeta(args[i])
 		s, ok := a.(vm.Symbol)
 		if !ok {
 			return nil, NewCompileError("all fn formal arguments must be symbols")
@@ -285,6 +459,7 @@ func (c *Context) enterFn(args []vm.Value) (*Context, error) {
 		// including `_`s, for arity checks.
 		fc.argCount++
 		fc.formalArgs[s] = i
+		fc.knownArgs[s] = tagged
 	}
 	return fc, nil
 }
@@ -374,9 +549,36 @@ func compileErrorAt(msg string, form vm.Value) *CompileError {
 	return NewCompileErrorWithSource(msg, info)
 }
 
-func hostTargetStaticallyKnown(target vm.Value) bool {
+// stripBindingMeta unwraps a `(with-meta sym meta)` binding form, as the reader
+// produces for `^Tag sym`, and reports whether the metadata carried a :tag.
+func stripBindingMeta(form vm.Value) (vm.Value, bool) {
+	lst, ok := form.(*vm.List)
+	if !ok || lst.First() != vm.Symbol("with-meta") {
+		return form, false
+	}
+	rest := lst.Next()
+	if rest == nil {
+		return form, false
+	}
+	tagged := false
+	if metaForm := rest.Next(); metaForm != nil {
+		if meta, ok := metaForm.First().(vm.Lookup); ok {
+			tagged = meta.ValueAt(vm.Keyword("tag")) != vm.NIL
+		}
+	}
+	return rest.First(), tagged
+}
+
+// hostTargetStaticallyKnown reports whether the target of a host member call
+// has a type the compiler can name: a literal, a constructor or ->Record call,
+// a with-meta form, or a local whose nearest declaration is known (a :tag hint,
+// or a let/loop init that is itself known).
+func (c *Context) hostTargetStaticallyKnown(target vm.Value) bool {
+	if sym, ok := target.(vm.Symbol); ok {
+		return c.lexicalKnown(sym)
+	}
 	if target.Type() != vm.ListType {
-		return target.Type() != vm.SymbolType
+		return true
 	}
 	seq, ok := target.(vm.Seq)
 	if !ok || seq == nil {
@@ -387,7 +589,9 @@ func hostTargetStaticallyKnown(target vm.Value) bool {
 		return false
 	}
 	name := string(head)
-	return name == "with-meta" || strings.HasPrefix(name, "->") || strings.HasSuffix(name, ".")
+	// `->` and `->>` are the threading macros, not ->Record constructors.
+	isRecordCtor := strings.HasPrefix(name, "->") && name != "->" && name != "->>"
+	return name == "with-meta" || isRecordCtor || strings.HasSuffix(name, ".")
 }
 
 // compileError creates a CompileError with source info from the current form context.
@@ -402,6 +606,24 @@ func (c *Context) compileError(msg string) *CompileError {
 	return NewCompileError(msg)
 }
 
+// maxFormSeqLen bounds how many elements compileForm realizes from a non-list
+// seq. Lazy sequences have no cheap finiteness test, so this is the backstop
+// for the ones isUnboundedSeq cannot recognize, such as a cycle.
+const maxFormSeqLen = 1 << 20
+
+// isUnboundedSeq reports whether o is a seq known to never end: iterate, a
+// zero-argument range, or a one-argument repeat. Realizing one of these in
+// compileForm would never return.
+func isUnboundedSeq(o vm.Value) bool {
+	switch v := o.(type) {
+	case *vm.Iterate, *vm.InfiniteRange:
+		return true
+	case *vm.Repeat:
+		return v.RawCount() < 0
+	}
+	return false
+}
+
 func (c *Context) compileForm(o vm.Value) error {
 	// Track current form for error reporting
 	prevForm := c.currentForm
@@ -413,7 +635,7 @@ func (c *Context) compileForm(o vm.Value) error {
 		c.chunk.AddSourceInfo(*info)
 	}
 	switch o.Type() {
-	case vm.IntType, vm.FloatType, vm.StringType, vm.NilType, vm.BooleanType, vm.KeywordType, vm.CharType, vm.VoidType, vm.FuncType, vm.NativeFnType, vm.BigIntType, vm.RatioType, vm.BigDecimalType, vm.UUIDType, vm.InstantType, vm.RegexType:
+	case vm.IntType, vm.FloatType, vm.StringType, vm.NilType, vm.BooleanType, vm.KeywordType, vm.CharType, vm.VoidType, vm.FuncType, vm.NativeFnType, vm.BigIntType, vm.RatioType, vm.BigDecimalType, vm.UUIDType, vm.InstantType, vm.RegexType, vm.TypeType:
 		n := c.constant(o)
 		c.emitWithArg(vm.OP_LOAD_CONST, n)
 		c.incSP(1)
@@ -466,92 +688,133 @@ func (c *Context) compileForm(o vm.Value) error {
 		varn := c.constant(v)
 		c.emitWithArg(vm.OP_LOAD_VAR, varn)
 		c.incSP(1)
-	case vm.ArrayVectorType:
+	case vm.ArrayVectorType, vm.PersistentVectorType:
 		tp := c.tailPosition
 		c.tailPosition = false
-		v, ok := o.(vm.ArrayVector)
+		elems, ok := orderedLiteralElems(o)
 		if !ok {
-			if me, ok := o.(vm.MapEntry); ok {
-				v = vm.ArrayVector{me.Key, me.Value}
-			} else {
-				return c.compileError("expected vector form")
-			}
+			return c.compileError("expected vector form")
 		}
-		// Optimization: const vectors could be pushed as constants
-		//if len(v) == 0 {
-		//	n := c.constant(v)
-		//	c.emitWithArg(vm.OP_LOAD_CONST, n)
-		//	c.incSP(1)
-		//	return nil
-		//}
-		vector := c.constant(rt.CoreNS.Lookup("vector"))
-		c.emitWithArg(vm.OP_LOAD_CONST, vector)
-		c.incSP(1)
-		for i := range v {
-			err := c.compileForm(v[i])
-			if err != nil {
-				return NewCompileError("compiling vector elements").Wrap(err)
-			}
+		if isConstantLiteral(o) {
+			// The vector is the constant: one value for every evaluation, as
+			// Clojure compiles it. Copied to exact length so a reader-built
+			// backing array with spare capacity is never shared.
+			c.loadConstant(vm.NewArrayVector(elems))
+			c.tailPosition = tp
+			return nil
 		}
-		c.emitWithArg(vm.OP_INVOKE, len(v))
-		c.decSP(len(v))
+		err := c.compileAggregateWithMeta(o, func() error {
+			vector := c.constant(rt.CoreNS.Lookup("vector"))
+			c.emitWithArg(vm.OP_LOAD_CONST, vector)
+			c.incSP(1)
+			n := len(elems)
+			for _, e := range elems {
+				if err := c.compileForm(e); err != nil {
+					return NewCompileError("compiling vector elements").Wrap(err)
+				}
+			}
+			c.emitWithArg(vm.OP_INVOKE, n)
+			c.decSP(n)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 		c.tailPosition = tp
-	case vm.MapType:
+	case vm.MapType, vm.SortedMapType:
 		tp := c.tailPosition
 		c.tailPosition = false
+		if isConstantLiteral(o) {
+			// The reader built it with array-map, so it is the value the call
+			// would build, in the same order: pool it instead.
+			c.loadConstant(o)
+			c.tailPosition = tp
+			return nil
+		}
 
-		arrayMap := c.constant(rt.CoreNS.Lookup("array-map"))
-		c.emitWithArg(vm.OP_LOAD_CONST, arrayMap)
-		c.incSP(1)
+		ctor := "array-map"
+		if sm, ok := o.(*vm.SortedMap); ok {
+			if !sm.UsesDefaultComparator() {
+				return c.compileError("can't compile a sorted map with a custom comparator as a form: no literal can carry the comparator")
+			}
+			ctor = "sorted-map"
+		}
+		err := c.compileAggregateWithMeta(o, func() error {
+			mapCtor := c.constant(rt.CoreNS.Lookup(vm.Symbol(ctor)))
+			c.emitWithArg(vm.OP_LOAD_CONST, mapCtor)
+			c.incSP(1)
 
-		// Get entries via Seq for both Map and PersistentMap
-		var count int
-		if sq, ok := o.(vm.Sequable); ok {
-			s := sq.Seq()
-			var entries []vm.Value
-			for s != nil && s != vm.EmptyList {
-				k, v, ok := vm.MapEntryKV(s.First())
-				if !ok {
+			// Get entries via Seq for both Map and PersistentMap
+			var count int
+			if sq, ok := o.(vm.Sequable); ok {
+				s := sq.Seq()
+				var entries []vm.Value
+				for s != nil && s != vm.EmptyList {
+					k, v, ok := vm.MapEntryKV(s.First())
+					if !ok {
+						s = s.Next()
+						continue
+					}
+					entries = append(entries, k, v)
 					s = s.Next()
-					continue
 				}
-				entries = append(entries, k, v)
-				s = s.Next()
-			}
-			count = len(entries) / 2
-			for _, e := range entries {
-				err := c.compileForm(e)
-				if err != nil {
-					return NewCompileError("compiling map entry").Wrap(err)
+				count = len(entries) / 2
+				for _, e := range entries {
+					err := c.compileForm(e)
+					if err != nil {
+						return NewCompileError("compiling map entry").Wrap(err)
+					}
 				}
 			}
-		}
 
-		c.emitWithArg(vm.OP_INVOKE, count*2)
-		c.decSP(count * 2)
+			c.emitWithArg(vm.OP_INVOKE, count*2)
+			c.decSP(count * 2)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 		c.tailPosition = tp
-	case vm.SetType:
+	case vm.SetType, vm.SortedSetType:
 		tp := c.tailPosition
 		c.tailPosition = false
-
-		hashSet := c.constant(rt.CoreNS.Lookup("hash-set"))
-		c.emitWithArg(vm.OP_LOAD_CONST, hashSet)
-		c.incSP(1)
-
-		count := 0
-		if sq, ok := o.(vm.Sequable); ok {
-			for s := sq.Seq(); s != nil && s != vm.EmptyList; s = s.Next() {
-				if err := c.compileForm(s.First()); err != nil {
-					return NewCompileError("compiling set element").Wrap(err)
-				}
-				count++
-			}
+		if isConstantLiteral(o) {
+			c.loadConstant(o)
+			c.tailPosition = tp
+			return nil
 		}
 
-		c.emitWithArg(vm.OP_INVOKE, count)
-		c.decSP(count)
+		ctor := "hash-set"
+		if ss, ok := o.(*vm.SortedSet); ok {
+			if !ss.UsesDefaultComparator() {
+				return c.compileError("can't compile a sorted set with a custom comparator as a form: no literal can carry the comparator")
+			}
+			ctor = "sorted-set"
+		}
+		err := c.compileAggregateWithMeta(o, func() error {
+			setCtor := c.constant(rt.CoreNS.Lookup(vm.Symbol(ctor)))
+			c.emitWithArg(vm.OP_LOAD_CONST, setCtor)
+			c.incSP(1)
+
+			count := 0
+			if sq, ok := o.(vm.Sequable); ok {
+				for s := sq.Seq(); s != nil && s != vm.EmptyList; s = s.Next() {
+					if err := c.compileForm(s.First()); err != nil {
+						return NewCompileError("compiling set element").Wrap(err)
+					}
+					count++
+				}
+			}
+
+			c.emitWithArg(vm.OP_INVOKE, count)
+			c.decSP(count)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 		c.tailPosition = tp
-	case vm.ListType:
+	case vm.ListType, vm.SequenceType, vm.RangeType, vm.RepeatType, vm.IterateType:
 		prevList := c.currentList
 		c.currentList = o
 		defer func() { c.currentList = prevList }()
@@ -563,8 +826,14 @@ func (c *Context) compileForm(o vm.Value) error {
 		lst, isList := o.(*vm.List)
 		if !isList {
 			if seq, ok := o.(vm.Seq); ok {
+				if isUnboundedSeq(o) {
+					return c.compileError("can't compile an unbounded sequence as a form")
+				}
 				var vals []vm.Value
 				for s := seq; s != nil; s = s.Next() {
+					if len(vals) >= maxFormSeqLen {
+						return c.compileError(fmt.Sprintf("can't compile a sequence of more than %d elements as a form; is it unbounded?", maxFormSeqLen))
+					}
 					vals = append(vals, s.First())
 				}
 				realized, _ := vm.ListType.Box(vals)
@@ -631,9 +900,45 @@ func (c *Context) compileForm(o vm.Value) error {
 			}
 
 			if fnsym == "." {
+				// Clojure has two canonical source shapes for the raw dot form,
+				// and both arrive with the member unquoted:
+				//
+				//	(. obj member args...)     bare symbol
+				//	(. obj (member args...))   list
+				//
+				// let-go's internal shape quotes the member -- (. obj 'member
+				// args...) -- which is what the (.member obj ...) rewrite above
+				// produces. Normalize the source shapes into it so an unquoted
+				// member is never compiled as an expression. An already-quoted
+				// member is left alone, since that is what the rewrite hands us.
+				if normalized := normalizeDotForm(lst); normalized != nil {
+					if info := vm.FormSource.Get(o); info != nil {
+						vm.FormSource.Set(normalized, *info)
+					}
+					return c.compileForm(normalized)
+				}
 				args := lst.Next()
-				if args != nil && !hostTargetStaticallyKnown(args.First()) {
+				if args != nil && !c.hostTargetStaticallyKnown(args.First()) {
 					rt.EmitReflectionWarningForForm(o, "host-interop", "host target type is not statically known; using dynamic member dispatch")
+				}
+			}
+
+			// *unchecked-math*: rewrite checked arithmetic to its wrapping
+			// counterpart before the call is compiled. Sits after macro-shaped
+			// rewrites above and before macro expansion below, so it only ever
+			// sees a plain function call.
+			if uncheckedMathEnabled() {
+				if base := c.resolveCoreArith(fnsym); base != "" {
+					var args []vm.Value
+					for sq := lst.Next(); sq != nil; sq = sq.Next() {
+						args = append(args, sq.First())
+					}
+					if rewritten := c.rewriteUncheckedArith(base, args); rewritten != nil {
+						if info := vm.FormSource.Get(o); info != nil {
+							vm.FormSource.Set(rewritten, *info)
+						}
+						return c.compileForm(rewritten)
+					}
 				}
 			}
 
@@ -655,7 +960,7 @@ func (c *Context) compileForm(o vm.Value) error {
 						}
 					}
 				}
-				newform, err := fvar.(*vm.Var).Deref().(vm.Fn).Invoke(argvec)
+				newform, err := invokeMacro(fvar.(*vm.Var), o, argvec)
 				if err != nil {
 					return NewCompileError(fmt.Sprintf("Executing macro %s (%s) failed", fvar, fvar.(*vm.Var).Deref())).Wrap(err)
 				}
@@ -673,7 +978,7 @@ func (c *Context) compileForm(o vm.Value) error {
 		argc := 0
 		if args != nil {
 			if coll, ok := args.(vm.Collection); ok {
-				argc = coll.Count().Unbox().(int)
+				argc = int(coll.Count().(vm.Int))
 			} else {
 				for s := args; s != nil; s = s.Next() {
 					argc++
@@ -692,10 +997,9 @@ func (c *Context) compileForm(o vm.Value) error {
 					}
 				}
 				c.emit(fastOp)
-				if argc == 2 {
-					c.decSP(1) // binary: 2 args -> 1 result
-				}
-				// unary (inc/dec): 1 arg -> 1 result, no SP change
+				// argc args -> 1 result: no SP change for unary inc/dec, one
+				// slot for a binary op, two for aset.
+				c.decSP(argc - 1)
 				c.tailPosition = tp
 				return nil
 			}
@@ -722,30 +1026,208 @@ func (c *Context) compileForm(o vm.Value) error {
 		c.decSP(argc)
 
 		c.tailPosition = tp
+	default:
+		// Fail closed. Without this arm an unlisted type compiled to nothing
+		// and returned nil, and the caller's missing stack slot surfaced much
+		// later as "index out of range [-1]". Forms also arrive from macros,
+		// eval and tagged readers, so the set of types is open.
+		return c.compileError(fmt.Sprintf("cannot compile a value of type %s as a form: %s", o.Type().Name(), o.String()))
 	}
 	return nil
 }
 
-// tryFastOpcode returns a specialized opcode for known core builtins,
-// or 0 if no fast path is available. Only emits for binary (arity 2)
-// and unary (arity 1) cases with known symbols.
-func (c *Context) tryFastOpcode(sym vm.Symbol, argc int) int32 {
-	// Only optimize unqualified symbols that resolve to core vars
-	if sym.Namespace() != vm.NIL {
-		return 0
+// coreArithNames are the checked arithmetic ops that *unchecked-math* redirects
+// to their wrapping counterparts, mirroring Clojure's inliner pairs.
+var coreArithNames = []vm.Symbol{"+", "-", "*", "inc", "dec"}
+
+// uncheckedArithFor maps a checked arithmetic op to the qualified unchecked var
+// it is rewritten to. Qualified so a local named `unchecked-add` cannot capture
+// the rewrite.
+var uncheckedArithFor = map[vm.Symbol]vm.Symbol{
+	"+":   "clojure.core/unchecked-add",
+	"-":   "clojure.core/unchecked-subtract",
+	"*":   "clojure.core/unchecked-multiply",
+	"inc": "clojure.core/unchecked-inc",
+	"dec": "clojure.core/unchecked-dec",
+}
+
+// uncheckedMathEnabled reports whether *unchecked-math* is truthy right now.
+// Read live rather than cached: it is dynamic, and CompileMultiple evaluates
+// each top-level form before compiling the next, so a top-level set! must be
+// visible to every later form.
+func uncheckedMathEnabled() bool {
+	v := rt.NS(rt.NameCoreNS).Lookup(vm.Symbol("*unchecked-math*"))
+	if v == vm.NIL {
+		return false
 	}
-	// Check that the symbol resolves to a core var (not a local binding)
-	if c.symbolLookup(sym) != nil {
-		return 0 // local binding shadows the core var
+	vr, ok := v.(*vm.Var)
+	if !ok {
+		return false
+	}
+	return vm.IsTruthy(vr.Deref())
+}
+
+// resolveCoreArith returns which core arithmetic op sym resolves to, or "" if
+// none. Both `+` and `clojure.core/+` qualify, because Clojure attaches
+// unchecked behaviour to the var rather than to the spelling. A lexical
+// binding shadows the core var and yields "".
+func (c *Context) resolveCoreArith(sym vm.Symbol) vm.Symbol {
+	if c.resolvesAsLexical(sym) || c.symbolLookup(sym) != nil {
+		return ""
 	}
 	v := c.CurrentNS().Lookup(sym)
 	if v == vm.NIL {
+		return ""
+	}
+	core := rt.NS(rt.NameCoreNS)
+	for _, name := range coreArithNames {
+		if cv := core.Lookup(name); cv != vm.NIL && cv == v {
+			return name
+		}
+	}
+	return ""
+}
+
+// rewriteUncheckedArith rewrites a checked arithmetic call into its wrapping
+// equivalent under *unchecked-math*, or returns nil to leave the form alone.
+//
+// The unchecked-* primitives are strict 2-ary (1-ary for negate/inc/dec) while
+// + and * are variadic with identity elements, so the arities must be handled
+// separately rather than substituted blindly:
+//
+//	(+) (*) (+ x) (* x)  -> left alone; identity, nothing to wrap
+//	(- x)                -> (unchecked-negate x)
+//	(+ a b)              -> (unchecked-add a b)
+//	(+ a b c)            -> (unchecked-add (unchecked-add a b) c)
+func (c *Context) rewriteUncheckedArith(base vm.Symbol, args []vm.Value) vm.Value {
+	call2 := func(fn vm.Symbol, a, b vm.Value) vm.Value {
+		return vm.EmptyList.Cons(b).Cons(a).Cons(fn)
+	}
+	call1 := func(fn vm.Symbol, a vm.Value) vm.Value {
+		return vm.EmptyList.Cons(a).Cons(fn)
+	}
+
+	switch base {
+	case "inc", "dec":
+		if len(args) != 1 {
+			return nil
+		}
+		return call1(uncheckedArithFor[base], args[0])
+	case "-":
+		if len(args) == 0 {
+			return nil
+		}
+		if len(args) == 1 {
+			return call1(vm.Symbol("clojure.core/unchecked-negate"), args[0])
+		}
+	case "+", "*":
+		if len(args) < 2 {
+			return nil
+		}
+	default:
+		return nil
+	}
+
+	// Left-nest: ((a op b) op c) op d ...
+	acc := call2(uncheckedArithFor[base], args[0], args[1])
+	for _, a := range args[2:] {
+		acc = call2(uncheckedArithFor[base], acc, a)
+	}
+	return acc
+}
+
+// quotedSymbol reports whether v is already (quote sym) -- the shape the
+// (.member obj ...) rewrite produces, which normalizeDotForm must not touch.
+func quotedSymbol(v vm.Value) bool {
+	lst, ok := v.(*vm.List)
+	if !ok || lst.Next() == nil {
+		return false
+	}
+	head, ok := lst.First().(vm.Symbol)
+	if !ok || head != "quote" {
+		return false
+	}
+	_, ok = lst.Next().First().(vm.Symbol)
+	return ok
+}
+
+// normalizeDotForm rewrites Clojure's two canonical raw dot shapes into
+// let-go's internal (. obj 'member args...), or returns nil when the form is
+// already in that shape, or is too short or too odd to be one.
+//
+//	(. obj member args...)   -> (. obj 'member args...)
+//	(. obj (member args...)) -> (. obj 'member args...)
+func normalizeDotForm(lst *vm.List) vm.Value {
+	rest := lst.Next()
+	if rest == nil {
+		return nil
+	}
+	instance := rest.First()
+	memberSeq := rest.Next()
+	if memberSeq == nil {
+		return nil
+	}
+	member := memberSeq.First()
+	if quotedSymbol(member) {
+		return nil // already normalized
+	}
+
+	var name vm.Symbol
+	var args []vm.Value
+	switch m := member.(type) {
+	case vm.Symbol:
+		name = m
+		for sq := memberSeq.Next(); sq != nil; sq = sq.Next() {
+			args = append(args, sq.First())
+		}
+	case *vm.List:
+		head, ok := m.First().(vm.Symbol)
+		if !ok {
+			return nil
+		}
+		name = head
+		for sq := m.Next(); sq != nil; sq = sq.Next() {
+			args = append(args, sq.First())
+		}
+	default:
+		return nil
+	}
+
+	quoted := vm.EmptyList.Cons(name).(*vm.List).Cons(vm.Symbol("quote")).(*vm.List)
+	out := vm.EmptyList
+	for i := len(args) - 1; i >= 0; i-- {
+		out = out.Cons(args[i]).(*vm.List)
+	}
+	return out.Cons(quoted).(*vm.List).Cons(instance).(*vm.List).Cons(vm.Symbol("."))
+}
+
+// tryFastOpcode returns a specialized opcode for known core builtins,
+// or 0 if no fast path is available. Only emits for fixed arities with
+// known symbols: unary inc/dec, the binary ops, and 3-arg aset.
+func (c *Context) tryFastOpcode(head vm.Symbol, argc int) int32 {
+	sym := c.fastOpcodeCoreName(head)
+	if sym == "" {
 		return 0
+	}
+	// Under *unchecked-math* the arithmetic ops are rewritten to their
+	// wrapping counterparts before this point. Emitting OP_ADD here would
+	// re-introduce the overflow check and silently defeat that rewrite.
+	if uncheckedMathEnabled() {
+		switch sym {
+		case "+", "-", "*", "inc", "dec":
+			return 0
+		}
 	}
 
 	switch argc {
+	case 3:
+		if sym == "aset" {
+			return vm.OP_ASET
+		}
 	case 2:
 		switch sym {
+		case "aget":
+			return vm.OP_AGET
 		case "+":
 			return vm.OP_ADD
 		case "-":
@@ -766,6 +1248,12 @@ func (c *Context) tryFastOpcode(sym vm.Symbol, argc int) int32 {
 			return vm.OP_BIT_SHIFT_RIGHT
 		case "unsigned-bit-shift-right":
 			return vm.OP_UNSIGNED_BIT_SHIFT_RIGHT
+		case "unchecked-add":
+			return vm.OP_UNCHECKED_ADD
+		case "unchecked-subtract":
+			return vm.OP_UNCHECKED_SUB
+		case "unchecked-multiply":
+			return vm.OP_UNCHECKED_MUL
 		case "<":
 			return vm.OP_LT
 		case "<=":
@@ -790,6 +1278,46 @@ func (c *Context) tryFastOpcode(sym vm.Symbol, argc int) int32 {
 	return 0
 }
 
+// fastOpcodeCoreName returns the clojure.core name a call head stands for
+// when the head resolves to that core var itself, or "" when it does not.
+//
+// A fast opcode binds the core semantics at compile time, so it may only
+// replace a head that really is the core var: not a local that shadows it,
+// and not a same-named var the current namespace defines or refers from
+// elsewhere. The identity check against the core ns covers both, where a
+// bare "does it resolve" test used to accept any var of that name.
+//
+// A head qualified to the core ns is what syntax-quote produces, so every
+// macro-emitted `+` or `<` arrives this way (#1045). It cannot be lexically
+// shadowed, and it resolves the same way the qualified-symbol path in
+// compileForm does, aliases included, so it only needs the identity check.
+func (c *Context) fastOpcodeCoreName(head vm.Symbol) vm.Symbol {
+	core := rt.NS(rt.NameCoreNS)
+	if core == nil {
+		return ""
+	}
+	sns, inner := head.Namespaced()
+	name := head
+	if sns != vm.NIL {
+		name = inner.(vm.Symbol)
+	} else if c.symbolLookup(head) != nil {
+		return "" // a local binding shadows the core var
+	}
+	coreVar := core.Lookup(name)
+	if coreVar == vm.NIL {
+		return ""
+	}
+	resolved := c.CurrentNS().Lookup(head)
+	if resolved == vm.NIL && sns != vm.NIL && string(sns.(vm.Symbol)) == rt.NameCoreNS {
+		// Same fallback compileForm applies to core/* before refers exist.
+		resolved = coreVar
+	}
+	if resolved != coreVar {
+		return ""
+	}
+	return name
+}
+
 func (c *Context) emitWithArgPlaceholder(inst int32) int {
 	placeholder := c.currentAddress()
 	c.emitWithArg(inst, 0)
@@ -806,16 +1334,21 @@ func (c *Context) updatePlaceholderArg(placeholder int, arg int) {
 
 func (c *Context) pushLocals() {
 	c.locals = append(c.locals, map[vm.Symbol]int{})
+	c.knownLocals = append(c.knownLocals, map[vm.Symbol]bool{})
 	c.localSlotCounts = append(c.localSlotCounts, 0)
 }
 
 func (c *Context) popLocals() {
 	c.locals = c.locals[0 : len(c.locals)-1]
+	c.knownLocals = c.knownLocals[0 : len(c.knownLocals)-1]
 	c.localSlotCounts = c.localSlotCounts[0 : len(c.localSlotCounts)-1]
 }
 
 func (c *Context) addLocal(name vm.Symbol) {
 	c.locals[len(c.locals)-1][name] = c.sp - 1
+	// A new binding is unknown until the caller says otherwise, which also
+	// clears a known flag left by an earlier binding of the same name.
+	delete(c.knownLocals[len(c.knownLocals)-1], name)
 	// Record the source name for this slot as debug info (slot -> name), so it
 	// survives into the bundle and can name locals in crash traces.
 	if name != "_" {
@@ -873,6 +1406,25 @@ func (c *Context) resolvesAsLexical(symbol vm.Symbol) bool {
 		}
 		if ctx.arg(symbol) >= 0 {
 			return true
+		}
+	}
+	return false
+}
+
+// lexicalKnown reports whether symbol's nearest lexical declaration is a
+// statically known host target. It walks scopes as resolvesAsLexical does and
+// stops at the first context that declares symbol, so an unhinted inner
+// binding masks a hinted outer one. A closed-over symbol is answered by the
+// enclosing context that declares it.
+func (c *Context) lexicalKnown(symbol vm.Symbol) bool {
+	for ctx := c; ctx != nil; ctx = ctx.parent {
+		for i := len(ctx.locals) - 1; i >= 0; i-- {
+			if _, ok := ctx.locals[i][symbol]; ok {
+				return ctx.knownLocals[i][symbol]
+			}
+		}
+		if _, ok := ctx.formalArgs[symbol]; ok {
+			return ctx.knownArgs[symbol]
 		}
 	}
 	return false
@@ -1037,23 +1589,23 @@ func tryCompiler(c *Context, form vm.Value) error {
 		bodyForms = append(bodyForms, f)
 	}
 
-	if len(catchClauses) == 1 && catchClauses[0].class == "" {
-		// let-go's native bare catch compiles directly as the handler.
-		catchSym = catchClauses[0].binding
-		catchForms = catchClauses[0].body
-	} else if len(catchClauses) > 0 {
-		// Desugar typed and/or multiple clauses into a single handler that
-		// dispatches on exception class in source order and rethrows when
-		// nothing matches (the IR builder's parse-try generates the same
-		// form — keep them in lockstep):
+	if len(catchClauses) > 0 {
+		// Desugar typed and/or multiple clauses (bare included) into a single
+		// handler that dispatches on exception class in source order and
+		// rethrows when nothing matches (the IR builder's parse-try generates
+		// the same form — keep them in lockstep):
 		//
 		//   (catch <caught>
 		//     (if (core/instance? Class1 <caught>) (let* [b1 <caught>] body1...)
 		//       ... (core/throw <caught>)))
 		//
 		// core/-qualified so a user shadowing instance? or throw cannot
-		// capture the dispatch. A bare clause tests as always-true, making
-		// any later clauses dead, like Clojure's ordered catch clauses.
+		// capture the dispatch. A bare clause is dispatched as Throwable —
+		// catch-everything, but (per catch-matches?) never the scope-
+		// cancellation condition — making any later clauses dead, like
+		// Clojure's ordered catch clauses. There is deliberately no fast
+		// path for a lone bare clause: routing it through catch-matches? is
+		// what keeps (catch e ...) from swallowing cancellation.
 		caught := freshCaughtSym()
 		acc, err := makeList(vm.Symbol("core/throw"), caught)
 		if err != nil {
@@ -1066,14 +1618,15 @@ func tryCompiler(c *Context, form vm.Value) error {
 			if err != nil {
 				return NewCompileError("building catch dispatch").Wrap(err)
 			}
-			if cl.class == "" {
-				acc = arm
-				continue
+			class := cl.class
+			if class == "" {
+				class = "Throwable"
 			}
 			// catch-matches? resolves the class at dispatch time (a JVM-only
 			// class let-go does not model never matches, rather than failing
-			// compilation) and gives Throwable its catch-everything role.
-			test, err := makeList(vm.Symbol("core/catch-matches?"), mustQuote(cl.class), caught)
+			// compilation) and gives Throwable its catch-everything role
+			// EXCEPT the scope-cancellation condition.
+			test, err := makeList(vm.Symbol("core/catch-matches?"), mustQuote(class), caught)
 			if err != nil {
 				return NewCompileError("building catch dispatch").Wrap(err)
 			}
@@ -1243,7 +1796,7 @@ func recurCompiler(c *Context, form vm.Value) error {
 	argc := 0
 	if args != nil {
 		if coll, ok := args.(vm.Collection); ok {
-			argc = coll.Count().Unbox().(int)
+			argc = int(coll.Count().(vm.Int))
 		} else {
 			for s := args; s != nil; s = s.Next() {
 				argc++
@@ -1312,16 +1865,12 @@ func parseBindingsVector(val vm.Value) ([]vm.Value, error) {
 func compileBindings(c *Context, binds []vm.Value, opName string) (int, error) {
 	bindn := 0
 	for i := 0; i < len(binds); i += 2 {
-		name := binds[i]
 		// Strip a metadata wrapper from the binding name: `^long x` is read as
 		// `(with-meta x {:tag long})`. As with fn params, we don't yet attach
-		// the tag to the local (a future hook for the IR typeinfer pass), just
-		// unwrap to the bare symbol so the check below succeeds.
-		if lst, ok := name.(*vm.List); ok && lst.First() == vm.Symbol("with-meta") {
-			if rest := lst.Next(); rest != nil {
-				name = rest.First()
-			}
-		}
+		// the tag to the local (a future hook for the IR typeinfer pass); the
+		// tag only marks the local as a known host target for the reflection
+		// warning.
+		name, tagged := stripBindingMeta(binds[i])
 		if name.Type() != vm.SymbolType {
 			return 0, c.compileError(fmt.Sprintf("%s binding name must be a symbol: %v", opName, name))
 		}
@@ -1329,11 +1878,19 @@ func compileBindings(c *Context, binds []vm.Value, opName string) (int, error) {
 			return 0, NewCompileError(fmt.Sprintf("%s bindings must have even number of forms", opName))
 		}
 		value := binds[i+1]
+		// Decided before addLocal so the init sees the enclosing bindings,
+		// not the name it is about to bind. Only let infers from the init: a
+		// loop local can be rebound to anything by recur, so only its hint
+		// counts.
+		known := tagged || (opName == "let" && c.hostTargetStaticallyKnown(value))
 		err := c.compileForm(value)
 		if err != nil {
 			return 0, NewCompileError(fmt.Sprintf("compiling %s binding", opName)).Wrap(err)
 		}
 		c.addLocal(name.(vm.Symbol))
+		if known {
+			c.knownLocals[len(c.knownLocals)-1][name.(vm.Symbol)] = true
+		}
 		bindn++
 	}
 	return bindn, nil
@@ -1481,13 +2038,151 @@ func fnFormCompiler(c *Context, sourceForm vm.Value, args vm.ArrayVector, bodyf 
 	return nil
 }
 
+// loadConstant pools v and emits the load of it.
+func (c *Context) loadConstant(v vm.Value) {
+	n := c.constant(v)
+	c.emitWithArg(vm.OP_LOAD_CONST, n)
+	c.incSP(1)
+}
+
+// isConstantLiteral reports whether a collection literal is a constant: every
+// element is self-evaluating data (or such a collection, recursively) and the
+// literal carries no metadata. Clojure compiles such a literal to one shared
+// value; a symbol, a list (a call) or metadata makes it an expression that
+// builds a fresh collection each time. The metadata rule follows Clojure,
+// where ^{:t 1} [1 2] is not shared either.
+func isConstantLiteral(o vm.Value) bool {
+	switch o.Type() {
+	case vm.IntType, vm.FloatType, vm.StringType, vm.NilType, vm.BooleanType, vm.KeywordType, vm.CharType,
+		vm.BigIntType, vm.RatioType, vm.BigDecimalType, vm.UUIDType, vm.InstantType, vm.RegexType:
+		return true
+	case vm.ArrayVectorType, vm.PersistentVectorType, vm.MapType, vm.SetType:
+		if im, ok := o.(vm.IMeta); ok {
+			if m := im.Meta(); m != nil && m != vm.NIL {
+				return false
+			}
+		}
+		if elems, ok := orderedLiteralElems(o); ok {
+			for _, e := range elems {
+				if !isConstantLiteral(e) {
+					return false
+				}
+			}
+			return true
+		}
+		sq, ok := o.(vm.Sequable)
+		if !ok {
+			return false
+		}
+		for s := sq.Seq(); s != nil && s != vm.EmptyList; s = s.Next() {
+			e := s.First()
+			if k, v, isEntry := vm.MapEntryKV(e); isEntry {
+				if !isConstantLiteral(k) || !isConstantLiteral(v) {
+					return false
+				}
+				continue
+			}
+			if !isConstantLiteral(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// compileAggregateWithMeta runs emit, which must leave one value on the
+// stack, and wraps it in a with-meta call when o carries reader metadata, so a
+// data-read `^:flag [1 2]` evaluates to a vector carrying it, as the code
+// reader's (with-meta ...) form does. lower_go.lg's boxed-with-meta is the AOT
+// counterpart.
+func (c *Context) compileAggregateWithMeta(o vm.Value, emit func() error) error {
+	im, ok := o.(vm.IMeta)
+	if !ok {
+		return emit()
+	}
+	m := im.Meta()
+	if m == vm.NIL || m == nil {
+		return emit()
+	}
+	withMeta := c.constant(rt.CoreNS.Lookup("with-meta"))
+	c.emitWithArg(vm.OP_LOAD_CONST, withMeta)
+	c.incSP(1)
+	if err := emit(); err != nil {
+		return err
+	}
+	// The metadata map is a form too: `^{:a (+ 1 1)} [1]` carries {:a 2}.
+	if err := c.compileForm(quoteTagHint(m)); err != nil {
+		return NewCompileError("compiling collection metadata").Wrap(err)
+	}
+	c.emitWithArg(vm.OP_INVOKE, 2)
+	c.decSP(2)
+	return nil
+}
+
+// quoteTagHint keeps a bare type hint a symbol when data-read metadata is
+// compiled as a form. The data reader stores `^long [1]` as {:tag long}, the
+// symbol itself; readMeta's code path quotes it for the same reason.
+func quoteTagHint(m vm.Value) vm.Value {
+	pm, ok := m.(*vm.PersistentMap)
+	if !ok {
+		return m
+	}
+	tagKey := vm.Keyword("tag")
+	sym, ok := pm.ValueAt(tagKey).(vm.Symbol)
+	if !ok {
+		return m
+	}
+	return pm.Assoc(tagKey, vm.NewList([]vm.Value{vm.Symbol("quote"), sym})).(vm.Value)
+}
+
+// orderedLiteralElems returns the elements of an ordered, non-seq collection
+// form. It is the one place that decides which representations count: both
+// vector types, matching vector?, and MapEntry, which is a vector in Clojure
+// too. pkg/vm has no ordered marker to ask instead (Indexed and Sequable also
+// cover strings, ranges and maps), so this is a type switch for now.
+func orderedLiteralElems(form vm.Value) ([]vm.Value, bool) {
+	switch v := form.(type) {
+	case vm.ArrayVector:
+		return []vm.Value(v), true
+	case vm.PersistentVector:
+		elems := make([]vm.Value, 0, v.RawCount())
+		for s := v.Seq(); s != nil && s != vm.EmptyList; s = s.Next() {
+			elems = append(elems, s.First())
+		}
+		return elems, true
+	case vm.MapEntry:
+		return []vm.Value{v.Key, v.Value}, true
+	default:
+		return nil, false
+	}
+}
+
+// paramVector accepts a fn params vector in either vector representation. The
+// code reader produces vm.ArrayVector; the data reader (read-string) promotes a
+// vector that carries metadata, such as the arity `^long [^long n]`, to
+// vm.PersistentVector — and data read back in must still compile, as it does in
+// Clojure. Unlike compileForm's vector-literal arm, a params vector must not
+// accept a bare vm.MapEntry — a fn signature that happens to be a map entry
+// makes no sense — so binding forms stay stricter than literals here.
+func paramVector(v vm.Value) (vm.ArrayVector, bool) {
+	if _, isEntry := v.(vm.MapEntry); isEntry {
+		return nil, false
+	}
+	elems, ok := orderedLiteralElems(v)
+	if !ok {
+		return nil, false
+	}
+	return vm.ArrayVector(elems), true
+}
+
 func fnCompiler(c *Context, form vm.Value) error {
 	f := form.(*vm.List).Next()
 	if f == nil {
 		return NewCompileError("unexpected fn form")
 	}
 
-	if args, ok := f.First().(vm.ArrayVector); ok {
+	if args, ok := paramVector(f.First()); ok {
 		// we have (fn* [args] body)
 		body := f.Next()
 		if body == nil {
@@ -1499,7 +2194,10 @@ func fnCompiler(c *Context, form vm.Value) error {
 		i := 0
 		for b := f; b != nil; b = b.Next() {
 			e := b.First().(vm.Seq)
-			args := e.First().(vm.ArrayVector)
+			args, ok := paramVector(e.First())
+			if !ok {
+				return NewCompileError("unexpected fn form")
+			}
 			ebody := e.Next()
 			if ebody == nil {
 				ebody = vm.EmptyList
@@ -1857,17 +2555,20 @@ func assocMeta(meta vm.Value, key vm.Value, val vm.Value) vm.Value {
 	return vm.NewPersistentMap([]vm.Value{key, val})
 }
 
-func metaValueAt(meta vm.Value, key vm.Value) vm.Value {
-	if meta == nil || meta == vm.NIL {
-		return vm.NIL
+func compactDefMeta(meta vm.Value) (vm.DefMetaPairs, bool) {
+	persistent, ok := meta.(*vm.PersistentMap)
+	if !ok {
+		return nil, false
 	}
-	if m, ok := meta.(*vm.PersistentMap); ok {
-		return m.ValueAt(key)
+	pairs := make(vm.DefMetaPairs, 0, persistent.RawCount()*2)
+	for seq := persistent.Seq(); seq != nil && seq != vm.EmptyList; seq = seq.Next() {
+		key, value, ok := vm.MapEntryKV(seq.First())
+		if !ok {
+			return nil, false
+		}
+		pairs = append(pairs, key, value)
 	}
-	if m, ok := meta.(vm.Map); ok {
-		return m.ValueAt(key)
-	}
-	return vm.NIL
+	return pairs, true
 }
 
 func defCompiler(c *Context, form vm.Value) error {
@@ -1909,20 +2610,57 @@ func defCompiler(c *Context, form vm.Value) error {
 	if doc != vm.NIL {
 		meta = assocMeta(meta, vm.Keyword("doc"), doc)
 	}
+	// :file/:line/:column, mirroring Clojure's def-time metadata — sourced
+	// from the ORIGINAL (pre-expansion) form, since macroexpansion propagates
+	// FormSource onto the expanded form it compiles from (see
+	// expandMacro/lang.go's macroexpand-1 native). A raw `(def x v)` typed
+	// directly carries its own FormSource the same way. Forms without a
+	// recorded source (e.g. synthesized by other macros) simply add no info.
+	if info := vm.FormSource.Get(form); info != nil {
+		meta = assocMeta(meta, vm.Keyword("line"), vm.MakeInt(info.Line+1))
+		meta = assocMeta(meta, vm.Keyword("column"), vm.MakeInt(info.Column+1))
+		meta = assocMeta(meta, vm.Keyword("file"), vm.String(info.File))
+	}
+	// :name, as Clojure's def attaches it (spec 4.4). A vm.Symbol constant
+	// serializes fine into an AOT bundle (see pkg/bytecode/encoder.go), so it
+	// is baked here like :file/:line/:column. :ns is NOT added here: it would
+	// need a *vm.Namespace bundle constant, which the encoder has no case
+	// for, so it is attached at runtime instead — see rt.ApplyVarMeta, which
+	// derives it from the Var's own NSRef() and therefore covers both the
+	// immediate apply below and the bytecode-replayed apply-def-meta! call
+	// (fresh process decoding a .lgb bundle).
+	meta = assocMeta(meta, vm.Keyword("name"), sym)
 	c.defName = sym.String()
 	varr := c.CurrentNS().LookupOrAdd(sym.(vm.Symbol))
 	if meta != vm.NIL {
-		v := varr.(*vm.Var)
-		v.SetMeta(meta)
-		if vm.IsTruthy(metaValueAt(meta, vm.Keyword("dynamic"))) {
-			v.SetDynamic()
-		}
-		if vm.IsTruthy(metaValueAt(meta, vm.Keyword("private"))) {
-			v.SetPrivate()
-		}
+		// Apply immediately: source-loaded/eval'd code compiles and runs this
+		// chunk in the same process on the same Var object, so this alone is
+		// enough there. It is NOT enough for an AOT bundle (lgbgen compiles
+		// core.lg in one process; the shipped binary decodes the resulting
+		// .lgb in another, against a brand-new stub Var — see DefStub) — the
+		// OP_INVOKE of apply-def-meta! emitted below reproduces this call
+		// when the chunk's bytecode actually runs there, mirroring how
+		// set-macro! already survives the same round-trip for :macro.
+		rt.ApplyVarMeta(varr.(*vm.Var), meta)
 	}
 	c.emitWithArg(vm.OP_LOAD_CONST, c.constant(varr))
 	c.incSP(1)
+	if meta != vm.NIL {
+		c.emitWithArg(vm.OP_LOAD_CONST, c.constant(rt.CoreNS.Lookup("apply-def-meta!")))
+		c.incSP(1)
+		c.emitWithArg(vm.OP_LOAD_CONST, c.constant(varr))
+		c.incSP(1)
+		metaConstant := meta
+		if compact, ok := compactDefMeta(meta); ok {
+			metaConstant = compact
+		}
+		c.emitWithArg(vm.OP_LOAD_CONST, c.constant(metaConstant))
+		c.incSP(1)
+		c.emitWithArg(vm.OP_INVOKE, 2)
+		c.decSP(2)
+		c.emit(vm.OP_POP)
+		c.decSP(1)
+	}
 	if l == 1 {
 		// No-init form (def x): intern the var but leave its root binding
 		// UNAFFECTED, matching Clojure ("If init is not supplied, the root
@@ -1934,6 +2672,13 @@ func defCompiler(c *Context, form vm.Value) error {
 		c.defName = ""
 		return nil
 	}
+	rewritten, irErr := c.maybeIRCompileDefFnArg(sym.(vm.Symbol), val)
+	if irErr != nil {
+		return compileErrorAt("ir-compile-strict def value", form).Wrap(irErr)
+	}
+	if rewritten != nil {
+		val = rewritten
+	}
 	err := c.compileForm(val)
 	if err != nil {
 		return compileErrorAt("compiling def value", form).Wrap(err)
@@ -1943,6 +2688,132 @@ func defCompiler(c *Context, form vm.Value) error {
 	c.tailPosition = tc
 	c.defName = ""
 	return nil
+}
+
+// maybeIRCompileDefFnArg is the runtime seam for name*-wrapped fn defs:
+// when *ir-compile* is on and a TOP-LEVEL
+// `(def NAME (name* ... (fn [args] ...) ...))` is being compiled, route the
+// anonymous inner fn form through the Lisp IR pipeline
+// (ir.passes.pipeline/compile-def-fn-value) and substitute the compiled Fn
+// value as an embedded constant — the same def-value shape the defn macro
+// produces via chunk->fn. The defn macro can't cover these: `def` is a
+// special form, so grammar-style rule defs never reach the macro layer and
+// their bodies otherwise always compile via the plain bytecode compiler.
+// Returns the rewritten value form, or nil to compile the original. A
+// matched-but-unlowerable form falls back silently to bytecode unless
+// *ir-compile-strict* (#580) is on, in which case it returns an error so the
+// bytecode-path census can see the miss — mirroring the defn macro's hybrid
+// path (core.lg).
+func (c *Context) maybeIRCompileDefFnArg(name vm.Symbol, val vm.Value) (vm.Value, error) {
+	// Top-level defs only: an inner fn compiled through the pipeline cannot
+	// capture enclosing locals.
+	if len(c.locals) != 0 {
+		return nil, nil
+	}
+	icv, ok := c.CurrentNS().Lookup(vm.Symbol("clojure.core/*ir-compile*")).(*vm.Var)
+	if !ok || !vm.IsTruthy(icv.Deref()) {
+		return nil, nil
+	}
+	// Under *ir-compile-strict* (#580) a matched-but-unlowerable form must NOT
+	// fall back to bytecode silently — that is exactly the class of hole the
+	// bytecode-path census exists to surface. The "not a name*-fn-def" checks
+	// below stay silent (the seam simply doesn't apply); only a shape that
+	// SHOULD lower but can't becomes an error when strict is on.
+	strict := false
+	if scv, ok := c.CurrentNS().Lookup(vm.Symbol("clojure.core/*ir-compile-strict*")).(*vm.Var); ok {
+		strict = vm.IsTruthy(scv.Deref())
+	}
+	lst, ok := val.(*vm.List)
+	if !ok {
+		return nil, nil
+	}
+	headSym, ok := lst.First().(vm.Symbol)
+	if !ok {
+		return nil, nil
+	}
+	_, headName, hasNS := headSym.NamespacedRaw()
+	if !hasNS {
+		headName = headSym
+	}
+	if headName != vm.Symbol("name*") {
+		return nil, nil
+	}
+	elems, ok := lst.Unbox().([]vm.Value)
+	if !ok {
+		return nil, nil
+	}
+	fnIdx := -1
+	for i := 1; i < len(elems); i++ {
+		el, isList := elems[i].(*vm.List)
+		if !isList {
+			continue
+		}
+		h, isSym := el.First().(vm.Symbol)
+		if !isSym || (h != "fn" && h != "fn*") {
+			continue
+		}
+		if fnIdx != -1 {
+			return nil, nil // more than one fn argument: ambiguous, leave alone
+		}
+		fnIdx = i
+	}
+	if fnIdx == -1 {
+		return nil, nil
+	}
+	// Named fn forms have a lexical self-binding: `(fn self [...] (self ...))`.
+	// The defn-shaped IR helper cannot preserve that binding (renaming it to the
+	// outer def would turn lexical recursion into mutable Var lookup), so named
+	// forms are deliberately outside this seam and stay on the ordinary compiler
+	// even under strict mode.
+	fnForm := elems[fnIdx].(*vm.List)
+	if fnTail := fnForm.Next(); fnTail != nil {
+		if _, named := fnTail.First().(vm.Symbol); named {
+			return nil, nil
+		}
+	}
+	// From here the form IS a name*-wrapped single-fn def that should lower;
+	// a failure is a real IR-compile miss, so honor strict.
+	hv, ok := c.CurrentNS().Lookup(vm.Symbol("ir.passes.pipeline/compile-def-fn-value")).(*vm.Var)
+	if !ok {
+		if strict {
+			return nil, fmt.Errorf("ir-compile-strict: ir.passes.pipeline/compile-def-fn-value unavailable for (def %v (name* …))", name)
+		}
+		return nil, nil
+	}
+	hfn, ok := hv.Deref().(vm.Fn)
+	if !ok {
+		if strict {
+			return nil, fmt.Errorf("ir-compile-strict: compile-def-fn-value is not callable")
+		}
+		return nil, nil
+	}
+	compiled, err := hfn.Invoke([]vm.Value{elems[fnIdx], c.CurrentNS(), name})
+	if err != nil {
+		if strict {
+			return nil, fmt.Errorf("ir-compile-strict: IR compile of (def %v (name* (fn …))) failed: %w", name, err)
+		}
+		return nil, nil
+	}
+	if compiled == vm.NIL {
+		if strict {
+			return nil, fmt.Errorf("ir-compile-strict: IR compile of (def %v (name* (fn …))) produced nil", name)
+		}
+		return nil, nil
+	}
+	newElems := make([]vm.Value, len(elems))
+	copy(newElems, elems)
+	newElems[fnIdx] = compiled
+	rewritten, berr := vm.ListType.Box(newElems)
+	if berr != nil {
+		if strict {
+			return nil, fmt.Errorf("ir-compile-strict: reboxing (def %v …) failed: %w", name, berr)
+		}
+		return nil, nil
+	}
+	if info := vm.FormSource.Get(val); info != nil {
+		vm.FormSource.Set(rewritten, *info)
+	}
+	return rewritten, nil
 }
 
 func setBangCompiler(c *Context, form vm.Value) error {
@@ -1973,8 +2844,9 @@ func setBangCompiler(c *Context, form vm.Value) error {
 
 func varCompiler(c *Context, form vm.Value) error {
 	sym := form.(*vm.List).Next().First().(vm.Symbol)
-	// Try compile-time resolution only
-	v := c.CurrentNS().Lookup(sym)
+	// Try compile-time resolution only. The var form ignores privacy —
+	// #'other-ns/private resolves; only bare symbol references enforce it.
+	v := c.CurrentNS().LookupIncludingPrivate(sym)
 	if v == vm.NIL {
 		return c.compileError(fmt.Sprintf("Can't resolve %s in this context", sym))
 	}

@@ -24,18 +24,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       # Use the official action: it installs a cached, prebuilt golangci-lint
       # binary from GitHub Releases instead of `go install`-ing it through
       # proxy.golang.org, which intermittently drops the HTTP/2 stream
       # mid-download and fails the job (INTERNAL_ERROR received from peer).
+      # No `version:` on purpose -- with it unset the action reads the version
+      # from the go.mod `tool` directive, so go.mod is the only place
+      # golangci-lint is pinned. Setting it here would silently win over go.mod.
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
           args: --timeout=5m
+      # `run` drops formatter findings in paths the linters exclude, test files
+      # included; `fmt --diff` checks every file the formatters cover. Uses the
+      # binary the action just installed.
+      - name: Check Go formatting
+        run: golangci-lint fmt --diff
 
   # Enforce the "no test files at the repo root" guard. The pre-commit hook of
   # the same name is the local equivalent, but jj does not run git hooks, so CI
@@ -56,7 +63,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -100,10 +107,28 @@ jobs:
       # compiles the whole stdlib twice concurrently and is the slow one:
       # ~60-120s on CI, ~200s on a contended local machine. It runs here under a
       # generous ceiling instead of inflating every package's budget.
-      - name: Expensive lowering e2e (determinism, deftype skeleton)
+      # TestLginteropXxh3RoundTrip joins them: it is -short-gated too (it builds
+      # lg), so it matched no lane and went unrun — long enough to go red on main
+      # unnoticed. It regenerates interop_xxh3.go and byte-compares, which is what
+      # now enforces the //go:build !tinygo constraint since the hand-tag guard
+      # (TestInteropXxh3KeepsTinygoBuildTag) was retired.
+      # TestCustomMain is -short-gated for the same reason (it builds three
+      # custom lg binaries and runs -w through each); without a place in this
+      # list it would never run in CI at all. TestLgbRoundtrip's examples
+      # corpus is -short-gated on the same terms.
+      - name: Expensive lowering e2e (determinism, deftype skeleton, lginterop round-trip, custom main, lgb round-trip)
         # No -short here so the testing.Short()-gated heavyweight e2e tests run
         # full; the fast `make test` loop passes -short to skip them.
-        run: go test -v -timeout 600s ./test/e2e/ -run 'TestLoweringDeterminism|TestDeftypeSkeletonNativeLowering'
+        run: go test -v -timeout 600s ./test/e2e/ -run 'TestLoweringDeterminism|TestDeftypeSkeletonNativeLowering|TestLginteropXxh3RoundTrip|TestCustomMain|TestLgbRoundtrip|TestBundleUsesLinkedLoweredCode'
+
+      # Standalone native-entry matrix (#425 / #628): lg-compile --entry-frame,
+      # embed program.lgb, go build, run. Also covers --entry-frame opt-in and
+      # the same pipeline driven by `lg compile` (#596), and builds inside a
+      # caller-supplied module with -module / -w-module / -import (#998); that
+      # test runs the wasm build under the runner's node.
+      # Skipped under -short; fib remains an example under examples/aot/native-entry/.
+      - name: AOT native-entry matrix (#425 / #628)
+        run: go test -v -timeout 300s ./test/e2e/ -run 'TestLgCompileEntryFrameOptIn|TestNativeEntryMatrix|TestLgCompileCommand|TestCallerModule|TestEntryFrameRequireSearchesOnlyLGSourcePaths'
 
   # Race-detector pass over the packages that hold cross-goroutine state:
   # the VM's shared runtime structures and the rt layer. Motivated by #464 —
@@ -118,7 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Race-detector tests (pkg/vm, pkg/rt)
@@ -139,11 +164,123 @@ jobs:
         with:
           submodules: recursive
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Build for GOOS=wasip1
         run: GOOS=wasip1 GOARCH=wasm go build -v -o /tmp/lg-wasip1.wasm .
+
+  # Keeps the lg_no_http lane from rotting. Nothing in the default build
+  # exercises pkg/rt/http_stub.go, so without this a change to http.go's
+  # signatures breaks the tagged build silently.
+  # Default-build dependency gate. The optional heavy subsystems (glplat's GL
+  # and Ebitengine backends, and the font stack they use) are meant to be
+  # reachable only behind a build tag. A single untagged file in their import
+  # closure puts the whole closure in every binary we ship, and nothing else
+  # here would notice: the build still succeeds and the tests still pass.
+  # Measured on the glplat branch, an untagged pkg/rt/interop_glplat.go cost
+  # the default binary +718,208 bytes (+3.60%) and hit ./cmd/lg-runtime too,
+  # which is the binary #658 spent effort shrinking. Same lane as #652/#658.
+  default-deps:
+    name: default-deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Assert untagged builds link no tag-gated subsystems
+        run: make check-default-deps
+
+  no-http-build:
+    name: no-http-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build runtime-only without net/http
+        run: go build -tags lg_no_http -o /tmp/lg-ro-nohttp ./cmd/lg-runtime
+      - name: Boot it
+        run: /tmp/lg-ro-nohttp -v
+      - name: Assert net/http did not link
+        run: |
+          if go tool nm /tmp/lg-ro-nohttp | grep -qE 'net/http|crypto/tls'; then
+            echo "net/http linked into an lg_no_http build" >&2
+            exit 1
+          fi
+      # Same guard for lg_no_json, which drops the json and transit
+      # namespaces so encoding/json's reflection codec is not linked.
+      - name: Build runtime-only without encoding/json
+        run: go build -tags lg_no_json -o /tmp/lg-ro-nojson ./cmd/lg-runtime
+      - name: Boot it
+        run: /tmp/lg-ro-nojson -v
+      - name: Assert encoding/json did not link
+        run: |
+          if go tool nm /tmp/lg-ro-nojson | grep -q 'encoding/json'; then
+            echo "encoding/json linked into an lg_no_json build" >&2
+            exit 1
+          fi
+
+  # Cross-build-and-run guard for the TinyGo WASI target. TinyGo does not
+  # implement reflect.Type.Method / reflect.Value.Call, so let-go's boxing path
+  # is build-tagged (boxed_reflect_tinygo.go, native_func_tinygo.go) to hand-shim
+  # what it needs. That regression is a RUNTIME trap at namespace-install time,
+  # not a build error — so unlike wasip1-build this job must execute the module,
+  # not just link it. `-v` runs the full core boot (LoadCore -> installLangNS,
+  # which exercises the reflect shim) and exits 0, so it's a complete smoke test.
+  tinygo-wasi-build:
+    name: tinygo-wasi-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # Pin TinyGo so a new release cannot turn this gate red on its own;
+      # bump deliberately and let this job verify the WASI build and core boot.
+      - name: Install TinyGo
+        run: |
+          wget -q https://github.com/tinygo-org/tinygo/releases/download/v0.42.0/tinygo_0.42.0_amd64.deb
+          sudo dpkg -i tinygo_0.42.0_amd64.deb
+      # Fetch directly: install.sh can exit 0 after a failed download, masking
+      # transient CDN errors until the later PATH check (#682).
+      - name: Install wasmtime
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://github.com/bytecodealliance/wasmtime/releases/download/v47.0.3/wasmtime-v47.0.3-x86_64-linux.tar.xz \
+            -o "$RUNNER_TEMP/wasmtime.tar.xz"
+          tar -xJf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP"
+          mkdir -p "$HOME/.wasmtime/bin"
+          install -m755 "$RUNNER_TEMP/wasmtime-v47.0.3-x86_64-linux/wasmtime" "$HOME/.wasmtime/bin/wasmtime"
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Verify wasmtime is on PATH
+        run: wasmtime --version
+      - name: Build runtime-only for TinyGo WASI
+        run: tinygo build -target=wasi -o /tmp/lg-ro-tinygo.wasm ./cmd/lg-runtime
+      - name: Boot past the reflect shim (must not trap)
+        run: wasmtime run /tmp/lg-ro-tinygo.wasm -v
+      # Boxed Go methods resolve under TinyGo only through the hand-written table
+      # in pkg/vm/boxed_reflect_tinygo.go. Core's inst-ms calls (.UnixMilli inst)
+      # on the time.Time that now returns, so read the clock both ways.
+      - name: Read the clock under TinyGo (time.Time method shims)
+        run: |
+          mkdir -p /tmp/tinygo-clock
+          printf '%s\n' '(println (pos? (inst-ms (now))) (int? (.Sub (now) (now))))' > /tmp/tinygo-clock/clock.lg
+          go run . -c /tmp/tinygo-clock/clock.lgb /tmp/tinygo-clock/clock.lg
+          out=$(wasmtime run --dir=/tmp/tinygo-clock /tmp/lg-ro-tinygo.wasm /tmp/tinygo-clock/clock.lgb)
+          echo "$out"
+          [ "$(printf '%s\n' "$out" | tail -n 1)" = "true true" ]
 
   # Differential gold check against a LIVE Clojure. The everyday `build` job is
   # clojure-free (it compares let-go to the committed test/gold/*.out goldens);
@@ -161,7 +298,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -214,10 +351,14 @@ jobs:
           echo "${{ steps.clj.outputs.version }}" > .gold-clojure-version
           echo "Goldens verified against Clojure ${{ steps.clj.outputs.version }}."
 
-  # Differential self-AOT execution gate: builds let-go twice (bytecode +
-  # -tags gogen_ir native) and diffs the output of every test/gold-aot/*.lg
-  # fixture across the two engines. A new cross-engine divergence fails the PR;
-  # known divergences are tracked in the shrink-only test/gogen_aot_xfail.txt.
+  # Engine parity gate + differential engine-output check: after `make lowered`
+  # builds the gitignored core_go_lowered/ tree, the job first runs the
+  # complete-corpus engine parity gate (strict capability and
+  # output census over every test/gold-aot/*.lg fixture, enforcing the committed
+  # case ledger test/parity-ledger.txt plus the shrink-only partial and
+  # divergence baselines), then runs TestGogenAOTDiff, which builds let-go twice
+  # (bytecode + -tags gogen_ir native) and diffs fixture output across the two
+  # engines. A new case, status change, or cross-engine divergence fails the PR.
   gogen-diff:
     name: gogen-diff
     runs-on: ubuntu-latest
@@ -226,11 +367,21 @@ jobs:
         with:
           submodules: recursive
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: make gogen-diff
-        run: make gogen-diff
+      - name: Generate the lowered tree
+        run: make lowered
+      # The jank harness imports core_go_lowered/test, so it needs the lowered
+      # tree in this checkout before it can build its generated Go test module.
+      - name: Jank direct-ABI generated Go gate
+        run: make test SHORT=false PKG=./test/e2e RUN=TestJankSuiteDirectABIGeneratedGo COUNT=1
+      - name: Engine parity and differential engine gate
+        run: make test SHORT=false PKG=./test/e2e RUN='TestEngineParityGate|TestGogenAOTDiff|TestGogenLazyCoreNamespaceStaysLowered'
+      # pkg/ir's own tests against the native passes: dispatch wireup and pass
+      # behaviour that only differs once the lowered overrides are installed.
+      - name: pkg/ir tests under -tags gogen_ir
+        run: go test -tags gogen_ir -count=1 ./pkg/ir
 
   # Single gate for every generated artifact (Policy: docs/contribution-policy.md §3):
   # the bundle is verified in lockstep with pkg/rt/core/**/*.lg (content-based, so
@@ -243,7 +394,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: make check-generated

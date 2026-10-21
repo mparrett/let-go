@@ -7,11 +7,21 @@
 package rt
 
 import (
+	"fmt"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
+
+// regPrimDebug, when LG_REGPRIM_DEBUG is set, logs every generated-primitive
+// registration (name, requested ns, resolved canonical ns, whether it landed
+// in the canonical ns). It is the per-primitive trace used to root-cause a
+// batch of newly hoisted //lg:native primitives without bisecting the whole
+// set: grep the run for `landed-canonical=false`.
+var regPrimDebug = os.Getenv("LG_REGPRIM_DEBUG") != ""
 
 // Generated-primitive binding lifecycle.
 //
@@ -35,7 +45,55 @@ var (
 // emitted for native-module callees consult this before taking the baked
 // direct call; on false they fall back to the var-dispatch trampoline so the
 // override is observed across lowered function boundaries.
-func NativePrimsIntact() bool { return vm.GuardedRootsIntact() }
+//
+// Lowered code calls this per guarded site, which in a numeric loop is per
+// element, so the intact path must inline: it is one atomic load, and the
+// deviated path lives in its own function to keep this one under the
+// inliner's budget (`go build -gcflags=-m=2 ./pkg/rt | grep NativePrimsIntact`).
+func NativePrimsIntact() bool {
+	if vm.GuardedRootsIntact() {
+		return true
+	}
+	return nativePrimsDeviated()
+}
+
+// nativePrimsDeviated is the cold half of NativePrimsIntact: a root deviated.
+// Under LG_GUARD_DEBUG, name the offending native primitive(s), the
+// diagnostic that pinpoints which hoisted primitive is being shadowed instead
+// of a bare intact=false.
+func nativePrimsDeviated() bool {
+	if guardDebug {
+		fmt.Fprintf(os.Stderr, "[GUARD] deviated: %v\n", deviatedGuardedVars())
+	}
+	return false
+}
+
+var guardDebug = os.Getenv("LG_GUARD_DEBUG") != ""
+
+// deviatedGuardedVars lists every interned var whose guarded root has deviated
+// from its canonical native root, "<ns>/<name>". Diagnostic only.
+func deviatedGuardedVars() []string {
+	nsMu.RLock()
+	names := make([]string, 0, len(nsRegistry))
+	for k := range nsRegistry {
+		names = append(names, k)
+	}
+	nsMu.RUnlock()
+	var dev []string
+	for _, nsName := range names {
+		ns := LookupNS(nsName)
+		if ns == nil {
+			continue
+		}
+		for sym, v := range ns.AllVars() {
+			if v.GuardDeviated() {
+				dev = append(dev, nsName+"/"+string(sym))
+			}
+		}
+	}
+	sort.Strings(dev)
+	return dev
+}
 
 // guardModuleVars marks the CURRENT root of every var a native module
 // direct-calls (corefns seq/first/…, builtins vector/cons/…) as canonical,
@@ -78,6 +136,7 @@ func setPrimitiveRoot(ns *vm.Namespace, name string, v vm.Value) *vm.Var {
 // the binding so it can be reapplied after the namespace's source loads.
 // Called only from the generated RegisterGeneratedPrimitives.
 func defGeneratedPrimitive(ns *vm.Namespace, nsName, name string, v vm.Value) {
+	recordShadowedHandRegistration(ns, nsName, name)
 	// GuardRoot marks the adapter as the var's canonical root: lowered
 	// direct-call sites stay on the native fast path only while the root is
 	// untouched (vm.GuardedRootsIntact), so with-redefs/alter-var-root in a
@@ -85,6 +144,14 @@ func defGeneratedPrimitive(ns *vm.Namespace, nsName, name string, v vm.Value) {
 	// boundaries.
 	setPrimitiveRoot(ns, name, v).GuardRoot()
 	canonical := resolveNSAlias(nsName)
+	if regPrimDebug {
+		landed := false
+		if cns := LookupNS(canonical); cns != nil {
+			landed = cns.LookupLocal(vm.Symbol(name)) != nil
+		}
+		fmt.Fprintf(os.Stderr, "[REGPRIM] %s/%s requested-ns=%s canonical=%s landed-canonical=%v\n",
+			nsName, name, nsName, canonical, landed)
+	}
 	genPrimMu.Lock()
 	m := genPrimBindings[canonical]
 	if m == nil {
@@ -93,6 +160,128 @@ func defGeneratedPrimitive(ns *vm.Namespace, nsName, name string, v vm.Value) {
 	}
 	m[name] = v
 	genPrimMu.Unlock()
+}
+
+// Shadowed hand registrations.
+//
+// installLangNS Defs its closures first; the generated registrar drains last
+// and takes the var root, so a name registered in BOTH places runs the
+// generated //lg:native body and the hand-written closure is silently
+// discarded. That is invisible when the two bodies agree and a regression when
+// they don't: `reduce` had accumulated ArrayVector/Range fast paths only in the
+// closure, so the day the generated registration started resolving (the ns
+// alias fix in #639) reduce got 1.75x slower with every test still green.
+// Recorded at initial registration so a test can ratchet the set.
+var (
+	shadowedMu       sync.Mutex
+	shadowedHandRegs = map[string]bool{} // "<requested-ns>/<name>"
+)
+
+// recordShadowedHandRegistration notes that a generated primitive is about to
+// take a var some other registration already interned. It runs from
+// defGeneratedPrimitive BEFORE the binding lands in genPrimBindings, so a name
+// already present there was interned by a PREVIOUS generated registration, not
+// by hand. Without that check any re-registration (a second registrar pass, a
+// test binding the same ns/name twice in one process) records its own
+// predecessor as a hand shadow, making the set invocation-count dependent.
+func recordShadowedHandRegistration(ns *vm.Namespace, nsName, name string) {
+	if ns == nil || ns.LookupLocal(vm.Symbol(name)) == nil {
+		return
+	}
+	genPrimMu.RLock()
+	_, alreadyGenerated := genPrimBindings[resolveNSAlias(nsName)][name]
+	genPrimMu.RUnlock()
+	if alreadyGenerated {
+		return
+	}
+	shadowedMu.Lock()
+	shadowedHandRegs[nsName+"/"+name] = true
+	shadowedMu.Unlock()
+}
+
+// ShadowedHandRegistrations lists "<ns>/<name>" for every generated primitive
+// that landed on top of an existing hand-written registration. Diagnostic:
+// each entry is a duplicate implementation where only the generated one runs.
+func ShadowedHandRegistrations() []string {
+	shadowedMu.Lock()
+	out := make([]string, 0, len(shadowedHandRegs))
+	for k := range shadowedHandRegs {
+		out = append(out, k)
+	}
+	shadowedMu.Unlock()
+	sort.Strings(out)
+	return out
+}
+
+// BindGeneratedPrimitive is the exported binding entry point for own-mode
+// registrars generated into OTHER packages (which cannot call the unexported
+// defGeneratedPrimitive). It resolves/creates the target namespace and binds
+// the adapter as the var's guarded canonical root, recording it for reapply.
+// pkg/rt's own generated registrar keeps calling defGeneratedPrimitive directly.
+func BindGeneratedPrimitive(nsName, name string, adapter vm.Value) {
+	ns := LookupOrRegisterNSNoLoad(nsName)
+	defGeneratedPrimitive(ns, nsName, name, adapter)
+}
+
+// AuditGeneratedPrimitives verifies that every recorded generated primitive is
+// actually bound in its canonical namespace, and returns one human-readable
+// line per primitive that is NOT — including where the name IS bound instead,
+// if anywhere. It never panics and never stops at the first problem: it is the
+// non-terminating diagnostic run around the bootstrap core.lg compile, so a
+// batch of newly hoisted //lg:native primitives surfaces ALL its registration
+// failures at once (`+ registered under "clojure.core", not canonical "core"`)
+// rather than the compile dying on the first `Can't resolve X`. Empty slice =
+// every generated primitive resolves in its canonical namespace.
+func AuditGeneratedPrimitives() []string {
+	type binding struct {
+		ns, name string
+	}
+	genPrimMu.RLock()
+	bindings := make([]binding, 0, len(genPrimBindings))
+	for nsName, m := range genPrimBindings {
+		for name := range m {
+			bindings = append(bindings, binding{nsName, name})
+		}
+	}
+	genPrimMu.RUnlock()
+
+	var problems []string
+	for _, b := range bindings {
+		ns := LookupNS(b.ns)
+		if ns == nil {
+			problems = append(problems, fmt.Sprintf("%s/%s: canonical namespace does not exist", b.ns, b.name))
+			continue
+		}
+		if v := ns.LookupLocal(vm.Symbol(b.name)); v == nil || !v.IsBound() {
+			problems = append(problems, fmt.Sprintf("%s/%s: not bound in canonical ns%s", b.ns, b.name, whereNameBound(b.name, resolveNSAlias(b.ns))))
+		}
+	}
+	sort.Strings(problems)
+	return problems
+}
+
+// whereNameBound scans the namespace registry for any namespace OTHER than
+// exclude that has name bound, returning a " (found bound in: …)" suffix so a
+// misregistered primitive points straight at the namespace it landed in (the
+// exact signature of the alias-resolution bug: bound in "clojure.core", absent
+// from canonical "core"). Empty string when the name is bound nowhere else.
+func whereNameBound(name, exclude string) string {
+	nsMu.RLock()
+	defer nsMu.RUnlock()
+	var found []string
+	for k, ns := range nsRegistry {
+		if k == exclude {
+			continue
+		}
+		if v := ns.LookupLocal(vm.Symbol(name)); v != nil && v.IsBound() {
+			found = append(found, k)
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	sort.Strings(found)
+	return " (found bound in: " + strings.Join(found, ", ") + ")"
 }
 
 // ReapplyGeneratedPrimitives restores the recorded native adapters on a

@@ -67,6 +67,7 @@ func (s *suiteCounters) summary() string {
 // Each .cljc file is compiled and executed through let-go with compat shims.
 // Files that fail to compile (e.g. missing builtins) are reported as skipped.
 func TestClojureTestSuite(t *testing.T) {
+	ensureJankSuite()
 	compiler.SetMatchCljConditional(true)
 	defer compiler.SetMatchCljConditional(false)
 
@@ -79,9 +80,11 @@ func TestClojureTestSuite(t *testing.T) {
 	origLoader := rt.GetNSLoader()
 	defer rt.SetNSLoader(origLoader)
 
-	c := vm.NewConsts()
+	// Loader/shim setup is complete before cases start; each case allocates its
+	// own pool in runCompatTest so leaked workers never write this pool.
+	bootstrapConsts := vm.NewConsts()
 	coreNS := rt.NS(rt.NameCoreNS)
-	loaderCtx := compiler.NewCompiler(c, coreNS)
+	loaderCtx := compiler.NewCompiler(bootstrapConsts, coreNS)
 	rt.SetNSLoader(resolver.NewNSResolver(loaderCtx, []string{
 		"compat",
 		"clojure-test-suite/test",
@@ -89,7 +92,7 @@ func TestClojureTestSuite(t *testing.T) {
 	}))
 
 	// Load portability shim (provides when-var-exists and thrown? macros)
-	portCtx := compiler.NewCompiler(c, coreNS)
+	portCtx := compiler.NewCompiler(bootstrapConsts, coreNS)
 	portCtx.SetSource("compat/clojure/core-test/portability.lg")
 	pf, err := os.Open("compat/clojure/core-test/portability.lg")
 	if err != nil {
@@ -99,6 +102,33 @@ func TestClojureTestSuite(t *testing.T) {
 	pf.Close()
 	if err != nil {
 		t.Fatal("failed to compile portability shim:", err)
+	}
+
+	// Mirror the bench's mode selection (zz_bench_test.go): LG_SUITE_IR routes
+	// every test-file fn body through the IR pipeline. The bench reports only
+	// aggregate counters and sends per-assertion output to /dev/null, so an
+	// IR-only failure shows up there as "fail=4" with no way to see WHICH
+	// assertions broke. Honoring the same env var here gets named per-file
+	// subtests and the assertion text, which is what makes an IR regression
+	// diagnosable rather than merely countable.
+	if suiteIRMode() {
+		irCtx := compiler.NewCompiler(bootstrapConsts, coreNS)
+		if _, _, err := irCtx.CompileMultiple(strings.NewReader(
+			"(require 'ir.passes.pipeline)\n(set! *ir-compile* true)",
+		)); err != nil {
+			t.Fatal("enable *ir-compile*:", err)
+		}
+		defer func() {
+			// *ir-compile* is a process-global: if this reset fails silently the
+			// flag stays ON and leaks into every later test in the package
+			// (TestRunner's .lg suite included), corrupting unrelated results
+			// while still looking clean. Report it rather than discarding it.
+			reset := compiler.NewCompiler(bootstrapConsts, coreNS)
+			if _, _, err := reset.CompileMultiple(strings.NewReader("(set! *ir-compile* false)")); err != nil {
+				t.Errorf("failed to reset *ir-compile* — later tests in this package "+
+					"may run with IR compilation still enabled: %v", err)
+			}
+		}()
 	}
 
 	var files []string
@@ -122,7 +152,7 @@ func TestClojureTestSuite(t *testing.T) {
 		}
 
 		t.Run(name, func(t *testing.T) {
-			runCompatTest(t, c, file, totals)
+			runCompatTest(t, file, totals)
 		})
 	}
 
@@ -180,7 +210,10 @@ func nsNameFromCompatPath(filename string) string {
 	return parent + "." + strings.ReplaceAll(dir, "_", "-") + "." + strings.ReplaceAll(base, "_", "-")
 }
 
-func runCompatTest(t *testing.T, c *vm.Consts, filename string, totals *suiteCounters) {
+func runCompatTest(t *testing.T, filename string, totals *suiteCounters) {
+	// A timed-out case leaves its worker goroutine running. Keep its constant
+	// pool private so it cannot race the next case's compiler through Consts.
+	c := vm.NewConsts()
 	ch := make(chan compatTestResult, 1)
 	runtime.GC()
 	baseAlloc := currentAlloc()
@@ -210,20 +243,11 @@ func runCompatTest(t *testing.T, c *vm.Consts, filename string, totals *suiteCou
 			}
 		}()
 
-		// Reset test registry
-		testNS := rt.NS("test")
-		_, _, err := compiler.NewCompiler(c, testNS).CompileMultiple(
-			strings.NewReader("(clear-registered-tests!)"),
-		)
-		if err != nil {
-			ch <- compatTestResult{err: fmt.Errorf("reset: %w", err)}
-			return
-		}
-
 		// Pre-register the file's namespace so the internal (ns ...) form
 		// doesn't cause the NSResolver to re-compile the same file. Without
 		// this, every (is ...) runs twice and assertion counts double.
-		rt.DefNSBare(nsNameFromCompatPath(filename))
+		nsName := nsNameFromCompatPath(filename)
+		rt.DefNSBare(nsName)
 
 		// Compile the .cljc file
 		coreNS := rt.NS(rt.NameCoreNS)
@@ -241,21 +265,29 @@ func runCompatTest(t *testing.T, c *vm.Consts, filename string, totals *suiteCou
 			return
 		}
 
-		// Run registered tests
-		outcomeVar := testNS.Lookup("*test-result*").(*vm.Var)
-		countersVar := testNS.Lookup("*report-counters*").(*vm.Var)
-
-		_, _, err = compiler.NewCompiler(c, testNS).CompileMultiple(
-			strings.NewReader("(run-tests)"),
-		)
+		// Run the file's tests through the public clojure.test API (spec
+		// 12.2): run-tests on the file's own namespace returns the summary,
+		// successful? reads the verdict off it. No source strings are
+		// compiled and no framework state is poked at.
+		fileNS := rt.NS(nsName)
+		if fileNS == nil {
+			ch <- compatTestResult{err: fmt.Errorf("namespace %s not found after compiling", nsName)}
+			return
+		}
+		summary, err := rt.InvokeValue(rt.LookupVar("test", "run-tests").Deref(), []vm.Value{fileNS})
 		if err != nil {
 			ch <- compatTestResult{err: fmt.Errorf("run-tests: %w", err)}
 			return
 		}
+		succ, err := rt.InvokeValue(rt.LookupVar("test", "successful?").Deref(), []vm.Value{summary})
+		if err != nil {
+			ch <- compatTestResult{err: fmt.Errorf("successful?: %w", err)}
+			return
+		}
 
 		ch <- compatTestResult{
-			outcome:  bool(outcomeVar.Deref().(vm.Boolean)),
-			counters: countersVar.Deref(),
+			outcome:  succ == vm.TRUE,
+			counters: summary,
 		}
 	}()
 

@@ -17,11 +17,12 @@ type Option func(*config)
 
 // config collects the resolved option values. Pure data, no behavior.
 type config struct {
-	stdout io.Writer
-	stderr io.Writer
-	emit   func(name, dataJSON string)
-	keys   rt.KeySource
-	store  rt.Storage
+	stdout  io.Writer
+	stderr  io.Writer
+	emit    func(name, dataJSON string)
+	keys    rt.KeySource
+	store   rt.Storage
+	surface rt.Surface
 }
 
 // WithStdout configures the runtime to route output written via *out*
@@ -89,6 +90,21 @@ func WithKeySource(ks rt.KeySource) Option {
 	return func(c *config) { c.keys = ks }
 }
 
+// WithSurface routes surface/present and surface/available? through s for this
+// instance, the graphics dual of WithEmit. An embedder or test supplies a frame
+// sink — capturing presented frames headlessly, or binding a native
+// terminal-image encoder (RGBA -> PNG -> iTerm2 IIP, etc.). s is an rt.Surface
+// (Present + Available); see pkg/rt/surface.go.
+//
+// Implementation: each Run pushes s as a dynamic binding on *surface*, popped
+// on return. Same process-global-binding-stack concurrency caveat as WithStdout.
+//
+// Default: no-op (the *surface* root nopSurface; surface/present is dropped,
+// surface/available? is false).
+func WithSurface(s rt.Surface) Option {
+	return func(c *config) { c.surface = s }
+}
+
 // WithStorage routes the storage namespace through store for this instance.
 // The store receives app-local logical keys; callers should not encode host
 // filesystem or browser-origin details into those keys.
@@ -121,11 +137,12 @@ type LetGo struct {
 	// stdoutHandle/stderrHandle are pre-constructed Boxed IOHandles, or
 	// nil when no option was supplied. Run pushes them as dynamic
 	// bindings on *out*/*err* and pops on return.
-	stdoutHandle vm.Value
-	stderrHandle vm.Value
-	emitHandle   vm.Value
-	keysHandle   vm.Value
-	storeHandle  vm.Value
+	stdoutHandle  vm.Value
+	stderrHandle  vm.Value
+	emitHandle    vm.Value
+	keysHandle    vm.Value
+	storeHandle   vm.Value
+	surfaceHandle vm.Value
 }
 
 // NewLetGo constructs a runtime. With no options, behavior is exactly
@@ -166,6 +183,9 @@ func NewLetGo(ns string, opts ...Option) (*LetGo, error) {
 	if cfg.store != nil {
 		ret.storeHandle = vm.NewBoxed(cfg.store)
 	}
+	if cfg.surface != nil {
+		ret.surfaceHandle = vm.NewBoxed(cfg.surface)
+	}
 
 	return ret, nil
 }
@@ -174,12 +194,21 @@ func (l *LetGo) SetLoadPath(path []string) {
 	l.loader.SetPath(path)
 }
 
+// CompilerContext returns the shared compiler context for host integrations
+// such as nREPL servers that must evaluate in the embedded runtime's namespace.
+func (l *LetGo) CompilerContext() *compiler.Context {
+	return l.c
+}
+
+// Def boxes value and binds it to name in the current namespace. Redefining
+// a name updates its existing Var, so functions compiled before the
+// redefinition see the new value, as they would after (def name value).
 func (l *LetGo) Def(name string, value any) error {
 	val, err := vm.BoxValue(reflect.ValueOf(value))
 	if err != nil {
 		return err
 	}
-	l.c.CurrentNS().Def(name, val)
+	l.c.CurrentNS().Intern(name, val)
 
 	return nil
 }
@@ -224,6 +253,12 @@ func (l *LetGo) Run(expr string) (vm.Value, error) {
 			defer v.PopBinding()
 		}
 	}
+	if l.surfaceHandle != nil {
+		if v := rt.LookupCoreVar("*surface*"); v != nil {
+			v.PushBinding(l.surfaceHandle)
+			defer v.PopBinding()
+		}
+	}
 
 	// Compile through a per-Run transient child context: an embedder calling
 	// Run in a loop must not grow the session pool by one entry per call
@@ -236,4 +271,25 @@ func (l *LetGo) Run(expr string) (vm.Value, error) {
 	result, err := frame.RunProtected()
 	vm.ReleaseFrame(frame)
 	return result, err
+}
+
+// IsIncomplete reports whether err, as returned by Run, means the input
+// ended in the middle of an open form (e.g. "(defn foo [x]") rather than
+// being wrong. Interactive frontends use it to decide between reading
+// more lines and reporting the error:
+//
+//	v, err := lg.Run(buffer)
+//	if err != nil {
+//		if api.IsIncomplete(err) {
+//			continue // prompt for another line, re-Run the whole buffer
+//		}
+//		report(err)
+//	}
+//
+// Empty and whitespace-only input also read as incomplete, which a REPL
+// loop treats the same way: keep prompting. A hard syntax error such as
+// an unmatched delimiter ("(]") is not incomplete — more input can never
+// complete it — and should be reported immediately.
+func IsIncomplete(err error) bool {
+	return compiler.IsErrorEOF(err)
 }

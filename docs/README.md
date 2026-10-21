@@ -1,9 +1,9 @@
 ---
 status: active
-last-verified: 2026-06-30
+last-verified: 2026-08-21
 authoritative-for:
   - docs-index
-human-verified: 2026-06-20
+human-verified: 2026-08-11
 ---
 
 # let-go docs
@@ -45,29 +45,46 @@ A subdir is earned when a cluster of related docs justifies one; one-off cross-c
 | Real-world Clojure compat findings | `xsofy-portability-gaps.md` |
 | Clojure-test-suite (jank) workflow | `clojure-test-suite.md` |
 | Testing strategy, conformance | `testing-and-conformance.md` |
+| `clojure.test` / `clojure.test.tap` API, stack-trace primitives, Go harness bridge | `specs/clojure-test-conformance.md` |
 | Docs frontmatter convention + maintenance hook | `frontmatter-hook.md` |
 | Docs judgement-layer report (stale/supersession/index) | `docs-status.md` |
+| Comment report (devlog/restatement/density) + how to act on it | `comment-lint.md` |
+| What fraction of a program the Go lowerer emits, and why the rest falls back | `lowering-census.md` |
+| Which type facts typeinfer leaves on a program, and whether a change tightened or loosened them | `typeinfer-census.md` |
+| Build, test, lint, regenerate, and the CI gate map | `contributor-workflow.md` |
+| Where CI runner time goes (measurement + `scripts/ci-usage.sh`) | `ci-actions-usage.md` |
+| Code-quality score report (`make quality`) | `scripts/quality.lg` (complexity, duplication, coverage, defect density; run `make quality`) |
 | Regenerating generated artifacts after `.lg` edits | `regenerating-generated-artifacts.md` |
 | Perf ratchet, regression checkpoints, historical baselines | `perf/ratchet.md` |
 | Running the perf A/B on a PR (the `perf` label) | `perf/ratchet.md` (§ Running the check on a PR) |
 | gogen_ir native-lowering compute microbench gate | `perf/microbench/README.md` |
+| Binary size and boot-time history, v1.7.4 -> 2026-07 (one-off audit) | `perf/size-boot-audit/README.md` |
 | Babashka pods (usage) | `guide/pods.md` |
 | Babashka pods (host protocol / design) | `design/pods.md` |
 | Portable `.cljc` / `:lg` reader conditionals | `guide/portability.md` |
+| Custom `*data-readers*` and raw `#go{...}` fragments | `guide/custom-data-readers.md` |
 | Version requirements, range matching (`let-go.semver`) | `guide/semver.md` |
 | `io/resource`, `-resource-paths` / `-source-paths` resolution | `guide/resources-and-source-paths.md` |
 | Embedding let-go in a Go program | `guide/embedding-in-go.md` |
+| Dropping `net/http` from a build (`lg_no_http`) | `guide/embedding-in-go.md` (§ Dropping `net/http`) |
 | Wrapping Go packages (lginterop, `database/sql` example) | `guide/go-interop.md` |
+| Building a custom `lg` around your own Go packages (`pkg/cli`) | `guide/custom-lg.md` |
 | Running as a WASI (`GOOS=wasip1`) module | `guide/wasi.md` |
 | let-go under TinyGo (status: not currently supported) | `guide/tinygo.md` |
 | nREPL server + editor setup | `guide/nrepl.md` |
+| Scopes: cancelling and draining spawned work (`with-scope`) | `guide/structured-concurrency.md` |
+| HTTP server (serve, start/stop/wait) and client (`http`) | `guide/http.md` |
 | TCP client + bencode framing (`net`, `bencode`) | `guide/net.md` |
+| Processes, environment, filesystem and paths (`os`) | `guide/os.md` |
 | Clojure compatibility: namespace table + differences | `guide/clojure-compatibility.md` |
+| Intentional and temporary Clojure divergences | `known-divergences.md` |
 | Running, compiling, WASM, project mgmt (lgx) | `guide/usage.md` |
 | IR pipeline dynamic vars (knobs + per-compile state) | `design/ir-dynamic-vars.md` |
 | IR fixup / link pass | `design/els2023-ir-fixup-audit.md` |
 | Parallel IR lowering + determinism | `design/parallel-lowering-and-type-cache.md` |
 | Runtime I/O, host decoupling | `design/runtime-io-host-decoupling.md` |
+| Terminal resize wake contract | `design/terminal-resize-wake.md` |
+| Graphics backend contract / host-capability seam | `design/glplat-backend-contract.md` |
 | Off-goroutine execution context threading | `design/exec-context-threading.md` |
 
 ## Reading order if starting cold

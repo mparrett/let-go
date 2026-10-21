@@ -1,0 +1,365 @@
+;; lg.compiler — the AOT compile driver, as a namespace.
+;;
+;; An ordinary embedded core namespace: enrolled in EmbeddedNSNames and swept by
+;; genmanifest's sourceSpecs, so edits here churn pkg/rt/generated.sums. It is
+;; kept out of core_compiled.lgb and loads from embedded source on demand — see
+;; cmd/lgbgen.isBundleSkippedTool. Architecture: docs/design/go-aot-backend.md.
+;;
+;; External contract: gloat invokes scripts/lg-compile by path and scrapes
+;; stdout, so the "EMIT-FAIL <path> pkg=<pkg> returned <type>" line and the
+;; process exit code are load-bearing. test/e2e pins both.
+
+(ns lg.compiler
+  (:require
+   [clojure.string]
+   [gogen]
+   [ir.data]
+   [ir.passes.entry-frame]
+   [ir.passes.pipeline]))
+
+(defn read-all [path]
+  (read-code-string (str "(do " (slurp path) "\n)")))
+
+(defn lowerable? [f]
+  ;; Multi-arity defns lower too: the pipeline splits arities into
+  ;; independent per-arity units (<Name>_<arity> Go funcs, per-arity
+  ;; direct-call registry entries, and a len(args)-switch override
+  ;; adapter when every arity is uniform vm.Value).
+  (and (seq? f)
+       (let [h (first f)]
+         (or (= h 'defn) (= h 'defn-)
+             (= h 'defmulti) (= h 'defmethod)))))
+
+(defn find-ns-name [forms]
+  (some (fn [f] (when (and (seq? f) (= 'ns (first f))) (second f))) forms))
+
+(defn basename-stem [path]
+  (let [segs (clojure.string/split path "/")
+        base (nth segs (dec (count segs)))]
+    (clojure.string/replace base ".lg" "")))
+
+;; Only DEFINITIONAL forms are evaluated during compilation: lowering needs each
+;; ns set up (its require/refer/alias table) and its vars interned so cross-ns
+;; calls resolve — but NOT arbitrary top-level expressions. Evaluating e.g.
+;; `(apply main ARGS)` would run user code (side effects) at compile time, and
+;; that form isn't part of the lowered Go output anyway.
+(def definitional-heads
+  (set '(ns in-ns require use import refer load load-file
+          def defn defn- defonce defmacro defmulti defmethod defprotocol
+          deftype defrecord declare definterface defmulti- def-)))
+
+(defn definitional? [f]
+  (and (seq? f) (symbol? (first f)) (contains? definitional-heads (first f))))
+
+;; A require entry names a namespace as a bare symbol, a [ns …] vector, or either
+;; wrapped in a (quote …) (top-level `(require '[ns …])`).
+(defn dep-ns-of-entry [e]
+  (cond
+    (and (seq? e) (= 'quote (first e))) (dep-ns-of-entry (second e))
+    (vector? e)                         (first e)
+    (symbol? e)                         e
+    :else                               nil))
+
+;; The namespaces a file depends on: ns-form :require/:use clauses + top-level
+;; (require …)/(use …). Used to load inputs in dependency order so compilation is
+;; independent of the order files are passed on the command line.
+(defn spec-dep-syms [forms]
+  (let [out (atom [])]
+    (doseq [f forms]
+      (when (and (seq? f) (symbol? (first f)))
+        (cond
+          (= 'ns (first f))
+          (doseq [clause (drop 2 f)]
+            (when (and (seq? clause) (contains? #{:require :use} (first clause)))
+              (doseq [e (rest clause)]
+                (when-let [n (dep-ns-of-entry e)] (swap! out conj n)))))
+          (contains? #{'require 'use} (first f))
+          (doseq [e (rest f)]
+            (when-let [n (dep-ns-of-entry e)] (swap! out conj n))))))
+    @out))
+
+;; Topologically order specs so a namespace loads after the sibling inputs it
+;; requires (deps outside the input set are ignored — they load via the normal
+;; path). DFS marks-before-recursing, so a require cycle terminates (its members
+;; come out in discovery order) rather than looping.
+(defn topo-order-specs [specs]
+  (let [by-ns (reduce (fn [m s] (assoc m (:nsn s) s)) {} specs)
+        nsset (set (keys by-ns))
+        deps  (reduce (fn [m s]
+                        (assoc m (:nsn s) (vec (filter nsset (spec-dep-syms (:forms s))))))
+                      {} specs)
+        seen  (atom #{})
+        out   (atom [])]
+    (doseq [s specs]
+      ((fn visit [nsn]
+         (when-not (contains? @seen nsn)
+           (swap! seen conj nsn)
+           (doseq [d (get deps nsn)] (visit d))
+           (swap! out conj (get by-ns nsn))))
+       (:nsn s)))
+    @out))
+
+(defn count-lowered-funcs
+  "Rough count of top-level lowered `func Name(` decls — excludes the generated
+   __gogen* wrappers and init() so the summary reflects real lowered fns."
+  [go-src]
+  (if-not (string? go-src)
+    0
+    (count (filter (fn [decl]
+                     ;; decl is "\nfunc NAME(" — strip "\nfunc " (6) + trailing "(".
+                     (let [nm (subs decl 6 (dec (count decl)))]
+                       (and (not (clojure.string/starts-with? nm "__gogen"))
+                            (not= nm "init"))))
+                   (re-seq #"\nfunc [A-Za-z_][A-Za-z0-9_]*\(" (str "\n" go-src))))))
+
+(defn parse-spec [import-prefix path]
+  (let [parsed (read-all path)
+        forms  (vec (rest parsed))
+        ns-sym (find-ns-name forms)
+        lf     (vec (filter lowerable? forms))
+        ;; canonical gogen naming: pkg = leaf segment, reldir = nested ns
+        ;; path. Files lacking an (ns ..) get a synthetic flat ys_<stem>.
+        nsstr  (if ns-sym (str ns-sym) (str "ys-" (basename-stem path)))
+        pkg    (gogen/ns->go-pkg nsstr)
+        reldir (gogen/ns->go-reldir nsstr)]
+    {:path path :forms forms :ns-sym ns-sym :lf lf
+     :pkg pkg :reldir reldir
+     :nsn (if ns-sym ns-sym (symbol nsstr))
+     :go-pkg (str import-prefix "/" reldir)
+     :entry (ir.passes.entry-frame/find-program-entry forms)}))
+
+;; A top-level form is classified after splicing `do` and expanding macro calls,
+;; so a defn that a macro emits, or one wrapped in do, is interned and lowered
+;; like a literal one (#1049). Expansion stops at a definitional head: defn is
+;; itself a macro, and lowering wants it unexpanded. Each definitional form is
+;; evaluated as it is found, so a macro an earlier form defines can expand a
+;; later one. A form that expands to anything else stays unevaluated; if it
+;; still holds a definition, as (when c (defn f ...)) or (let [x 1] (defn f ...))
+;; do, that definition won't exist at compile time, so say which form it was.
+(defn- holds-definition? [f]
+  (and (coll? f)
+       (not (and (seq? f) (= 'quote (first f))))
+       (or (definitional? f) (boolean (some holds-definition? f)))))
+
+(defn- definitional-forms!
+  ([f] (definitional-forms! f f))
+  ([f written]
+   (cond
+     (definitional? f) (do (eval f) [f])
+     (and (seq? f) (= 'do (first f))) (into [] (mapcat definitional-forms! (rest f)))
+     :else (let [e (if (seq? f) (macroexpand-1 f) f)]
+             (if (not= e f)
+               (recur e written)
+               (do (when (holds-definition? e)
+                     (binding [*out* *err*]
+                       (println (str "lg compile: warning: a definition inside this top-level form "
+                                     "is not loaded at compile time, so lowered code can't refer to it: "
+                                     (let [w (pr-str written)]
+                                       (if (> (count w) 100) (str (subs w 0 100) "...") w))))))
+                   []))))))
+
+;; Load every ns first, in dependency order, evaluating ONLY definitional forms,
+;; so cross-ns refers resolve when lower-all-ns-to-go lowers them — regardless of
+;; input order, and without running top-level user code at compile time. This is
+;; the call that switches the global current ns. Returns specs with :lf
+;; recomputed from the expanded forms.
+(defn load-specs! [specs]
+  (let [lfs (reduce (fn [m s]
+                      (when-not (:ns-sym s) (eval (list 'ns (:nsn s))))
+                      (let [defs (into [] (mapcat definitional-forms! (:forms s)))]
+                        (assoc m (:path s) (vec (filter lowerable? defs)))))
+                    {}
+                    (topo-order-specs specs))]
+    (mapv (fn [s] (assoc s :lf (get lfs (:path s)))) specs)))
+
+(defn write-packages!
+  "Writes each emitted package to disk. Returns the number of EMIT-FAILs so the
+   caller can decide the exit code. gloat scrapes EMIT-FAIL from stdout."
+  [out-dir specs results]
+  (let [fails (atom 0)]
+    (doseq [pair (map-indexed vector specs)]
+      (let [i  (first pair)
+            s  (second pair)
+            r  (nth results i)
+            go (when r (:source r))]
+        (cond
+          (empty? (:lf s)) (println (str (:path s) ": no lowerable defns — skipped"))
+          (string? go)     (let [dir (str out-dir "/" (:reldir s))
+                                 out (str dir "/" (:pkg s) ".go")]
+                             (mkdir dir)
+                             (spit out go)
+                             (println (str (:path s) " -> " out)))
+          :else            (do (swap! fails inc)
+                               (println (str "EMIT-FAIL " (:path s) " pkg=" (:pkg s)
+                                             " returned " (clojure.core/type r)))))))
+    @fails))
+
+(defn pick-entry-spec
+  "Prefer -main's owning ns when several inputs declare an entry."
+  [specs]
+  (or (first (filter (fn [s] (and (:entry s) (= "-main" (:name (:entry s))))) specs))
+      (first (filter :entry specs))))
+
+(defn emit-frame!
+  "Emits main.go (+ a private-entry bridge when applicable). Opt-in: only called
+   when the caller asked for an entry frame."
+  [out-dir specs results entry-spec entry]
+  (let [blanks   (vec (keep (fn [pair]
+                              (let [s (nth specs (first pair))
+                                    r (second pair)]
+                                (when (and (seq (:lf s)) r (string? (:source r))) (:go-pkg s))))
+                            (map-indexed vector results)))
+        frame    (ir.passes.entry-frame/emit-entry-frame-go
+                   {:entry entry
+                    :entry-import (:go-pkg entry-spec)
+                    :blank-imports blanks})
+        main-out (str out-dir "/main.go")
+        bridge   (ir.passes.entry-frame/emit-entry-bridge-go
+                   (:pkg entry-spec) entry)]
+    (mkdir out-dir)
+    (spit main-out frame)
+    (println (str "native-entry frame -> " main-out))
+    (when bridge
+      (let [bdir (str out-dir "/" (:reldir entry-spec))
+            bout (str bdir "/native_entry.go")]
+        (mkdir bdir)
+        (spit bout bridge)
+        (println (str "native-entry bridge -> " bout))))))
+
+(defn compile-program
+  "Lower `files` to Go packages under `out-dir` with Go import prefix
+   `import-prefix`. When entry-frame? is true and a recognized program entry is
+   present, also emit the native-entry frame.
+
+   Returns {:emit-fails n :lowered-funcs n :entry <entry-or-nil>
+            :entry-path <path-or-nil> :error <msg>}
+   instead of exiting, so a Go caller can decide what to do. Printing is kept
+   for the scripts/lg-compile shim's stdout contract."
+  [out-dir import-prefix files entry-frame?]
+  (let [specs (load-specs! (mapv (fn [p] (parse-spec import-prefix p)) files))]
+    (let [results    (binding [ir.passes.pipeline/*target* :go]
+                       (ir.passes.pipeline/lower-all-ns-to-go-result
+                         (mapv (fn [s] [(:pkg s) (:nsn s) (:lf s) (:go-pkg s)]) specs)))
+          entry-spec (pick-entry-spec specs)
+          ;; Reject unsupported entry arities only when we would emit a frame —
+          ;; package-only mode must not fail on shapes gloat handles itself.
+          arity-err  (when entry-frame?
+                       (ir.passes.entry-frame/entry-arity-error
+                         (when entry-spec (:entry entry-spec))))]
+      (if arity-err
+        {:error arity-err :emit-fails 0 :lowered-funcs 0 :entry nil}
+        (let [fails   (write-packages! out-dir specs results)
+              n-funcs (reduce + (map (fn [r] (count-lowered-funcs (when r (:source r)))) results))]
+          (if-not entry-spec
+            (do (println (ir.passes.entry-frame/entry-summary-line n-funcs nil))
+                {:emit-fails fails :lowered-funcs n-funcs :entry nil})
+            (let [ei     (first (keep-indexed (fn [i s] (when (= s entry-spec) i)) specs))
+                  result (nth results ei)
+                  fn-rec (ir.passes.entry-frame/lookup-entry-fn
+                           (when result (:fns result))
+                           (:entry entry-spec))
+                  ;; Stamp the owning source namespace so VM fallback resolves
+                  ;; LookupNS(ns).LookupLocal(name) rather than scanning the registry.
+                  entry  (assoc (ir.passes.entry-frame/analyze-entry
+                                  (:entry entry-spec) {:fn fn-rec})
+                                :ns (str (:nsn entry-spec)))]
+              (when entry-frame?
+                (emit-frame! out-dir specs results entry-spec entry))
+              (println (ir.passes.entry-frame/entry-summary-line n-funcs entry))
+              {:emit-fails fails :lowered-funcs n-funcs :entry entry
+               :entry-path (:path entry-spec)})))))))
+
+(defn exit-code
+  "The shim's exit policy, as a pure function of compile-program's result.
+
+   EMIT-FAILs never reach the exit code: a fn that does not lower stays on the
+   trampoline and the program still runs, so partial lowering is a normal
+   outcome the orchestrator judges from stdout. Only :error is fatal."
+  [res]
+  (if (:error res) 1 0))
+
+(defn main-from-args
+  "argv contract of scripts/lg-compile: [--entry-frame] <out-dir> <prefix> <file>...
+   Returns the result map; the shim owns exit codes, via exit-code above."
+  [argv0]
+  (let [entry-frame? (boolean (some (fn [a] (= "--entry-frame" a)) argv0))
+        argv         (vec (filter (fn [a] (not= "--entry-frame" a)) argv0))]
+    (compile-program (nth argv 0) (nth argv 1) (vec (drop 2 argv)) entry-frame?)))
+
+(def program-module
+  "Go module name of the generated build. Lowered packages import each other
+   under it, so it is also the import prefix passed to compile-program."
+  "lgprogram")
+
+(defn- build-in
+  "build-program's steps once the directory to generate into is chosen. dir
+   holds main.go and program.lgb; lowered packages import each other under
+   import-path. A caller-supplied module (module? true) keeps its own go.mod and
+   go.sum and is built read-only; otherwise dir gets a scaffolded module."
+  [files out dir import-path module? host]
+  (let [res   (compile-program dir import-path files true)
+        entry (:entry res)]
+    (cond
+      (:error res) res
+      (nil? entry)
+      (assoc res :error (str "lg compile: no program entry; define -main or main in one of: "
+                             (clojure.string/join " " files)))
+      :else
+      (let [out (or out (basename-stem (:entry-path res)))]
+        ((:compile-lgb host) (:entry-path res) (str dir "/program.lgb")
+                             (str (:ns entry) "/" (:name entry)))
+        (if module?
+          ((:go-build-readonly host) dir out)
+          (do ((:scaffold-module host) dir program-module)
+              ((:go-build host) dir out)))
+        (assoc res :out out)))))
+
+(defn build-program
+  "Compile `files` to a standalone native binary at `out` (nil names it after
+   the entry file, in the current directory): lower them with the
+   native-entry frame, bytecode-compile the entry file to program.lgb beside
+   the frame, scaffold a Go module, and go build it. Partial lowering is not an
+   error: an EMIT-FAIL package stays on the VM, as it does for lg-compile.
+
+   The Go toolchain steps come from `host`, a map of fns the CLI supplies:
+     :compile-lgb       (f src dst entry)  writes program.lgb; entry is ns/name
+     :scaffold-module   (f dir module)     writes go.mod and go.sum into dir
+     :go-build          (f dir out)        builds the module in dir to out
+     :make-temp-dir     (f)                returns a fresh directory
+     :remove-dir        (f dir)            deletes it
+     :open-module       (f module-dir imports)
+                                           prepares the directory let-go owns
+                                           in a caller's module and
+                                           blank-imports each Go package in
+                                           imports; returns
+                                           {:dir d :import-path p}
+     :go-build-readonly (f dir out)        builds dir to out, -mod=readonly
+   program.lgb comes from a separate process, not this one: lowering loads the
+   compiler's own namespaces, and an in-process compile would bundle them.
+
+   `work-dir`, when given, holds the generated module and is kept; otherwise a
+   temporary directory is used and removed. `module-dir`, when given, names a
+   Go module the caller prepared and replaces work-dir: the program is
+   generated into the directory :open-module hands back, lowered packages
+   import each other under its import path, and the caller's go.mod and go.sum
+   are used as they are. `imports` names Go packages to link into the program
+   for their init(), typically ones registering namespaces; it needs
+   module-dir, whose go.mod must require them. Returns compile-program's result
+   plus :out, or a map with :error."
+  ([files out work-dir host] (build-program files out work-dir nil nil host))
+  ([files out work-dir module-dir host] (build-program files out work-dir module-dir nil host))
+  ([files out work-dir module-dir imports host]
+   (cond
+     module-dir
+     (let [m ((:open-module host) module-dir (vec imports))]
+       (build-in files out (:dir m) (:import-path m) true host))
+     ;; The scaffolded module requires only let-go, so any other package
+     ;; could not build there.
+     (seq imports)
+     {:error "lg compile: Go imports need a caller-supplied module"}
+     :else
+     (let [work (or work-dir ((:make-temp-dir host)))]
+       (try
+         (build-in files out work program-module false host)
+         (finally
+           (when-not work-dir ((:remove-dir host) work))))))))

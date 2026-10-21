@@ -184,7 +184,7 @@ func TestBoolRoundtrip(t *testing.T) {
 }
 
 func TestIntRoundtrip(t *testing.T) {
-	cases := []int{0, 42, -1, math.MaxInt64, math.MinInt64}
+	cases := []int64{0, 42, -1, math.MaxInt64, math.MinInt64}
 	for _, tc := range cases {
 		got := roundtripValue(t, vm.Int(tc))
 		if got != vm.Int(tc) {
@@ -518,6 +518,54 @@ func TestMapRoundtrip(t *testing.T) {
 	}
 	if gotMap.ValueAt(vm.Keyword("y")) != vm.Int(2) {
 		t.Errorf(":y got %v, want 2", gotMap.ValueAt(vm.Keyword("y")))
+	}
+}
+
+func TestDefMetaPairsRoundtrip(t *testing.T) {
+	pairs := vm.DefMetaPairs{
+		vm.Keyword("doc"), vm.String("the doc"),
+		vm.Keyword("private"), vm.TRUE,
+	}
+	got := roundtripValue(t, pairs)
+	gotPairs, ok := got.(vm.DefMetaPairs)
+	if !ok {
+		t.Fatalf("expected vm.DefMetaPairs, got %T", got)
+	}
+	if !pairs.Equals(gotPairs) {
+		t.Fatalf("metadata pairs roundtrip = %v, want %v", gotPairs, pairs)
+	}
+}
+
+func TestDefMetaPairsUsesVersionedMapTag(t *testing.T) {
+	var buf bytes.Buffer
+	enc := &encoder{
+		w:        NewWriter(&buf),
+		strings:  []string{"doc", "the doc"},
+		strIndex: map[string]int{"doc": 0, "the doc": 1},
+	}
+	if err := enc.writeValue(vm.DefMetaPairs{vm.Keyword("doc"), vm.String("the doc")}); err != nil {
+		t.Fatalf("writeValue: %v", err)
+	}
+	if err := enc.w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got, want := buf.Bytes()[0], byte(TagIDMap|TagVer1); got != want {
+		t.Fatalf("metadata tag = %#x, want versioned map tag %#x", got, want)
+	}
+}
+
+func TestKnownTagRejectsUnsupportedVersion(t *testing.T) {
+	dec := &decoder{r: NewReader(bytes.NewReader([]byte{TagIDVector | TagVer1}))}
+	if _, err := dec.readValueV2(); err == nil || !strings.Contains(err.Error(), "unsupported tag version 1") {
+		t.Fatalf("readValueV2 error = %v, want unsupported tag version", err)
+	}
+}
+
+func TestDefMetaPairsRejectsOddPairCount(t *testing.T) {
+	var buf bytes.Buffer
+	enc := &encoder{w: NewWriter(&buf)}
+	if err := enc.writeValue(vm.DefMetaPairs{vm.Keyword("doc")}); err == nil || !strings.Contains(err.Error(), "odd pair count") {
+		t.Fatalf("writeValue error = %v, want odd pair count", err)
 	}
 }
 
@@ -1136,15 +1184,23 @@ func TestUnsupportedCapabilityMask(t *testing.T) {
 	w.WriteBytes(Magic[:])
 	w.WriteUint16(2)
 	w.WriteUint16(FlagCapabilities)
-	w.WriteUint32(0x00000002) // bit 1 set — no such capability defined
+	w.WriteUint32(0x80000000) // bit 31 set — no such capability defined
 	w.Flush()
 
 	_, err := Decode(&buf)
 	if err == nil {
 		t.Fatal("expected error for unsupported capability mask")
 	}
-	if !strings.Contains(err.Error(), "unsupported capability mask") {
-		t.Fatalf("expected 'unsupported capability mask' in error, got: %v", err)
+	msg := err.Error()
+	for _, want := range []string{
+		"unsupported capabilities",
+		"unknown bit 31",
+		"CapOpcodeSet",
+		"recompile the bundle with a matching lg",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected %q in error, got: %v", want, err)
+		}
 	}
 }
 

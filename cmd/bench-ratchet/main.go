@@ -65,6 +65,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nooga/let-go/pkg/perfdata"
@@ -79,8 +80,10 @@ const (
 	// gate. These metrics are deterministic (no CPU-dependent noise), so the
 	// budget is tight — it only absorbs rare boundary effects (e.g. a map
 	// resize landing one element differently).
-	allocBudget      = 0.02
-	defaultCount     = 1
+	allocBudget = 0.02
+	// 4 reps minimum: the first is discarded as warmup by reduceSamples,
+	// leaving >=3 for a meaningful median (a median of 2 doesn't exist).
+	defaultCount     = 4
 	defaultBenchtime = "1s"
 	defaultTimeout   = "10m"
 	defaultTags      = "gogen_ir"
@@ -107,12 +110,17 @@ const (
 	irCompilePackage = "github.com/nooga/let-go/pkg/ir"
 	irCompileFilter  = "^BenchmarkIRCompile$"
 
-	// Startup cost: decoding the precompiled core bundle and running its
-	// main chunk — exactly what `lg -e nil` does minus process spawn. This
-	// is the guard for startup regressions (the per-instruction source-map /
-	// local-var realloc churn that doubled cold-start). Its B/op and
-	// allocs/op are deterministic and machine-independent, so the ratchet
-	// catches a reintroduction even when ns/op is noisy.
+	// Startup cost: the compiler's bundle-boot path — decode the precompiled
+	// core bundle, run clojure.core, the lg baseline and the hybrid
+	// namespaces, and mark the rest needs-load — exactly what `lg -e nil`
+	// does minus process spawn. A namespace left needs-load keeps its chunks
+	// undecoded until its first require (bytecode.DecodeBundle), so code
+	// added there does not move this gate; code added to core, a baseline or
+	// a hybrid does, as a real process pays for it. This is the guard for
+	// startup regressions (the per-instruction source-map / local-var realloc
+	// churn that doubled cold-start). Its B/op and allocs/op are deterministic
+	// and machine-independent, so the ratchet catches a reintroduction even
+	// when ns/op is noisy.
 	initPackage = "github.com/nooga/let-go/pkg/compiler"
 	initFilter  = "^BenchmarkInitFromLGB$"
 )
@@ -166,22 +174,30 @@ func (r Result) FullName() string {
 
 func main() {
 	var (
-		baselinePath = flag.String("baseline", defaultBaselinePath, "baseline JSON path")
-		budget       = flag.Float64("budget", defaultBudget, "fractional regression tolerated before flagging (0.05 = 5%)")
-		packages     = flag.String("packages", "", "space-separated go packages to bench (default: discover)")
-		count        = flag.Int("count", defaultCount, "go test -count")
-		benchtime    = flag.String("benchtime", defaultBenchtime, "go test -benchtime")
-		filter       = flag.String("filter", "", "regexp filter on benchmark names (default: all)")
-		timeout      = flag.String("timeout", defaultTimeout, "go test -timeout per package")
-		outPath      = flag.String("out", "", "capture .jsonl output path (default: docs/perf/.runs/<sha>-<ts>.jsonl)")
-		inPath       = flag.String("in", "", "aggregate .jsonl input path (default: most recent under docs/perf/.runs/)")
-		force        = flag.Bool("force", false, "with update: bypass the ratchet — write current numbers even where they'd loosen the bar. Use sparingly for accepted regressions.")
-		shaOverride  = flag.String("sha", "", "override the SHA recorded for this run (default: git rev-parse HEAD of cwd). Use when aggregating a capture from a worktree that differs from cwd.")
-		tags         = flag.String("tags", defaultTags, "go test -tags. Default 'gogen_ir' so the lowered-to-Go VM is compiled into the test binary alongside the bytecode VM. Has no effect on releases that pre-date the lowered-Go work (the build tag matches no files there).")
-		format       = flag.String("format", "text", "report format: text (default, ANSI terminal), markdown (GitHub/Slack-friendly table), json (the raw baseline)")
-		full         = flag.Bool("full", false, "run the FULL benchmark profile: pkg/vm fleet under -tags plus jank + IR compile under both VM variants. Slow (~25 min) — for mainline profiling and manual deep-dives.")
-		profile      = flag.String("profile", "", "named benchmark profile (e.g. 'pr-fast'). Mutually exclusive with -packages/-filter/-full. Sets the job list plus default count/benchtime/budget; explicit flags still override.")
-		wasm         = flag.Bool("wasm", false, "run benchmarks under GOOS=js/wasm via the go_js_wasm_exec shim (Node), reporting the machine as js/wasm. Forces -tags off (the wasm bundle ships the bytecode VM, not the lowered-Go path). Slower and noisier than native; for the wasm A/B gate.")
+		baselinePath     = flag.String("baseline", defaultBaselinePath, "baseline JSON path")
+		budget           = flag.Float64("budget", defaultBudget, "fractional regression tolerated before flagging (0.05 = 5%)")
+		packages         = flag.String("packages", "", "space-separated go packages to bench (default: discover)")
+		count            = flag.Int("count", defaultCount, "go test -count")
+		benchtime        = flag.String("benchtime", defaultBenchtime, "go test -benchtime")
+		filter           = flag.String("filter", "", "regexp filter on benchmark names (default: all)")
+		timeout          = flag.String("timeout", defaultTimeout, "go test -timeout per package")
+		outPath          = flag.String("out", "", "capture .jsonl output path (default: docs/perf/.runs/<sha>-<ts>.jsonl)")
+		inPath           = flag.String("in", "", "aggregate .jsonl input path (default: most recent under docs/perf/.runs/)")
+		force            = flag.Bool("force", false, "with update: bypass the ratchet — replace current-machine timing and rebase global deterministic metrics. Use sparingly for accepted regressions.")
+		acceptDet        = flag.Bool("accept-deterministic", false, "with update -force: also write allocs/op and bytes/op the run measured WORSE than the stored bar. Without it a forced rebaseline moves timing only, since allocs/bytes are a property of the code rather than of this host and every profile is gated against them.")
+		shaOverride      = flag.String("sha", "", "override the SHA recorded for this run (default: git rev-parse HEAD of cwd). Use when aggregating a capture from a worktree that differs from cwd.")
+		tags             = flag.String("tags", defaultTags, "go test -tags. Default 'gogen_ir' so the lowered-to-Go VM is compiled into the test binary alongside the bytecode VM. Has no effect on releases that pre-date the lowered-Go work (the build tag matches no files there).")
+		format           = flag.String("format", "text", "report format: text (default, ANSI terminal), markdown (GitHub/Slack-friendly table), json (the raw baseline)")
+		full             = flag.Bool("full", false, "run the FULL benchmark profile: pkg/vm fleet under -tags plus jank + IR compile under both VM variants. Slow (~25 min) — for mainline profiling and manual deep-dives.")
+		profile          = flag.String("profile", "", "named benchmark profile (e.g. 'pr-fast'). Mutually exclusive with -packages/-filter/-full. Sets the job list plus default count/benchtime/budget; explicit flags still override.")
+		wasm             = flag.Bool("wasm", false, "run benchmarks under GOOS=js/wasm via the go_js_wasm_exec shim (Node), reporting the machine as js/wasm. Forces -tags off (the wasm bundle ships the bytecode VM, not the lowered-Go path). Slower and noisier than native; for the wasm A/B gate.")
+		perfDataDir      = flag.String("perf-data-dir", "", "seed-baseline only: directory containing perf-data timeline snapshots (e.g., /path/to/perf-data/timeline)")
+		seedWindow       = flag.Int("seed-window", defaultSeedWindow, "seed-baseline only: how many recent snapshots per machine key to reduce. One snapshot is one CI run; seeding from a single run pins whatever that run happened to measure.")
+		seedCoherenceTol = flag.Float64("seed-coherence-tolerance", defaultSeedCoherenceTolerance, "seed-baseline only: reject a snapshot whose ratio_to_anchor values sit, in median, further than this fraction off the rest of its window. Catches a mixed capture; deliberately NOT a check on the anchor's absolute drift, which moves without the ratios moving.")
+		seedIterTol      = flag.Float64("seed-iteration-tolerance", defaultSeedIterationTolerance, "seed-baseline only: report a benchmark whose b.N spread across the window exceeds this fraction. Reported, not excluded.")
+		seedMinIters     = flag.Int64("seed-min-iterations", defaultSeedMinIterations, "seed-baseline only: report a benchmark whose median b.N falls below this. Reported, not excluded.")
+		seedArch         = flag.String("seed-arch", defaultSeedArch, "seed-baseline only: architecture to seed from (#651: amd64-only initial seed).")
+		seedMinWindow    = flag.Int("seed-min-window", defaultSeedMinWindow, "seed-baseline only: skip a machine key with fewer snapshots than this. A tier seeded from one or two runs has no window to disagree with, so every floor is a single observation.")
 	)
 	flag.Parse()
 
@@ -202,9 +218,9 @@ func main() {
 		mode = flag.Arg(0)
 	}
 	switch mode {
-	case "check", "update", "show", "capture", "aggregate", "snapshot", "machine-key":
+	case "check", "update", "show", "capture", "aggregate", "snapshot", "machine-key", "seed-baseline":
 	default:
-		die("unknown mode %q (want check / update / show / capture / aggregate / snapshot / machine-key)", mode)
+		die("unknown mode %q (want check / update / show / capture / aggregate / snapshot / machine-key / seed-baseline)", mode)
 	}
 
 	// machine-key: print the canonical machine token ("<arch>-<cpumodel>",
@@ -216,6 +232,31 @@ func main() {
 	// exact "<arch>/<CPUModel>" partition the timeline groups snapshots by.
 	if mode == "machine-key" {
 		fmt.Println(machineKey())
+		return
+	}
+
+	// seed-baseline: derive the baseline from perf-data timeline snapshots per
+	// #651. Filters to one architecture, preserves the existing M3 profile, and
+	// reduces a WINDOW of recent snapshots per machine key rather than trusting
+	// the newest one — see seed.go for why a single snapshot is not a baseline.
+	if mode == "seed-baseline" {
+		if *perfDataDir == "" {
+			die("seed-baseline requires -perf-data-dir <path>")
+		}
+		if *seedWindow < 1 {
+			die("-seed-window must be at least 1")
+		}
+		if *seedMinWindow < 1 || *seedMinWindow > *seedWindow {
+			die("-seed-min-window must be between 1 and -seed-window (%d)", *seedWindow)
+		}
+		seedBaseline(*baselinePath, *perfDataDir, seedOptions{
+			window:             *seedWindow,
+			coherenceTolerance: *seedCoherenceTol,
+			iterationTolerance: *seedIterTol,
+			minIterations:      *seedMinIters,
+			archPrefix:         *seedArch,
+			minWindow:          *seedMinWindow,
+		})
 		return
 	}
 
@@ -240,7 +281,7 @@ func main() {
 		if mode == "snapshot" {
 			writeSnapshot(*baselinePath, current)
 		} else {
-			writeOrCheck(*baselinePath, current, "update", *budget, *force, *format)
+			writeOrCheck(*baselinePath, current, "update", *budget, *force, *acceptDet, *format, nil)
 		}
 		return
 	}
@@ -289,6 +330,16 @@ func main() {
 		}
 	}
 
+	// The reduction needs at least 3 reps for a true median (count >= 4 gets
+	// warmup-discard + median, count 3 a plain median-of-3). Below that it
+	// degenerates to a single sample; runs that accept the tradeoff for
+	// wall-clock reasons still work, but the degradation must never be silent.
+	if effCount < 3 && mode != "show" {
+		fmt.Fprintf(os.Stderr, "bench-ratchet: WARNING: -count %d cannot form a median; "+
+			"use -count >= 3 (>= 4 adds a discarded warmup rep). Results are more outlier-sensitive.\n",
+			effCount)
+	}
+
 	if *outPath == "" {
 		*outPath = defaultRunPath()
 	}
@@ -331,7 +382,7 @@ func main() {
 	if mode == "snapshot" {
 		writeSnapshot(*baselinePath, current)
 	} else {
-		writeOrCheck(*baselinePath, current, mode, effBudget, *force, *format)
+		writeOrCheck(*baselinePath, current, mode, effBudget, *force, *acceptDet, *format, jobs)
 	}
 }
 
@@ -353,8 +404,11 @@ func writeSnapshot(path string, current MachineBaseline) {
 	fmt.Printf("\nwrote snapshot → %s (%d benchmarks for %s)\n", path, len(current.Benchmarks), key)
 }
 
-// writeOrCheck dispatches the post-aggregate action.
-func writeOrCheck(baselinePath string, current MachineBaseline, mode string, budget float64, force bool, format string) {
+// writeOrCheck dispatches the post-aggregate action. jobs is the capture
+// scope of THIS run (nil when aggregating from a pre-recorded .jsonl, where
+// the scope is unknown); check reporting uses it to suppress out-of-scope
+// baseline entries instead of listing them as MISSING.
+func writeOrCheck(baselinePath string, current MachineBaseline, mode string, budget float64, force, acceptDeterministic bool, format string, jobs []captureJob) {
 	switch mode {
 	case "show":
 		switch format {
@@ -366,10 +420,12 @@ func writeOrCheck(baselinePath string, current MachineBaseline, mode string, bud
 			die("unknown -format %q (want text / markdown / json)", format)
 		}
 	case "update":
-		// Ratchet semantics, scoped to THIS machine's profile: metrics only
-		// move toward faster / fewer-allocs / fewer-bytes, and only within the
-		// same {arch, cpu_model} profile so an M1 run never tightens an M3 bar.
-		// -force bypasses the ratchet for this profile.
+		// Ratchet semantics are scoped to THIS machine's profile: metrics only
+		// move toward faster / fewer-allocs / fewer-bytes, an M1 run never
+		// tightens an M3 timing bar, and -force replaces only this profile. The
+		// six known-unstable b.N=1 suite variants remain observational only,
+		// matching seed-baseline policy.
+		current = filterUnstableBenchmarks(current)
 		key := perfdata.MachineKey(current.Machine)
 		existing, err := readBaseline(baselinePath)
 		if err != nil {
@@ -382,9 +438,8 @@ func writeOrCheck(baselinePath string, current MachineBaseline, mode string, bud
 		prof, ok := existing.Machines[key]
 		switch {
 		case force:
-			fmt.Printf("  -force: writing current %s numbers as the new bar, bypassing ratchet.\n", key)
-			stampAll(&current)
-			existing.Machines[key] = current
+			fmt.Printf("  -force: writing current %s timing as the new bar, bypassing ratchet.\n", key)
+			printDeterministicRejections(forceRebaseline(&existing, key, current, acceptDeterministic))
 		case !ok:
 			fmt.Printf("  new machine profile %s — seeding its baseline.\n", key)
 			stampAll(&current)
@@ -406,8 +461,8 @@ func writeOrCheck(baselinePath string, current MachineBaseline, mode string, bud
 				baselinePath, err)
 		}
 		exit := 0
-		// Machine-independent gate: allocs/bytes are deterministic, so check
-		// them against the global-min across ALL profiles — this catches an
+		// Machine-independent gate: allocs/bytes are deterministic, so they are
+		// checked against the newest row any profile carries — catching an
 		// allocation regression on any machine, even one with no timing bar.
 		if compareDeterministic(machineIndependentBar(baseline), current, allocBudget) > 0 {
 			exit = 1
@@ -415,7 +470,7 @@ func writeOrCheck(baselinePath string, current MachineBaseline, mode string, bud
 		// Timing gate: ns/op and ratio_to_anchor are CPU-dependent, so gate
 		// them ONLY against this machine's own profile.
 		if prof, ok := baseline.Machines[key]; ok {
-			if e := compareAndReport(prof, current, budget, format); e != 0 {
+			if e := compareAndReport(prof, current, budget, format, jobs); e != 0 {
 				exit = e
 			}
 		} else {
@@ -426,6 +481,172 @@ func writeOrCheck(baselinePath string, current MachineBaseline, mode string, bud
 			os.Exit(exit)
 		}
 	}
+}
+
+// forceRebaseline replaces this machine's TIMING numbers with the accepted
+// ones, stamped with this run's commit. Entries the run did not measure are
+// retained: a fast-gate rebaseline must not erase the full-profile benchmark
+// history.
+//
+// Timing is where -force belongs. ns/op and ratio_to_anchor are properties of
+// the host, so a machine may legitimately re-declare its own; allocs/op and
+// bytes/op are properties of the code at a commit, and every profile is gated
+// against them, so a local recapture that allocates more is a regression on
+// every machine rather than a number this one gets to reset. Such values are
+// kept with their provenance and returned as rejections for the caller to
+// report; acceptDeterministic (-accept-deterministic) is the deliberate
+// override for a regression that has been justified on its own terms. An
+// improvement needs no override — it ratchets, as anywhere else.
+//
+// It writes only this profile. Accepted deterministic metrics reach the gate by
+// being the newest measurement of them, which machineIndependentBar selects on
+// its own — so no other profile needs to be told. Copying them into the other
+// profiles would record one machine's local capture as every other tier's
+// stored floor under this run's commit, which is both untrue of those tiers and
+// outside the window discipline their numbers are otherwise held to.
+func forceRebaseline(existing *Baseline, key string, current MachineBaseline, acceptDeterministic bool) []deterministicRejection {
+	stampAll(&current)
+	var rejected []deterministicRejection
+	// The bar every profile is gated against, resolved BEFORE this write. A
+	// value can be an improvement over THIS machine's stale row and still be a
+	// regression against the newest row any profile carries; since selection
+	// is by newest provenance, adopting and stamping it would make the worse
+	// value the bar and the regression would stop being reported. So a forced
+	// timing update is gated on both: the local row (below) and this.
+	globalBar := machineIndependentBar(*existing)
+	if previous, ok := existing.Machines[key]; ok {
+		for name, entry := range previous.Benchmarks {
+			cur, measured := current.Benchmarks[name]
+			if !measured {
+				current.Benchmarks[name] = entry
+				continue
+			}
+			if acceptDeterministic {
+				continue
+			}
+			// A stored value's date can be implicit in the profile it sat in,
+			// and this write re-stamps the profile, so resolve it now or it is
+			// gone. Each metric keeps or adopts on its own, so each keeps or
+			// adopts its own date with it. Only a metric measured WORSE keeps
+			// the stored value and its date; one measured equal or better
+			// carries this run's stamp from stampAll, the same confirmation
+			// rule ratchetMerge applies.
+			keptAllocsSHA, keptAllocsAt := allocsProvenance(previous, entry)
+			keptBytesSHA, keptBytesAt := bytesProvenance(previous, entry)
+			bar, barred := globalBar[name]
+			// A metric better than this machine's stale row can still be worse
+			// than the bar every profile is gated against. Adopting it would
+			// stamp it as the newest provenance and RAISE that bar, so the
+			// regression it represents would stop being reported. Either
+			// violation keeps the stored value and its date; the rejection
+			// names whichever bar was actually exceeded.
+			overGlobalAllocs := barred && bar.AllocsPerOp > 0 && cur.AllocsPerOp > bar.AllocsPerOp
+			overGlobalBytes := barred && bar.BytesPerOp > 0 && cur.BytesPerOp > bar.BytesPerOp
+			if cur.AllocsPerOp > entry.AllocsPerOp {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "allocs/op",
+					Kept: entry.AllocsPerOp, Measured: cur.AllocsPerOp,
+					SinceSHA: keptAllocsSHA,
+				})
+				cur.AllocsPerOp = entry.AllocsPerOp
+				cur.AllocsSinceSHA, cur.AllocsSinceAt = keptAllocsSHA, keptAllocsAt
+			} else if overGlobalAllocs {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "allocs/op",
+					Kept: bar.AllocsPerOp, Measured: cur.AllocsPerOp,
+					SinceSHA: bar.AllocsSinceSHA,
+				})
+				cur.AllocsPerOp = entry.AllocsPerOp
+				cur.AllocsSinceSHA, cur.AllocsSinceAt = keptAllocsSHA, keptAllocsAt
+			}
+			if cur.BytesPerOp > entry.BytesPerOp {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "bytes/op",
+					Kept: entry.BytesPerOp, Measured: cur.BytesPerOp,
+					SinceSHA: keptBytesSHA,
+				})
+				cur.BytesPerOp = entry.BytesPerOp
+				cur.BytesSinceSHA, cur.BytesSinceAt = keptBytesSHA, keptBytesAt
+			} else if overGlobalBytes {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "bytes/op",
+					Kept: bar.BytesPerOp, Measured: cur.BytesPerOp,
+					SinceSHA: bar.BytesSinceSHA,
+				})
+				cur.BytesPerOp = entry.BytesPerOp
+				cur.BytesSinceSHA, cur.BytesSinceAt = keptBytesSHA, keptBytesAt
+			}
+			current.Benchmarks[name] = cur
+		}
+	}
+	if !acceptDeterministic {
+		// A benchmark this machine has no prior row for is never visited by
+		// the loop above, so stampAll would publish it as the newest
+		// provenance unchecked. There is no local value to fall back to here,
+		// so a metric over the bar keeps the bar's own value and date.
+		previous := existing.Machines[key]
+		for name, cur := range current.Benchmarks {
+			if _, hadLocal := previous.Benchmarks[name]; hadLocal {
+				continue
+			}
+			bar, ok := globalBar[name]
+			if !ok {
+				continue
+			}
+			if bar.AllocsPerOp > 0 && cur.AllocsPerOp > bar.AllocsPerOp {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "allocs/op",
+					Kept: bar.AllocsPerOp, Measured: cur.AllocsPerOp,
+					SinceSHA: bar.AllocsSinceSHA,
+				})
+				cur.AllocsPerOp = bar.AllocsPerOp
+				cur.AllocsSinceSHA, cur.AllocsSinceAt = bar.AllocsSinceSHA, bar.AllocsSinceAt
+			}
+			if bar.BytesPerOp > 0 && cur.BytesPerOp > bar.BytesPerOp {
+				rejected = append(rejected, deterministicRejection{
+					Name: name, Metric: "bytes/op",
+					Kept: bar.BytesPerOp, Measured: cur.BytesPerOp,
+					SinceSHA: bar.BytesSinceSHA,
+				})
+				cur.BytesPerOp = bar.BytesPerOp
+				cur.BytesSinceSHA, cur.BytesSinceAt = bar.BytesSinceSHA, bar.BytesSinceAt
+			}
+			current.Benchmarks[name] = cur
+		}
+	}
+	existing.Machines[key] = current
+	sort.Slice(rejected, func(i, j int) bool {
+		if rejected[i].Name != rejected[j].Name {
+			return rejected[i].Name < rejected[j].Name
+		}
+		return rejected[i].Metric < rejected[j].Metric
+	})
+	return rejected
+}
+
+// printDeterministicRejections reports the allocs/bytes a -force run measured
+// worse than the stored bar. They are named in full because a forced timing
+// rebaseline is precisely when an allocation regression would otherwise be
+// written to disk unannounced.
+func printDeterministicRejections(rejected []deterministicRejection) {
+	if len(rejected) == 0 {
+		return
+	}
+	fmt.Printf("\n  NOT ACCEPTED (deterministic regression; stored bar kept — re-run with -accept-deterministic to record it):\n")
+	for _, r := range rejected {
+		fmt.Printf("    ! %-60s %-9s kept %d (since %s), measured %d\n",
+			short(r.Name, 60), r.Metric, r.Kept, shortSHA(r.SinceSHA), r.Measured)
+	}
+}
+
+// deterministicRejection is one allocs/bytes value a -force run measured worse
+// than the stored bar and therefore did not write.
+type deterministicRejection struct {
+	Name     string
+	Metric   string
+	Kept     int64
+	Measured int64
+	SinceSHA string
 }
 
 // RatchetSummary describes what ratchetMerge changed. Each named bench
@@ -469,6 +690,8 @@ func ratchetMerge(existing, current MachineBaseline) (MachineBaseline, RatchetSu
 		if !ok {
 			cur.BestSinceSHA = current.CapturedAtSHA
 			cur.BestSinceAt = current.CapturedAt
+			cur.AllocsSinceSHA, cur.AllocsSinceAt = current.CapturedAtSHA, current.CapturedAt
+			cur.BytesSinceSHA, cur.BytesSinceAt = current.CapturedAtSHA, current.CapturedAt
 			out.Benchmarks[name] = cur
 			summary.NewBench = append(summary.NewBench, SummaryEntry{Name: name, NSPerOp: cur.NSPerOp})
 			continue
@@ -478,6 +701,29 @@ func ratchetMerge(existing, current MachineBaseline) (MachineBaseline, RatchetSu
 			AllocsPerOp:   minI(cur.AllocsPerOp, base.AllocsPerOp),
 			BytesPerOp:    minI(cur.BytesPerOp, base.BytesPerOp),
 			RatioToAnchor: minF(cur.RatioToAnchor, base.RatioToAnchor),
+		}
+		// Each deterministic metric carries its own stamp, moved by any run that
+		// CONFIRMS that metric — measures it equal to or better than the stored
+		// value — regardless of whether the value itself changed. A run that
+		// only remeasures the same allocs/bytes is still current evidence that
+		// this code state holds that floor, and the gate ranks rows by newest
+		// evidence, not by whichever run last changed the number. Only a run
+		// that measures a metric WORSE leaves that metric's value and stamp
+		// alone — the ratchet only tightens. Sharing one stamp across both
+		// metrics would date a value this run never produced — the timing stamp
+		// dates a run that only got faster, and a pair stamp dates a kept metric
+		// to the run that moved the other one — so the two are judged
+		// independently against the run that actually measured them (cur), not
+		// against the merged (already-minimized) value.
+		if cur.AllocsPerOp <= base.AllocsPerOp {
+			merged.AllocsSinceSHA, merged.AllocsSinceAt = current.CapturedAtSHA, current.CapturedAt
+		} else {
+			merged.AllocsSinceSHA, merged.AllocsSinceAt = base.AllocsSinceSHA, base.AllocsSinceAt
+		}
+		if cur.BytesPerOp <= base.BytesPerOp {
+			merged.BytesSinceSHA, merged.BytesSinceAt = current.CapturedAtSHA, current.CapturedAt
+		} else {
+			merged.BytesSinceSHA, merged.BytesSinceAt = base.BytesSinceSHA, base.BytesSinceAt
 		}
 		tightened := merged.RatioToAnchor < base.RatioToAnchor ||
 			merged.AllocsPerOp < base.AllocsPerOp ||
@@ -557,6 +803,8 @@ func stampAll(b *MachineBaseline) {
 	for name, e := range b.Benchmarks {
 		e.BestSinceSHA = b.CapturedAtSHA
 		e.BestSinceAt = b.CapturedAt
+		e.AllocsSinceSHA, e.AllocsSinceAt = b.CapturedAtSHA, b.CapturedAt
+		e.BytesSinceSHA, e.BytesSinceAt = b.CapturedAtSHA, b.CapturedAt
 		b.Benchmarks[name] = e
 	}
 }
@@ -678,7 +926,7 @@ var profiles = map[string]profile{
 		// Sized for fast PR feedback, not absolute precision: ~53 cases ×
 		// count 3 × 500ms keeps a two-pass A/B well under the old full-fleet
 		// runtime, and the 12% budget sits above the residual sub-µs jitter.
-		count:     3,
+		count:     4,
 		benchtime: "500ms",
 		budget:    0.12,
 		jobs: func(tags string) ([]captureJob, error) {
@@ -731,12 +979,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: tags, filter: filterRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -765,12 +1013,12 @@ func buildJobs(packages, tags string, full, manual bool, filterRE *regexp.Regexp
 		}
 		jobs := []captureJob{
 			{pkg: anchorPackage, tags: "", filter: anchorRE},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 1},
-			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 1, env: []string{"LG_SUITE_IR=1"}},
-			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 1, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteRE, variant: "ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteRE, variant: "aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_bytecode", count: 4},
+			{pkg: suitePackage, tags: "", filter: suiteTotalRE, variant: "total_ir_bytecode", count: 4, env: []string{"LG_SUITE_IR=1"}},
+			{pkg: suitePackage, tags: "gogen_ir", filter: suiteTotalRE, variant: "total_aot_native", count: 4, env: []string{"LG_SUITE_IR=1"}},
 			{pkg: irCompilePackage, tags: "", filter: irCompileRE, variant: "bytecode"},
 			{pkg: irCompilePackage, tags: "gogen_ir", filter: irCompileRE, variant: "gogen_ir"},
 			{pkg: initPackage, tags: "", filter: initRE, variant: "bytecode"},
@@ -927,9 +1175,44 @@ func captureOnePackage(pkg string, count int, benchtime, timeout, tags string, f
 	return written, nil
 }
 
+// reduceSamples collapses chronological per-rep measurements into one
+// robust value, hyperfine-style: with more than one rep, the FIRST is
+// discarded as warmup (cold caches, first-touch var resolution, and
+// CPU clock ramp make it the systematically slowest — the suite bench
+// visibly climbs across in-process reps), and the median of the rest
+// is taken. Median, not mean: a single contention spike or GC pause
+// skews an average straight into the stored baseline, which is how a
+// concurrently-running pass once manufactured six phantom regressions.
+//
+// Exactly three reps take the plain median of all three: the median
+// already rejects the systematically-slow cold rep, whereas discarding
+// it first would leave two samples and force a mean — the estimator
+// this function exists to avoid. This keeps -count 3 callers (the
+// perf-timeline ubuntu leg, whose measured budget can't fit count 4,
+// see #573) on a true median. With one rep (legacy captures, -count 1)
+// the value passes through.
+func reduceSamples(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	// n==2 still discards the cold rep (a single warm sample beats a mean
+	// that averages the cold rep in).
+	if len(vals) > 3 || len(vals) == 2 {
+		vals = vals[1:]
+	}
+	s := append([]float64(nil), vals...)
+	sort.Float64s(s)
+	if n := len(s); n%2 == 1 {
+		return s[n/2]
+	} else {
+		return (s[n/2-1] + s[n/2]) / 2
+	}
+}
+
 // aggregateFromFile reads a .jsonl of StreamRecord lines and returns
-// a Baseline computed from them. Same-named records (e.g. multiple
-// -count repetitions) are averaged.
+// a Baseline computed from them. Same-named records (multiple -count
+// repetitions, in capture order) reduce via reduceSamples: median, with
+// the first rep discarded as warmup when enough reps allow it.
 func aggregateFromFile(path string) (MachineBaseline, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -938,12 +1221,11 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 	defer f.Close()
 
 	type accum struct {
-		pkg                       string
-		name                      string
-		count                     int
-		nsSum, bytesSum, allocSum float64
-		iters                     int64
-		samples                   []BenchmarkSample
+		pkg               string
+		name              string
+		ns, bytes, allocs []float64
+		iters             int64
+		samples           []BenchmarkSample
 	}
 	byName := map[string]*accum{}
 	dec := json.NewDecoder(f)
@@ -958,10 +1240,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			a = &accum{pkg: rec.Package, name: rec.Name}
 			byName[key] = a
 		}
-		a.count++
-		a.nsSum += rec.NSPerOp
-		a.bytesSum += float64(rec.BytesPerOp)
-		a.allocSum += float64(rec.AllocsPerOp)
+		a.ns = append(a.ns, rec.NSPerOp)
+		a.bytes = append(a.bytes, float64(rec.BytesPerOp))
+		a.allocs = append(a.allocs, float64(rec.AllocsPerOp))
 		if rec.Iterations > a.iters {
 			a.iters = rec.Iterations
 		}
@@ -974,9 +1255,9 @@ func aggregateFromFile(path string) (MachineBaseline, error) {
 			Package:     a.pkg,
 			Name:        a.name,
 			Iterations:  a.iters,
-			NSPerOp:     a.nsSum / float64(a.count),
-			BytesPerOp:  int64(a.bytesSum / float64(a.count)),
-			AllocsPerOp: int64(a.allocSum / float64(a.count)),
+			NSPerOp:     reduceSamples(a.ns),
+			BytesPerOp:  int64(reduceSamples(a.bytes)),
+			AllocsPerOp: int64(reduceSamples(a.allocs)),
 			Samples:     append([]BenchmarkSample(nil), a.samples...),
 		})
 	}
@@ -1150,12 +1431,163 @@ func slugify(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// gitShortSHA reports the commit whose tree these benchmarks measured, as the
+// 12-character id recorded in a capture filename and in a profile's
+// CapturedAtSHA — which is provenance: machineIndependentBar selects a bar by
+// it, so a wrong value silently attributes a measurement to code that did not
+// produce it.
+//
+// `git rev-parse HEAD` cannot answer that in a jj repository. jj keeps ONE git
+// HEAD for the whole colocated repo, tracking whatever the default workspace
+// last exported, so every `jj workspace` shares it no matter which commit the
+// workspace is actually on. Observed here: a workspace sitting on main
+// (6cdeb6d0) with a clean working copy reported efcd30925663 — a bookmarkless
+// local commit that is not an ancestor of main@upstream and never will be. The
+// failure is silent and the recorded SHA looks plausible, so it survives
+// review; baselines on this machine carried an unreachable stamp for days.
+//
+// So ask jj for the commit this workspace is on, and fall back to git only
+// when jj is absent or errors (a plain git checkout, or a jj version whose
+// template syntax differs).
 func gitShortSHA() string {
+	if sha := jjWorkspaceSHA(); sha != "" {
+		warnUnpublishedSHA(sha)
+		return sha
+	}
 	out, err := exec.Command("git", "rev-parse", "--short=12", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// unpublishedWarned keeps the notice to one line per run; gitShortSHA is
+// called for both the capture filename and the profile's CapturedAtSHA.
+var unpublishedWarned sync.Once
+
+// warnUnpublishedSHA says so when the recorded provenance names a commit that
+// exists only in this repository. Writing such a baseline is legitimate — it
+// is how a local experiment is measured — but a reviewer reading the stamp
+// later cannot fetch it, so the run is not reproducible by anyone else until
+// the commit is pushed. Saying it at capture time is the only moment the
+// operator can still act on it.
+func warnUnpublishedSHA(sha string) {
+	if capturedSHAIsPublished(sha) {
+		return
+	}
+	unpublishedWarned.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"bench-ratchet: warning: recording SHA %s, which is not reachable from any remote-tracking ref.\n"+
+				"  The measured tree exists only in this repository, so a baseline stamped with it\n"+
+				"  cannot be reproduced by anyone who has not fetched that commit. Push it, or pass\n"+
+				"  -sha <published commit> if this run represents one.\n", sha)
+	})
+}
+
+// jjWorkspaceSHA returns this jj workspace's commit as a git-resolvable
+// 12-character sha, or "" when the directory is not in a jj repository.
+//
+// jj stores its commits in the git object store, so a jj commit id IS a git
+// sha: `git cat-file -t` reports "commit" for it, and jj pins it with a
+// refs/jj/keep/<sha> ref so it survives gc. The conversion this function
+// performs is therefore not a translation between id spaces — it is choosing
+// WHICH commit describes the measured tree, which is the part `git rev-parse
+// HEAD` gets wrong.
+//
+// It resolves to a STABLE commit rather than to @ unconditionally. jj rewrites
+// the working-copy commit on every snapshot, and for a clean checkout @ is an
+// empty commit that exists only in this repo. When @ is empty the tree being
+// measured IS the parent's tree, so the parent is both the truthful and the
+// durable answer — typically a pushed commit such as main's tip, which anyone
+// can check out with plain git. When @ is non-empty the working copy genuinely
+// differs from every named commit, and @'s own id is the only thing that
+// identifies what ran; see capturedSHAIsPublished for what that costs.
+//
+// The command deliberately snapshots (no --ignore-working-copy): emptiness has
+// to be judged against the files the benchmark just read, not a stale snapshot.
+func jjWorkspaceSHA() string {
+	const tmpl = `if(empty, parents.map(|p| p.commit_id().short(12)).join(" "), commit_id.short(12))`
+	out, err := exec.Command("jj", "log", "--no-graph", "-r", "@", "-T", tmpl).Output()
+	if err != nil {
+		return ""
+	}
+	// An empty @ with several parents is a merge; no single commit describes
+	// that tree, so fall through to @ itself rather than picking one arbitrarily.
+	fields := strings.Fields(string(out))
+	if len(fields) != 1 {
+		out, err = exec.Command("jj", "log", "--no-graph", "-r", "@", "-T", "commit_id.short(12)").Output()
+		if err != nil {
+			return ""
+		}
+		fields = strings.Fields(string(out))
+	}
+	if len(fields) != 1 {
+		return ""
+	}
+	sha := fields[0]
+
+	// Guarantee plain git can resolve what we are about to record. jj exports
+	// to git lazily, so ask it to sync before concluding the object is absent.
+	if !gitHasCommit(sha) {
+		_ = exec.Command("jj", "git", "export").Run()
+		if !gitHasCommit(sha) {
+			return ""
+		}
+	}
+	return sha
+}
+
+// gitDir returns the path to the git directory for this repository, or ""
+// if it cannot be determined. Handles jj workspaces that may not have .git
+// in their working directory.
+func gitDir() string {
+	// Try jj first: it knows the git directory even for secondary workspaces
+	// that don't have .git in their working tree.
+	out, err := exec.Command("jj", "git", "root").Output()
+	if err == nil && len(out) > 0 {
+		return strings.TrimSpace(string(out))
+	}
+	// Fall back to git: works for plain git checkouts, and is the user's
+	// configuration if jj is not in use.
+	out, err = exec.Command("git", "rev-parse", "--git-dir").Output()
+	if err == nil && len(out) > 0 {
+		return strings.TrimSpace(string(out))
+	}
+	return ""
+}
+
+// gitHasCommit reports whether git can resolve sha to a commit object in
+// this repository's git directory.
+func gitHasCommit(sha string) bool {
+	gdir := gitDir()
+	if gdir == "" {
+		return false
+	}
+	return exec.Command("git", "--git-dir="+gdir, "cat-file", "-e", sha+"^{commit}").Run() == nil
+}
+
+// capturedSHAIsPublished reports whether sha is reachable from a
+// remote-tracking ref, i.e. whether someone who cloned this repository could
+// check the commit out.
+//
+// This is the difference between a sha that documents a measurement and one
+// that merely labels it. jj keeps every local commit alive under
+// refs/jj/keep/<sha>, which makes it resolvable HERE and is never pushed, so
+// reachability from refs/remotes/* is the only honest test of whether a
+// non-jj user could reproduce the run.
+func capturedSHAIsPublished(sha string) bool {
+	gdir := gitDir()
+	if gdir == "" {
+		return true
+	}
+	out, err := exec.Command("git", "--git-dir="+gdir, "for-each-ref", "--contains", sha,
+		"--format=%(refname)", "refs/remotes/").Output()
+	if err != nil {
+		// An older git without --contains on for-each-ref cannot answer;
+		// stay silent rather than warn on a false negative.
+		return true
+	}
+	return len(strings.Fields(string(out))) > 0
 }
 
 func writeBaseline(path string, b Baseline) error {
@@ -1310,35 +1742,157 @@ func canonicalizeBenchmarks(bm map[string]BenchmarkEntry) map[string]BenchmarkEn
 	return out
 }
 
+// allocsProvenance and bytesProvenance return the commit identity and time one
+// entry's allocs/op, respectively bytes/op, was measured at. Each metric is
+// asked separately because the ratchet keeps each one's minimum separately: a
+// stored pair can hold this run's allocs beside an older run's bytes, and no
+// single date describes that.
+//
+// Three cases, per metric:
+//
+//  1. the metric's own since_* stamp when set — the run that recorded it.
+//  2. otherwise, for an entry with no best_since_* either: the profile's
+//     captured_at_sha / captured_at. No best_since means the entry has never
+//     been ratcheted, so seed or capture wrote every one of its numbers in the
+//     run the profile records, and that run IS their provenance.
+//  3. otherwise UNKNOWN, which sorts oldest.
+//
+// Case 3 is the one best_since cannot answer: it moves whenever ANY metric of
+// the entry improves, so on a ratcheted row it may date a timing win while the
+// allocs/bytes were pinned from an older run. The profile's captured_at is no
+// better there — it dates the run that wrote the file, not the run that set a
+// bar the ratchet has carried forward.
+func allocsProvenance(prof MachineBaseline, e BenchmarkEntry) (sha, at string) {
+	if e.AllocsSinceSHA != "" || e.AllocsSinceAt != "" {
+		return e.AllocsSinceSHA, e.AllocsSinceAt
+	}
+	return unratchetedProvenance(prof, e)
+}
+
+func bytesProvenance(prof MachineBaseline, e BenchmarkEntry) (sha, at string) {
+	if e.BytesSinceSHA != "" || e.BytesSinceAt != "" {
+		return e.BytesSinceSHA, e.BytesSinceAt
+	}
+	return unratchetedProvenance(prof, e)
+}
+
+func unratchetedProvenance(prof MachineBaseline, e BenchmarkEntry) (sha, at string) {
+	if e.BestSinceSHA == "" && e.BestSinceAt == "" {
+		return prof.CapturedAtSHA, prof.CapturedAt
+	}
+	return "", ""
+}
+
 // machineIndependentBar collapses every machine profile into one bar of the
-// DETERMINISTIC metrics (allocs/op, bytes/op) per benchmark, taking the global
-// minimum across profiles. allocs/bytes don't depend on the CPU, so this bar is
-// valid to gate against on any machine — including one with no timing profile.
+// DETERMINISTIC metrics (allocs/op, bytes/op) per benchmark.
+//
+// allocs/op and bytes/op are a property of the CODE at a commit, not of the CPU
+// — which is why they can be gated on any machine, including one with no timing
+// profile. That same fact is why a minimum ACROSS profiles is the wrong
+// reduction. Profiles are captured at whatever commit their machine last ran at,
+// and a tier keeps its last numbers indefinitely once its runner stops
+// reporting, so the profiles present at any moment describe several different
+// code states. A minimum over them answers "the least anyone has ever measured",
+// which is a fact about the fleet's history rather than about any one commit,
+// and gates current code against whichever code state happened to allocate
+// least.
+//
+// So the reference for each benchmark is the value with the NEWEST provenance
+// among the profiles that carry it — the most recent commit anyone measured it
+// at — with same-commit rows reduced to their minimum, so the bar still
+// ratchets across repeated measurements of one code state. A value with no
+// provenance at all sorts oldest: it is only the reference when nothing better
+// exists.
+//
+// allocs/op and bytes/op are selected SEPARATELY, because they are dated
+// separately. A profile can hold a freshly measured allocs figure beside a
+// bytes figure the ratchet kept from an older run, and taking both from
+// whichever row won on one of them would either discard the fresh measurement
+// or adopt the stale one.
+//
+// Same-commit rows are recognised by the SHA, not the clock. Two machines run
+// one commit at whatever times their queues allow, so equal timestamps neither
+// identify a shared code state nor are needed to: rows that name the same
+// commit are two measurements of one code state and reduce to their minimum,
+// while rows from different commits are ranked even when their timestamps
+// collide, because mixing them would describe code that never existed. A merged
+// group is then ranked by its NEWEST member, since its claim on describing
+// current code rests on its latest capture, not on whichever profile happened to
+// be read first.
+//
+// Ranking is by the recorded timestamp, not by commit topology — a SHA alone
+// cannot be ordered without the repository, and a baseline is read on machines
+// that may not have the history. Every timestamp this tool writes is
+// time.RFC3339 in UTC, so a string compare orders them; the SHA breaks a
+// remaining timestamp tie so the choice does not depend on map order.
 func machineIndependentBar(b Baseline) map[string]BenchmarkEntry {
-	bar := map[string]BenchmarkEntry{}
-	for _, prof := range b.Machines {
-		for name, e := range prof.Benchmarks {
-			if cur, ok := bar[name]; ok {
-				cur.AllocsPerOp = minI(cur.AllocsPerOp, e.AllocsPerOp)
-				cur.BytesPerOp = minI(cur.BytesPerOp, e.BytesPerOp)
-				bar[name] = cur
-			} else {
-				bar[name] = BenchmarkEntry{AllocsPerOp: e.AllocsPerOp, BytesPerOp: e.BytesPerOp}
+	type metricBar struct {
+		value    int64
+		sha, at  string
+		selected bool
+	}
+	// consider folds one measurement into the running selection for one metric.
+	consider := func(cur metricBar, value int64, sha, at string) metricBar {
+		cand := metricBar{value: value, sha: sha, at: at, selected: true}
+		switch {
+		case !cur.selected:
+			return cand
+		case cand.sha == cur.sha:
+			cur.value = minI(cur.value, cand.value)
+			if cand.at > cur.at {
+				cur.at = cand.at
 			}
+			return cur
+		case cand.at != cur.at:
+			if cand.at > cur.at {
+				return cand
+			}
+			return cur
+		case cand.sha > cur.sha:
+			return cand
+		default:
+			return cur
+		}
+	}
+	allocs := map[string]metricBar{}
+	bytes := map[string]metricBar{}
+	names := map[string]bool{}
+	for _, key := range profileKeys(b) {
+		prof := b.Machines[key]
+		for name, e := range prof.Benchmarks {
+			names[name] = true
+			aSHA, aAt := allocsProvenance(prof, e)
+			bSHA, bAt := bytesProvenance(prof, e)
+			allocs[name] = consider(allocs[name], e.AllocsPerOp, aSHA, aAt)
+			bytes[name] = consider(bytes[name], e.BytesPerOp, bSHA, bAt)
+		}
+	}
+	bar := make(map[string]BenchmarkEntry, len(names))
+	for name := range names {
+		a, by := allocs[name], bytes[name]
+		bar[name] = BenchmarkEntry{
+			AllocsPerOp:    a.value,
+			AllocsSinceSHA: a.sha,
+			AllocsSinceAt:  a.at,
+			BytesPerOp:     by.value,
+			BytesSinceSHA:  by.sha,
+			BytesSinceAt:   by.at,
 		}
 	}
 	return bar
 }
 
 // compareDeterministic gates the machine-independent allocs/op and bytes/op of
-// current against the global-min bar, with allocBudget tolerance. Prints any
-// regressions and returns their count. Runs regardless of whether a timing
-// profile exists for this machine.
+// current against the bar machineIndependentBar selected — the value measured
+// at the newest commit that has each benchmark — with allocBudget tolerance.
+// Prints any regressions and returns their count. Runs regardless of whether a
+// timing profile exists for this machine.
 func compareDeterministic(bar map[string]BenchmarkEntry, current MachineBaseline, budget float64) int {
 	type reg struct {
 		name, metric string
 		base, cur    int64
 		delta        float64
+		sinceSHA     string
 	}
 	var regs []reg
 	names := make([]string, 0, len(current.Benchmarks))
@@ -1352,24 +1906,25 @@ func compareDeterministic(bar map[string]BenchmarkEntry, current MachineBaseline
 		if !ok {
 			continue
 		}
-		check := func(metric string, b, c int64) {
+		check := func(metric string, b, c int64, sinceSHA string) {
 			if b <= 0 {
 				return
 			}
 			if d := float64(c-b) / float64(b); d > budget {
-				regs = append(regs, reg{n, metric, b, c, d})
+				regs = append(regs, reg{n, metric, b, c, d, sinceSHA})
 			}
 		}
-		check("allocs/op", base.AllocsPerOp, cur.AllocsPerOp)
-		check("bytes/op", base.BytesPerOp, cur.BytesPerOp)
+		check("allocs/op", base.AllocsPerOp, cur.AllocsPerOp, base.AllocsSinceSHA)
+		check("bytes/op", base.BytesPerOp, cur.BytesPerOp, base.BytesSinceSHA)
 	}
 	if len(regs) == 0 {
-		fmt.Printf("deterministic (allocs/bytes, machine-independent): OK — within %.0f%% of global min\n", budget*100)
+		fmt.Printf("deterministic (allocs/bytes, machine-independent): OK — within %.0f%% of the newest measured row\n", budget*100)
 		return 0
 	}
-	fmt.Printf("\ndeterministic regressions (machine-independent, > %.0f%% of global min):\n", budget*100)
+	fmt.Printf("\ndeterministic regressions (machine-independent, > %.0f%% of the newest measured row):\n", budget*100)
 	for _, r := range regs {
-		fmt.Printf("  %-55s %-10s %d -> %d  (%+.1f%%)\n", short(r.name, 55), r.metric, r.base, r.cur, r.delta*100)
+		fmt.Printf("  %-55s %-10s %d -> %d  (%+.1f%%)  since %s\n",
+			short(r.name, 55), r.metric, r.base, r.cur, r.delta*100, shortSHA(r.sinceSHA))
 	}
 	return len(regs)
 }
@@ -1383,9 +1938,46 @@ func printBaseline(b MachineBaseline) {
 // non-zero exit code when any benchmark exceeded the regression budget.
 // format is "text" (default ANSI terminal) or "markdown" (a single
 // GitHub/Slack-friendly table).
-func compareAndReport(baseline, current MachineBaseline, budget float64, format string) int {
+// jobsSelect reports whether fullName (Package + "." + Name, where Name may
+// carry "/sub" segments and a " [variant]" suffix) is selected by any of this
+// run's capture jobs. Check reporting uses it to distinguish a benchmark that
+// is in scope but absent from the run (deleted/renamed — a real MISSING
+// signal) from a baseline entry outside the active profile's scope (e.g. the
+// pkg/vm micro fleet when running the fast gate), which was never going to be
+// measured and must not be reported row-by-row.
+func jobsSelect(jobs []captureJob, fullName string) bool {
+	for _, j := range jobs {
+		rest, ok := strings.CutPrefix(fullName, j.pkg+".")
+		if !ok {
+			continue
+		}
+		// Variant label must agree: variant jobs stamp " [v]" onto the name;
+		// the variant-free anchor job records no label.
+		if j.variant != "" {
+			r2, ok := strings.CutSuffix(rest, " ["+j.variant+"]")
+			if !ok {
+				continue
+			}
+			rest = r2
+		} else if strings.Contains(rest, " [") {
+			continue
+		}
+		// go test -bench matches per slash-segment and the job filters are
+		// family-anchored, so match the family segment only.
+		family := rest
+		if i := strings.IndexByte(family, '/'); i >= 0 {
+			family = family[:i]
+		}
+		if j.filter.MatchString(family) {
+			return true
+		}
+	}
+	return false
+}
+
+func compareAndReport(baseline, current MachineBaseline, budget float64, format string, jobs []captureJob) int {
 	if format == "markdown" {
-		return compareAndReportMarkdown(baseline, current, budget)
+		return compareAndReportMarkdown(baseline, current, budget, jobs)
 	}
 	fmt.Println()
 	if baseline.Machine.CPUModel != current.Machine.CPUModel ||
@@ -1401,6 +1993,20 @@ func compareAndReport(baseline, current MachineBaseline, budget float64, format 
 		anchorDrift := (current.Anchor.NSPerOp - baseline.Anchor.NSPerOp) / baseline.Anchor.NSPerOp
 		fmt.Printf("anchor: baseline %.3f ns/op, current %.3f ns/op (%+.1f%%)\n",
 			baseline.Anchor.NSPerOp, current.Anchor.NSPerOp, anchorDrift*100)
+		// The anchor is the divisor for EVERY normalized ratio: on identical
+		// hardware+toolchain it should be stable to a few percent. A large
+		// drift means the anchor ran in a different CPU regime on one side
+		// (P-core vs E-core scheduling, thermal throttle, a concurrent
+		// load) — and every REGRESSION/ok verdict below is scaled by the
+		// same bogus factor. Observed in practice as a bimodal ~1.06 vs
+		// ~1.85 ns anchor on an M3 manufacturing phantom +38% regressions.
+		if anchorDrift < -0.15 || anchorDrift > 0.15 {
+			fmt.Printf("WARNING: anchor moved %+.1f%% on the same machine class — normalized\n", anchorDrift*100)
+			fmt.Printf("  ratios below are scaled by this factor and NOT trustworthy. Likely a\n")
+			fmt.Printf("  polluted capture (CPU scheduling/thermal/concurrent load) on one side;\n")
+			fmt.Printf("  re-run on a quiet machine, and if the drift persists recapture the\n")
+			fmt.Printf("  baseline (bench-ratchet update -force) from a clean checkout.\n")
+		}
 	}
 	fmt.Println()
 
@@ -1412,8 +2018,16 @@ func compareAndReport(baseline, current MachineBaseline, budget float64, format 
 		present             bool
 	}
 	var drifts []drift
+	outOfScope := 0
 	for name, base := range baseline.Benchmarks {
 		cur, ok := current.Benchmarks[name]
+		// A baseline entry the active profile never selects (e.g. the full
+		// pkg/vm fleet while running the fast gate) is out of scope, not
+		// missing — count it once, don't report it row-by-row.
+		if !ok && len(jobs) > 0 && !jobsSelect(jobs, name) {
+			outOfScope++
+			continue
+		}
 		d := drift{
 			name:      name,
 			baseRatio: base.RatioToAnchor,
@@ -1471,6 +2085,9 @@ func compareAndReport(baseline, current MachineBaseline, budget float64, format 
 	fmt.Println()
 	fmt.Printf("summary: %d regression(s) > %.1f%% budget, %d missing, %d new\n",
 		regressions, budget*100, missing, newCount)
+	if outOfScope > 0 {
+		fmt.Printf("(%d baseline benchmark(s) outside this profile's scope — not run, not compared)\n", outOfScope)
+	}
 	if regressions > 0 {
 		return 1
 	}
@@ -1537,7 +2154,7 @@ func formatWall(ns float64) string {
 //
 // The output is also Slack-friendly when wrapped in a code block, since
 // Slack renders the pipes monospace.
-func compareAndReportMarkdown(baseline, current MachineBaseline, budget float64) int {
+func compareAndReportMarkdown(baseline, current MachineBaseline, budget float64, jobs []captureJob) int {
 	type row struct {
 		name          string
 		baseR, curR   float64
@@ -1551,12 +2168,20 @@ func compareAndReportMarkdown(baseline, current MachineBaseline, budget float64)
 	regressions := 0
 	missing := 0
 	newCount := 0
+	outOfScope := 0
 
 	for name, base := range baseline.Benchmarks {
 		seen[name] = true
 		r := row{name: name, baseR: base.RatioToAnchor, baseNs: base.NSPerOp, bestSinceSHA: base.BestSinceSHA}
 		cur, ok := current.Benchmarks[name]
 		if !ok {
+			// Outside the active profile's scope → never run; count once
+			// instead of emitting a MISSING row per benchmark. (nil jobs =
+			// scope unknown, e.g. aggregate-from-file → classic MISSING.)
+			if len(jobs) > 0 && !jobsSelect(jobs, name) {
+				outOfScope++
+				continue
+			}
 			r.status = "MISSING"
 			missing++
 			rows = append(rows, r)
@@ -1595,6 +2220,9 @@ func compareAndReportMarkdown(baseline, current MachineBaseline, budget float64)
 	fmt.Println()
 	fmt.Printf("**bench-ratchet** — %d regression(s) > %.1f%% budget, %d missing, %d new\n\n",
 		regressions, budget*100, missing, newCount)
+	if outOfScope > 0 {
+		fmt.Printf("_%d baseline benchmark(s) outside this profile's scope — not run, not compared._\n\n", outOfScope)
+	}
 	fmt.Printf("- baseline: `%s` / `%s` / `%s`\n",
 		baseline.Machine.CPUModel, baseline.Machine.GoVersion, baseline.Machine.OS+"-"+baseline.Machine.Arch)
 	fmt.Printf("- current:  `%s` / `%s` / `%s`\n",
@@ -1603,6 +2231,17 @@ func compareAndReportMarkdown(baseline, current MachineBaseline, budget float64)
 		anchorDrift := (current.Anchor.NSPerOp - baseline.Anchor.NSPerOp) / baseline.Anchor.NSPerOp
 		fmt.Printf("- anchor: baseline `%.3f ns/op`, current `%.3f ns/op` (`%+.1f%%`)\n\n",
 			baseline.Anchor.NSPerOp, current.Anchor.NSPerOp, anchorDrift*100)
+		// The markdown reports (perf-pr.yml / perf-wasm.yml) are exactly the
+		// surface the phantom-regression incident is meant to expose, so the
+		// same >15% anchor-drift warning the text path emits must render here —
+		// otherwise a polluted capture publishes a trustworthy-looking verdict.
+		if anchorDrift < -0.15 || anchorDrift > 0.15 {
+			fmt.Printf("> **⚠️ anchor moved %+.1f%% on the same machine class — normalized.**\n", anchorDrift*100)
+			fmt.Printf("> The ratios below are scaled by this factor and are **not trustworthy** —\n")
+			fmt.Printf("> likely a polluted capture (CPU scheduling / thermal / concurrent load) on\n")
+			fmt.Printf("> one side. Re-run on a quiet machine; if the drift persists, recapture the\n")
+			fmt.Printf("> baseline (`bench-ratchet update -force`) from a clean checkout.\n\n")
+		}
 	} else {
 		fmt.Println()
 	}
@@ -1695,6 +2334,33 @@ func formatWallMD(ns float64) string {
 	default:
 		return fmt.Sprintf("%.3g s", ns/1_000_000_000)
 	}
+}
+
+// filterUnstableBenchmarks drops the known-unstable b.N=1 suite variants from a
+// profile, so `update` writes the same benchmark set that `seed-baseline` does.
+//
+// The exclusion prefixes come from unstableBenchmarks in seed.go rather than a
+// second copy here: the two paths disagreeing about which benchmarks are
+// ratchetable is exactly the failure a duplicated list invites.
+func filterUnstableBenchmarks(mb MachineBaseline) MachineBaseline {
+	if mb.Benchmarks == nil {
+		return mb
+	}
+	filtered := make(map[string]BenchmarkEntry, len(mb.Benchmarks))
+	for name, entry := range mb.Benchmarks {
+		unstable := false
+		for _, prefix := range unstableBenchmarks {
+			if strings.HasPrefix(name, prefix) {
+				unstable = true
+				break
+			}
+		}
+		if !unstable {
+			filtered[name] = entry
+		}
+	}
+	mb.Benchmarks = filtered
+	return mb
 }
 
 func die(format string, args ...any) {

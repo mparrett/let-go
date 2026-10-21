@@ -1,7 +1,7 @@
 ---
 status: active
-last-verified: 2026-07-13
-human-verified:
+last-verified: 2026-10-11
+human-verified: 2026-08-11
 ---
 
 # Clojure compatibility and differences
@@ -21,26 +21,34 @@ with no known failures, compile skips, panic skips, or runtime skips.
 | `clojure.string`     | full                                                                                                                                                                                          |
 | `clojure.set`        | full                                                                                                                                                                                          |
 | `clojure.walk`       | `prewalk`, `postwalk`, `keywordize-keys`, `stringify-keys`, `walk`                                                                                                                            |
-| `clojure.edn`        | `read`, `read-string`                                                                                                                                                                         |
-| `clojure.pprint`     | `pprint`, `cl-format`                                                                                                                                                                         |
-| `clojure.test`       | `deftest`, `is`, `testing`, `are`, fixtures                                                                                                                                                   |
+| `clojure.edn`        | `read-string` (with `:readers`, `:default`, `:eof` options), `read-all-string`                                                                                                                |
+| `clojure.pprint`     | `pprint`, `cl-format` (aesthetic/radix/iteration/conditional/justify directives), `print-table`                                                                                                |
+| `clojure.repl`       | `dir`, `apropos`, `doc`, `find-doc`, `source`                                                                                                                                                 |
+| `clojure.test`       | `deftest`, `is`, `testing`, `are`, fixtures, `run-tests`, `run-test-var`/`run-test` (single var)                                                                                               |
 | `clojure.core.async` | channels, `go`/`go-loop`, `alts!`, `mult`/`pub`, `pipe`/`merge`/`split` (real goroutines, not IOC)                                                                                            |
 | `io`                 | polymorphic readers/writers, `slurp`/`spit`, lazy line-seq, encoding, URLs, `with-open`, `resource` (filesystem in dev, embedded in `-b` binaries)                                                |
 | `http`               | Ring-style server + client, streaming responses                                                                                                                                               |
 | `json`               | `read-json`, `write-json` (float-preserving, record-aware)                                                                                                                                    |
 | `transit`            | transit+json codec with rolling cache                                                                                                                                                         |
-| `os`                 | `sh`, `stat`, `ls`, `cwd`, `getenv`/`setenv`, `exit`, `os-name`, `arch`, `user-name`, `hostname`, separators                                                                                  |
+| `os`                 | process execution, environment/args, filesystem and path operations, host information; see the [`os` guide](os.md)                                                                            |
 | `System`             | JVM-shaped: `getProperty`, `getProperties`, `getenv`, `exit`, `currentTimeMillis`, `nanoTime`. Exposes `let-go.version`, `let-go.commit`, `user.home`, `user.dir`, `os.name`, `os.arch`, etc. |
 | `syscall`            | direct Linux syscalls (mount, unshare, mknod, prctl, capset, seccomp, AppArmor)                                                                                                               |
 | `pods`               | Babashka pods over JSON / EDN / transit                                                                                                                                                       |
+
+The reader supports `#uuid` and `#inst` through `default-data-readers` plus
+custom data readers registered as symbol-to-function entries in the dynamic
+`*data-readers*` map, with `*default-data-reader-fn*` for any other tag. `lg`
+also reads raw `#go{...}` fragments, a `*data-readers*` entry that importing the
+Go package `pkg/gofragments` installs (left out with `-tags lg_no_gofragments`). As in
+Clojure, a tag that nothing handles throws `No reader function for tag`.
+See [Custom data readers](custom-data-readers.md).
 
 ## Not implemented
 
 - **STM coordination**: `ref`/`dosync`/`alter`/`commute` are atom-backed compatibility aliases, not coordinated STM
 - **Asynchronous agents**: `agent`/`send`/`send-off` are synchronous atom-backed compatibility aliases
 - **Chunked sequences**: lazy seqs are unchunked
-- **Custom tagged literal readers**: built-in `#uuid` and `#inst` work; unknown tags read as their payload, and `*data-readers*` / `*default-data-reader-fn*` are not implemented
-- **Java-style `deftype` / `reify` method bodies and host interfaces**: protocol implementations work; JVM host methods do not
+- **Java-style `deftype` method bodies and host interfaces**: protocol implementations work; JVM host methods on `deftype` do not. `reify` accepts `Object` method overrides: `toString` is wired into the value's string representation (`str`, `pr-str`, `println`); `hashCode`/`equals` are accepted and ignored (hash/equality stay identity-based)
 - **Spec** (no `clojure.spec`)
 - **`subseq` / `rsubseq`**: sorted collections work (`sorted-map`, `sorted-set`, `rseq`); range queries don't
 
@@ -53,6 +61,11 @@ with no known failures, compile skips, panic skips, or runtime skips.
 - Base integer `+`/`-`/`*`/`inc`/`dec` throw on overflow; use `+'`/`-'`/`*'`/`inc'`/`dec'` for BigInt-promoting exact math
 - Regex is Go flavor (`re2`), not Java regex
 - `letfn` uses atoms internally for forward references
+- `Thread/currentThread` is the current scope: `.isInterrupted` reads scope cancellation and `.interrupt` cancels the scope (inside `with-scope` only; at the root scope it throws rather than cancel the whole program's tracked work). `Thread.` itself is not supported
+- `format` is Go `fmt` underneath; Java's `%n` is honored as `\n` and surplus arguments are ignored
+- `=` gives the same answer on all three compile paths; `identical?` is promised only for a value compared with itself. A value stays `identical?` to itself however it travels (through `let`, `loop`, `if` or a fn argument), as in Clojure. Whether two equal literals written in different places are one object is unspecified, as it is in Clojure, where `(identical? 127 127)` is `true` but `(identical? [1 2] [1 2])` is `false`: any compile path may share equal constants, so in let-go the two can be `identical?`. A literal map keeps the key order it was written in, as Clojure's array maps do, so sharing never replaces a map with an equal one whose keys are in a different order
+- A `fn` that closes over nothing is created once and shared on all three compile paths (the default compiler, `*ir-compile*` and lowered Go): `(defn mk [] (fn [x] x))` returns the same object every call, so `(identical? (mk) (mk))` is `true` where Clojure gives `false`. A `fn` that closes over locals is a new object per evaluation, as in Clojure
+- Code lowered to native Go (`-tags gogen_ir`) links a call from one lowered fn to another directly, as Clojure's direct linking does: `with-redefs`, `alter-var-root` or a re-`def` of a lowered fn reaches bytecode callers and anything that calls through the var, but not other lowered fns until they are recompiled. As in Clojure, a `^:redef` or `^:dynamic` fn is never linked directly. The default compiler and `*ir-compile*` always call through the var, as Clojure does without direct linking
 
 ## Compiler compatibility vars
 
@@ -66,13 +79,22 @@ site for:
   generic `InvokeValueEC` trampoline.
 
 Ordinary higher-order IFn calls, protocol dispatch, known host targets, and
-successfully direct/native-lowered calls stay silent. A concrete receiver
-shape (a literal, a fresh constructor call) can resolve host warnings.
-**Known phase-1 limitation:** *dispatch* type hints (`^String s`) are NOT yet
-consulted — the compiler does not attach `:tag` metadata to fn params or
-locals, so a hinted receiver still warns; expect the host warning on most
-interop whose receiver is a plain symbol. Direct/native warnings need a
-supported call signature or native registration.
+successfully direct/native-lowered calls stay silent. A host receiver counts
+as known when the source names its type: a literal, a fresh constructor call,
+a `^Tag` hint on the receiver form, or a local whose nearest binding is known.
+A binding is known when it carries a `^Tag` hint (fn params and `let`/`loop`
+locals) or, for `let`, when its init is itself a known receiver. A `loop`
+local counts only through its hint, since `recur` can rebind it. A call whose
+receiver is another call's result, such as `(.concat (.toString a) b)`, still
+warns: let-go does not model method return types. Direct/native warnings need
+a supported call signature or native registration.
+
+**Known limitation:** a known receiver silences the host warning, but no
+compile path dispatches host members statically yet. The bytecode compiler,
+`*ir-compile*`, and the Go lowering all route member calls through the
+generic `.` builtin, so a hint is neither checked against the runtime value
+nor used to pick the method. Only the bytecode compiler emits the host
+warning.
 
 This is separate from *numeric* parameter hints (`^double x`, `^long n`),
 which ARE honored: the AOT native-Go lowering pipeline uses them to run

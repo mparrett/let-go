@@ -43,22 +43,192 @@ func LGBVarResolver(nsName, name string) *vm.Var {
 // DecodeExecUnit decodes a .lgb payload (plain or bundle format), resolving
 // var references with LGBVarResolver.
 func DecodeExecUnit(data []byte) (*bytecode.ExecUnit, error) {
-	return bytecode.DecodeToExecUnit(bytes.NewReader(data), LGBVarResolver)
+	return decodeProgram(func() (*bytecode.ExecUnit, error) {
+		return bytecode.DecodeToExecUnit(bytes.NewReader(data), LGBVarResolver)
+	})
+}
+
+// DecodeExecUnitWithDebug decodes a payload and attaches a verified external
+// debug companion when the payload was produced by bytecode.SplitDebug.
+func DecodeExecUnitWithDebug(data, debugData []byte) (*bytecode.ExecUnit, error) {
+	if len(debugData) == 0 {
+		return DecodeExecUnit(data)
+	}
+	return decodeProgram(func() (*bytecode.ExecUnit, error) {
+		return bytecode.DecodeToExecUnitBytesWithDebug(data, debugData, LGBVarResolver)
+	})
+}
+
+// decodeProgram runs a program decode, then marks for loading every embedded
+// core namespace the decode materialized that the unit does not define itself.
+//
+// LGBVarResolver creates a referenced var's namespace bare, with stub vars. A
+// namespace in the core bundle is already marked for on-demand loading at boot,
+// but one loaded from embedded source (zip, data, the ir.* pipeline since #356)
+// is not, so the program's (require 'zip) found the bare namespace, treated it
+// as loaded, and every var stayed nil (#954). Only embedded namespaces are
+// marked: the program's own namespaces are either defined by the unit or have
+// no source to reload, and marking them would make a later require re-run them.
+func decodeProgram(decode func() (*bytecode.ExecUnit, error)) (*bytecode.ExecUnit, error) {
+	before := AllNSes()
+	unit, err := decode()
+	if err != nil {
+		return nil, err
+	}
+	for name := range AllNSes() {
+		if _, existed := before[name]; existed || unit.NSChunks[name] != nil {
+			continue
+		}
+		if _, embedded := EmbeddedSource(name); embedded {
+			MarkNSNeedsLoad(name)
+		}
+	}
+	return unit, nil
+}
+
+// DecodeExecUnitWithDebugFile loads and decodes a companion only when the LGB
+// header says debug information was split. Ordinary artifacts therefore pay
+// no filesystem lookup and ignore stale sidecars.
+func DecodeExecUnitWithDebugFile(data []byte, artifactPath string) (*bytecode.ExecUnit, error) {
+	if !bytecode.HasSplitDebug(data) {
+		return DecodeExecUnit(data)
+	}
+	debugData, err := LoadDebugCompanion(artifactPath)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeExecUnitWithDebug(data, debugData)
+}
+
+// LoadDebugCompanion reads debug information for artifactPath. LG_DEBUG_FILE,
+// when set, selects an explicit file (or disables loading when empty); otherwise
+// the conventional <artifact>.debug sibling is optional.
+func LoadDebugCompanion(artifactPath string) ([]byte, error) {
+	path, explicit := os.LookupEnv("LG_DEBUG_FILE")
+	if explicit && path == "" {
+		return nil, nil
+	}
+	if !explicit {
+		path = artifactPath + bytecode.DebugCompanionSuffix
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, nil
+	}
+	if !explicit && os.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("reading debug companion %s: %w", path, err)
 }
 
 // RunExecUnit replays a decoded unit: namespace chunks in dependency order
-// first, then the main chunk.
+// first, then the main chunk (when it is not already one of those namespaces).
 func RunExecUnit(unit *bytecode.ExecUnit) error {
+	if err := LoadProgramNamespaces(unit); err != nil {
+		return err
+	}
+	return RunProgramMainChunk(unit)
+}
+
+// LoadProgramNamespaces replays every namespace chunk in unit.NSOrder, draining
+// ApplyGoOverrides after each so gogen_ir NativeFn overrides land on the Vars
+// the bytecode just installed. This is the program-half of an AOT native-entry
+// frame (#425): the frame's core boot (pkg/compiler's init, or BootCore for a
+// runtime-only host) already owns core boot+reapply; the generated main.go
+// owns this load, then the main-chunk replay, then the entry — directly when
+// it lowered, else through InvokeProgramEntry.
+//
+// Unlike the historical RunExecUnit loop, this does NOT skip MainChunk —
+// for a single-ns program the ns chunk IS MainChunk, and the native entry
+// still needs those Vars (non-lowered callees, override targets) installed
+// before the direct Go call. RunProgramMainChunk then no-ops when MainChunk
+// was already covered here.
+func LoadProgramNamespaces(unit *bytecode.ExecUnit) error {
+	if unit == nil {
+		return fmt.Errorf("LoadProgramNamespaces: nil ExecUnit")
+	}
 	for _, name := range unit.NSOrder {
 		chunk := unit.NSChunks[name]
-		if chunk == nil || chunk == unit.MainChunk {
+		if chunk == nil {
 			continue
 		}
-		if err := runChunk(chunk); err != nil {
+		if err := runUnitChunk(unit, chunk); err != nil {
 			return fmt.Errorf("loading namespace %s: %w", name, err)
 		}
+		if ns := LookupNS(name); ns != nil {
+			ApplyGoOverrides(ns)
+		}
 	}
-	return runChunk(unit.MainChunk)
+	return nil
+}
+
+// RunProgramMainChunk runs unit.MainChunk on the VM when it was not already
+// replayed by LoadProgramNamespaces (i.e. when MainChunk is not one of the
+// NSOrder namespaces). The AOT native-entry VM-fallback path (#425 Finding 2)
+// uses this after LoadProgramNamespaces when the recognized main/-main form
+// did not lower.
+func RunProgramMainChunk(unit *bytecode.ExecUnit) error {
+	if unit == nil {
+		return fmt.Errorf("RunProgramMainChunk: nil ExecUnit")
+	}
+	if unit.MainChunk == nil {
+		return nil
+	}
+	for _, name := range unit.NSOrder {
+		if unit.NSChunks[name] == unit.MainChunk {
+			// Already loaded (and override-drained) by LoadProgramNamespaces.
+			return nil
+		}
+	}
+	if err := runUnitChunk(unit, unit.MainChunk); err != nil {
+		return err
+	}
+	// The chunk's ns form entered the namespace it defines, so *ns* names it;
+	// a single-file program has no namespace table to drain by. Only that
+	// namespace is drained: one that exists only as decode stubs still has its
+	// chunk to run, and that replay would overwrite drained overrides.
+	if ns, ok := CurrentNS.Deref().(*vm.Namespace); ok {
+		ApplyGoOverrides(ns)
+	}
+	return nil
+}
+
+// InvokeProgramEntry looks up name ("-main" or "main") in the given
+// namespace and Invokes it with args. Used by the #425 native-entry
+// VM-fallback frame after LoadProgramNamespaces has installed defs — a bare
+// MainChunk re-run would no-op for single-ns programs whose MainChunk is the
+// ns chunk itself.
+//
+// namespace must be the source namespace that owns the selected entry. The
+// compiler already chose that namespace; searching CurrentNS or the global
+// registry would let a competing entry in another namespace steal the call.
+func InvokeProgramEntry(ec *vm.ExecContext, namespace, name string, args []vm.Value) error {
+	if ec == nil {
+		return fmt.Errorf("InvokeProgramEntry: nil ExecContext")
+	}
+	if namespace == "" {
+		return fmt.Errorf("InvokeProgramEntry: empty namespace")
+	}
+	ns := LookupNS(namespace)
+	if ns == nil {
+		return fmt.Errorf("InvokeProgramEntry: namespace %s not found", namespace)
+	}
+	v := ns.LookupLocal(vm.Symbol(name))
+	if v == nil {
+		return fmt.Errorf("InvokeProgramEntry: %s/%s not found", namespace, name)
+	}
+	fn, ok := v.Deref().(vm.Fn)
+	if !ok {
+		return fmt.Errorf("InvokeProgramEntry: %s/%s is not callable", namespace, name)
+	}
+	_, err := ec.Invoke(fn, args)
+	return err
+}
+
+// runUnitChunk runs one of unit's chunks with the unit's TypeScope active, so
+// its defrecord and deftype forms adopt the types its constants decoded to.
+func runUnitChunk(unit *bytecode.ExecUnit, c *vm.CodeChunk) error {
+	return vm.WithTypeScope(unit.Types, func() error { return runChunk(c) })
 }
 
 func runChunk(c *vm.CodeChunk) error {

@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nooga/let-go/pkg/bytecode"
 	"github.com/nooga/let-go/pkg/rt"
 	"github.com/nooga/let-go/pkg/vm"
 )
@@ -35,8 +34,7 @@ func benchEval(b *testing.B, src string) {
 	}
 }
 
-// benchExec compiles once, then runs b.N times (execution only).
-func benchExec(b *testing.B, src string) {
+func compileBenchChunk(b *testing.B, src string) *vm.CodeChunk {
 	b.Helper()
 	consts := vm.NewConsts()
 	ctx := NewCompiler(consts, rt.NS(rt.NameCoreNS))
@@ -44,12 +42,57 @@ func benchExec(b *testing.B, src string) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	return chunk
+}
+
+// benchExec compiles once, then executes through the standalone frame entry
+// used by evaluation, API, runtime, resolver, and WASM callers.
+func benchExec(b *testing.B, src string) {
+	b.Helper()
+	chunk := compileBenchChunk(b, src)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		f := vm.NewFrame(chunk, nil)
-		f.Run()
+		_, runErr := f.Run()
+		vm.ReleaseFrame(f)
+		if runErr != nil {
+			b.Fatal(runErr)
+		}
 	}
 }
+
+// benchFuncInvoke compiles once, wraps the chunk as a zero-argument function,
+// then executes through normal function invocation. Keep this separate from
+// benchExec: the two entry paths have different frame-pool behavior.
+func benchFuncInvoke(b *testing.B, src string) {
+	b.Helper()
+	chunk := compileBenchChunk(b, src)
+	fn := vm.MakeFunc(0, false, chunk)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, runErr := fn.Invoke(nil)
+		if runErr != nil {
+			b.Fatal(runErr)
+		}
+	}
+}
+
+const (
+	benchDirectCallLoop = `
+		(do
+			(defn add1 [x] (+ x 1))
+			(loop [i 0] (if (< i 10000) (do (add1 i) (recur (+ i 1))) i)))`
+	benchClosureCallLoop = `
+		(do
+			(defn make-adder [n] (fn [x] (+ x n)))
+			(let [add5 (make-adder 5)]
+				(loop [i 0] (if (< i 10000) (do (add5 i) (recur (+ i 1))) i))))`
+	benchNonTailFib20 = `
+		(do
+			(defn fib [n]
+				(if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+			(fib 20))`
+)
 
 // ============================================================================
 // Init — core.lg loading: source compilation vs precompiled bytecode
@@ -67,29 +110,27 @@ func BenchmarkInitFromSource(b *testing.B) {
 	}
 }
 
+// initFromLGB is one iteration of BenchmarkInitFromLGB: the bundle-boot path
+// evalInit takes in a real `lg` process — decode the bundle, run clojure.core,
+// the lg baseline namespaces and the hybrid namespaces, and mark everything
+// else needs-load for its first (require ...). Calling the loader itself, not
+// a re-creation of it, keeps the benchmark and startup from drifting apart;
+// TestInitFromLGBLeavesLazyNamespacesUnloaded pins the lazy half.
+func initFromLGB(tb testing.TB) {
+	tb.Helper()
+	if err := loadPrecompiledBundle(); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+// BenchmarkInitFromLGB is the startup gate (cmd/bench-ratchet initFilter):
+// its B/op and allocs/op are what a process pays before user code runs.
 func BenchmarkInitFromLGB(b *testing.B) {
 	if len(rt.CoreCompiledLGB) == 0 {
 		b.Skip("no precompiled core_compiled.lgb")
 	}
-	resolve := func(ns, name string) *vm.Var {
-		n := rt.NS(ns)
-		v := n.Lookup(vm.Symbol(name))
-		if v == vm.NIL {
-			return n.Def(name, vm.NIL)
-		}
-		return v.(*vm.Var)
-	}
 	for i := 0; i < b.N; i++ {
-		unit, err := bytecode.DecodeToExecUnitBytes(rt.CoreCompiledLGB, resolve)
-		if err != nil {
-			b.Fatal(err)
-		}
-		f := vm.NewFrame(unit.MainChunk, nil)
-		_, err = f.RunProtected()
-		vm.ReleaseFrame(f)
-		if err != nil {
-			b.Fatal(err)
-		}
+		initFromLGB(b)
 	}
 }
 
@@ -119,17 +160,10 @@ func BenchmarkArithmetic(b *testing.B) {
 
 func BenchmarkFunctionCalls(b *testing.B) {
 	b.Run("direct-call-loop", func(b *testing.B) {
-		benchExec(b, `
-		(do
-			(defn add1 [x] (+ x 1))
-			(loop [i 0] (if (< i 10000) (do (add1 i) (recur (+ i 1))) i)))`)
+		benchExec(b, benchDirectCallLoop)
 	})
 	b.Run("closure-call-loop", func(b *testing.B) {
-		benchExec(b, `
-		(do
-			(defn make-adder [n] (fn [x] (+ x n)))
-			(let [add5 (make-adder 5)]
-				(loop [i 0] (if (< i 10000) (do (add5 i) (recur (+ i 1))) i))))`)
+		benchExec(b, benchClosureCallLoop)
 	})
 	b.Run("native-call-loop", func(b *testing.B) {
 		benchExec(b, `(loop [i 0] (if (< i 10000) (recur (+ i 1)) i))`)
@@ -208,11 +242,7 @@ func BenchmarkRecursion(b *testing.B) {
 		benchExec(b, `(loop [i 0] (if (< i 10000) (recur (+ i 1)) i))`)
 	})
 	b.Run("non-tail-fib-20", func(b *testing.B) {
-		benchExec(b, `
-		(do
-			(defn fib [n]
-				(if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
-			(fib 20))`)
+		benchExec(b, benchNonTailFib20)
 	})
 	b.Run("mutual-even-odd-1000", func(b *testing.B) {
 		benchExec(b, `
@@ -222,4 +252,28 @@ func BenchmarkRecursion(b *testing.B) {
 			(defn my-odd? [n] (if (= n 0) false (my-even? (- n 1))))
 			(my-even? 1000))`)
 	})
+}
+
+// BenchmarkExecutionEntryModes makes the two real execution entry paths
+// explicit without changing the names or semantics of the existing suite.
+func BenchmarkExecutionEntryModes(b *testing.B) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"direct-call-loop", benchDirectCallLoop},
+		{"closure-call-loop", benchClosureCallLoop},
+		{"non-tail-fib-20", benchNonTailFib20},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.Run("new-frame-run", func(b *testing.B) {
+				benchExec(b, tc.src)
+			})
+			b.Run("func-invoke", func(b *testing.B) {
+				benchFuncInvoke(b, tc.src)
+			})
+		})
+	}
 }

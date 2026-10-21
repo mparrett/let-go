@@ -1,0 +1,31 @@
+;; Regression test for duplicate test registration.
+;;
+;; There is no test registry any more (Task 12): a test is any var with a
+;; fn under its :test metadata, and deftest just def's the var then
+;; alter-meta!'s :test onto it. Re-evaluating a deftest — the editor flow,
+;; where you tweak a test and send it to the REPL again — replaces the
+;; var's :test fn in place via alter-meta! (a single map entry, not a
+;; list), so the var still carries exactly one :test fn, and the bridged
+;; run-tests still counts it once.
+;;
+;; The probe deftest lives in its own scratch namespace so that calling
+;; the bridged run-tests on it, from inside this file's own deftest, does
+;; not also re-run whichever test is currently executing.
+
+(in-ns 'test.register-test-dedupe-probe-ns)
+(clojure.core/require '[test :refer :all])
+(deftest probe (is true))
+(deftest probe (is true))
+(deftest probe (is true))
+
+(in-ns 'test.register-test-dedupe-test)
+(clojure.core/require '[test :refer :all])
+
+(deftest re-evaluating-a-deftest-leaves-one-test-fn
+  (is (fn? (:test (meta (resolve 'test.register-test-dedupe-probe-ns/probe))))))
+
+(deftest run-tests-counts-a-reevaluated-test-once
+  (let [events (atom [])]
+    (binding [report (fn [m] (swap! events conj m))]
+      (run-tests 'test.register-test-dedupe-probe-ns))
+    (is (= 1 (count (filter #(= :begin-test-var (:type %)) @events))))))

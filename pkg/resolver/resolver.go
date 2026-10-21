@@ -62,6 +62,17 @@ func PathsFromInputs(explicit, fallback string, explicitSet bool) []string {
 	return ParseSearchPaths(raw)
 }
 
+func asVector(v vm.Value) (vm.Indexed, bool) {
+	switch v := v.(type) {
+	case vm.ArrayVector:
+		return v, true
+	case vm.PersistentVector:
+		return v, true
+	default:
+		return nil, false
+	}
+}
+
 // PathsFromDepsEdn reads deps.edn in dir and returns the :paths entries.
 // Returns nil if the file doesn't exist, can't be parsed, or has no :paths.
 func PathsFromDepsEdn(dir string) []string {
@@ -82,12 +93,13 @@ func PathsFromDepsEdn(dir string) []string {
 		return nil
 	}
 	pathsVal := m.ValueAt(vm.Keyword("paths"))
-	vec, ok := pathsVal.(vm.ArrayVector)
+	vec, ok := asVector(pathsVal)
 	if !ok {
 		return nil
 	}
-	out := make([]string, 0, len(vec))
-	for _, item := range vec {
+	out := make([]string, 0, vec.RawCount())
+	for i := 0; i < vec.RawCount(); i++ {
+		item := vec.Nth(i)
 		if s, ok := item.(vm.String); ok && s != "" {
 			out = append(out, string(s))
 		}
@@ -122,7 +134,13 @@ func (r *NSResolver) loadFile(path string) (*vm.Namespace, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return r.loadSource(path, f, true)
+	var ns *vm.Namespace
+	err = rt.WithFile(path, func() error {
+		var lerr error
+		ns, lerr = r.loadSource(path, f, true)
+		return lerr
+	})
+	return ns, err
 }
 
 func (r *NSResolver) loadSource(sourceName string, reader io.Reader, recordChunk bool) (*vm.Namespace, error) {
@@ -149,7 +167,7 @@ func (r *NSResolver) loadSource(sourceName string, reader io.Reader, recordChunk
 	if rt.CoreNS != nil {
 		scratch.Refer(rt.CoreNS, "", true)
 	}
-	freshCtx := compiler.NewCompiler(r.ctx.Consts(), scratch)
+	freshCtx := r.ctx.ChildForLoad(scratch)
 	freshCtx.SetSource(sourceName)
 	chunk, _, err := freshCtx.CompileMultiple(reader)
 	nns := freshCtx.CurrentNS()
@@ -242,7 +260,11 @@ func (r *NSResolver) loadEmbedded(name string) (*vm.Namespace, error) {
 	// Try precompiled bytecode first — unless this ns is pinned to source
 	// loading via LG_FORCE_SOURCE_NS (dev loop; see forceSourceNS).
 	if !forceSourceNS(name) {
-		if chunk := compiler.PrecompiledNSChunk(name); chunk != nil {
+		chunk, err := compiler.PrecompiledNSChunk(name)
+		if err != nil {
+			return nil, err
+		}
+		if chunk != nil {
 			return r.execPrecompiled(name, chunk)
 		}
 	}
@@ -278,19 +300,22 @@ func (r *NSResolver) execPrecompiled(name string, chunk *vm.CodeChunk) (*vm.Name
 	defer delete(r.cloading, name)
 
 	ons := r.ctx.CurrentNS()
-	f := vm.NewFrame(chunk, nil)
-	result, err := f.RunProtected()
-	vm.ReleaseFrame(f)
+	err := vm.WithTypeScope(compiler.PrecompiledTypeScope(), func() error {
+		f := vm.NewFrame(chunk, nil)
+		f.SetExecContext(r.ctx.EvaluationExecContext())
+		_, err := f.RunProtected()
+		vm.ReleaseFrame(f)
+		return err
+	})
 	if err != nil {
 		r.ctx.SetCurrentNS(ons)
 		// Wrap with vm.ExecutionError, not fmt.Errorf: FormatError walks the
 		// cause chain by concrete type (GetCause), so a %w-wrapped
 		// ExecutionError/ThrownError from RunProtected would render as one
-		// flat line — losing the source snippet and stack this PR restores.
+		// flat line, losing the source snippet and the stack.
 		return nil, vm.NewExecutionError(
 			fmt.Sprintf("failed to load precompiled namespace %s", name)).Wrap(err)
 	}
-	_ = result
 	nns := r.ctx.CurrentNS()
 	r.ctx.SetCurrentNS(ons)
 	// gogen_ir: drain Go-native overrides registered by the lowered

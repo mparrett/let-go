@@ -35,19 +35,89 @@ func ApplyVarMeta(v *vm.Var, meta vm.Value) {
 	if v == nil || meta == nil || meta == vm.NIL {
 		return
 	}
-	v.SetMeta(meta)
-	m, ok := meta.(interface {
-		ValueAt(vm.Value) vm.Value
-	})
-	if !ok {
+	if pairs, ok := meta.(vm.DefMetaPairs); ok {
+		v.SetMetaPairs(meta)
+		seenDynamic, seenPrivate := false, false
+		for i := len(pairs) - 2; i >= 0; i -= 2 {
+			key, ok := pairs[i].(vm.Keyword)
+			if !ok {
+				continue
+			}
+			value := pairs[i+1]
+			switch key {
+			case vm.Keyword("dynamic"):
+				if !seenDynamic {
+					seenDynamic = true
+					if vm.IsTruthy(value) {
+						v.SetDynamic()
+					}
+				}
+			case vm.Keyword("private"):
+				if !seenPrivate {
+					seenPrivate = true
+					if vm.IsTruthy(value) {
+						v.SetPrivate()
+					}
+				}
+			}
+			if seenDynamic && seenPrivate {
+				break
+			}
+		}
+	} else {
+		v.SetMeta(meta)
+		if m, ok := meta.(interface {
+			ValueAt(vm.Value) vm.Value
+		}); ok {
+			if vm.IsTruthy(m.ValueAt(vm.Keyword("dynamic"))) {
+				v.SetDynamic()
+			}
+			if vm.IsTruthy(m.ValueAt(vm.Keyword("private"))) {
+				v.SetPrivate()
+			}
+		}
+	}
+	attachVarNSMeta(v)
+}
+
+// attachVarNSMeta assocs :ns — the namespace OBJECT, as Clojure's def
+// attaches it (spec 4.4) — onto v's metadata, derived from the Var's own
+// NSRef() rather than from the meta argument. A *vm.Namespace has no bundle
+// constant encoding (pkg/bytecode/encoder.go has no case for it), so baking
+// :ns into the compiled apply-def-meta! constant would break `make generate`
+// for every def in the AOT-compiled core bundle. Deriving it here instead
+// means both the immediate apply (compiler.go, same-process source eval) and
+// the bytecode-replayed apply-def-meta! call (fresh process decoding a
+// .lgb bundle) converge on the same identity value, since ApplyVarMeta is
+// the shared hook for both. Vars built without a namespace (some Go-side
+// unit-test fixtures) are left alone.
+func attachVarNSMeta(v *vm.Var) {
+	ns := v.NSRef()
+	if ns == nil {
 		return
 	}
-	if vm.IsTruthy(m.ValueAt(vm.Keyword("dynamic"))) {
-		v.SetDynamic()
+	// Bundle vars keep their metadata as lazy DefMetaPairs until something
+	// reads it; Var.materializeMetaLocked adds :ns at that point. Reading
+	// Meta() here would build the map for every def at init.
+	if v.MetaDeferred() {
+		return
 	}
-	if vm.IsTruthy(m.ValueAt(vm.Keyword("private"))) {
-		v.SetPrivate()
+	v.SetMeta(assocIdentityMeta(v.Meta(), vm.Keyword("ns"), ns))
+}
+
+// assocIdentityMeta mirrors compiler.assocMeta (unexported, different
+// package): assoc key/val onto meta, treating nil/NIL as an empty map.
+func assocIdentityMeta(meta vm.Value, key vm.Value, val vm.Value) vm.Value {
+	if meta == nil || meta == vm.NIL {
+		return vm.NewPersistentMap([]vm.Value{key, val})
 	}
+	if m, ok := meta.(*vm.PersistentMap); ok {
+		return m.Assoc(key, val).(vm.Value)
+	}
+	if m, ok := meta.(vm.Map); ok {
+		return m.Assoc(key, val).(vm.Value)
+	}
+	return vm.NewPersistentMap([]vm.Value{key, val})
 }
 
 // LookupVar resolves a runtime Var by namespace and symbol name.
@@ -64,23 +134,48 @@ func LookupVar(nsName, symName string) *vm.Var {
 	return out
 }
 
-// CachedVarFn lazily resolves a cross-namespace Var ONCE — memoizing it through
-// the caller-supplied package-level pointer — then returns that var's CURRENT
-// fn root for invocation. The lowered Go calls it as
+// CachedVarFn is CachedVarFnEC in the root execution context, for callers
+// that hold no ExecContext.
+func CachedVarFn(ptr **vm.Var, nsName, symName string) vm.Fn {
+	return CachedVarFnEC(nil, ptr, nsName, symName)
+}
+
+// CachedVarFnEC lazily resolves a cross-namespace Var ONCE — memoizing it
+// through the caller-supplied package-level pointer — then returns the var's
+// CURRENT fn as ec sees it. The lowered Go calls it as
 //
-//	rt.CachedVarFn(&__v_ns_name, "ns", "name").Invoke(args)
+//	ec.Invoke(rt.CachedVarFnEC(ec, &__v_ns_name, "ns", "name"), args)
 //
-// The *Var (not the fn) is what's cached, and its root is re-read on every call,
-// so the var stays the override seam (^:dynamic / ^:redef / alter-var-root still
-// work). Resolution is lazy (first call), not at package init(): blank-imported
+// The *Var (not the fn) is what's cached, and it is dereferenced through ec on
+// every call, so the var stays the override seam: alter-var-root and ^:redef
+// replace its root, and a ^:dynamic binding in ec — including one made on
+// another goroutine's context, as inside a future — selects the callee.
+// Resolution is lazy (first call), not at package init(): blank-imported
 // lowered packages run init() before the bundle replay loads namespaces, where
 // LookupVar would return nil. The .(vm.Fn) assertion matches the trampoline's
 // contract — every callable vm value implements vm.Fn.
-func CachedVarFn(ptr **vm.Var, nsName, symName string) vm.Fn {
+func CachedVarFnEC(ec *vm.ExecContext, ptr **vm.Var, nsName, symName string) vm.Fn {
 	if *ptr == nil {
 		*ptr = LookupVar(nsName, symName)
+		if *ptr == nil {
+			return failingFn(vm.NewExecutionError(fmt.Sprintf("Unable to resolve var: %s/%s", nsName, symName)))
+		}
 	}
-	return (*ptr).Deref().(vm.Fn)
+	val := ec.Deref(*ptr)
+	if f, ok := val.(vm.Fn); ok {
+		return f
+	}
+	if !(*ptr).IsBound() {
+		return failingFn(vm.NewExecutionError(fmt.Sprintf("Attempting to call unbound fn: #'%s/%s", nsName, symName)))
+	}
+	return failingFn(vm.NewTypeError(val, "is not a function", nil))
+}
+
+// failingFn is a callable that reports err when invoked, so a call through a
+// var holding no function fails as an ordinary call error instead of a panic.
+func failingFn(err error) vm.Fn {
+	f, _ := vm.NativeFnType.Wrap(func([]vm.Value) (vm.Value, error) { return vm.NIL, err })
+	return f.(vm.Fn)
 }
 
 // MultiFnNativeFrozen reports whether the multimethod var still holds its
@@ -127,9 +222,42 @@ func InvokeValueEC(ec *vm.ExecContext, target vm.Value, args []vm.Value) (vm.Val
 	return inv.Invoke(args)
 }
 
-// BoxNativeFn wraps a Go function literal as a let-go callable.
-// Lowered Go closures use this at the runtime boundary after capturing
-// outer Go locals directly.
+// InvokeValueEC1 through InvokeValueEC4 are InvokeValueEC with the arguments
+// as parameters: a lowered call of one to four arguments reaches the callee
+// through ec.InvokeN, so the bytecode VM's rule that a callee borrows its
+// arguments and never retains them holds here too, with no slice built at
+// the site. A value that is not a vm.Fn still takes the slice path.
+func InvokeValueEC1(ec *vm.ExecContext, target vm.Value, a vm.Value) (vm.Value, error) {
+	if fn, ok := target.(vm.Fn); ok {
+		return ec.Invoke1(fn, a)
+	}
+	return InvokeValueEC(ec, target, []vm.Value{a})
+}
+
+func InvokeValueEC2(ec *vm.ExecContext, target vm.Value, a, b vm.Value) (vm.Value, error) {
+	if fn, ok := target.(vm.Fn); ok {
+		return ec.Invoke2(fn, a, b)
+	}
+	return InvokeValueEC(ec, target, []vm.Value{a, b})
+}
+
+func InvokeValueEC3(ec *vm.ExecContext, target vm.Value, a, b, c vm.Value) (vm.Value, error) {
+	if fn, ok := target.(vm.Fn); ok {
+		return ec.Invoke3(fn, a, b, c)
+	}
+	return InvokeValueEC(ec, target, []vm.Value{a, b, c})
+}
+
+func InvokeValueEC4(ec *vm.ExecContext, target vm.Value, a, b, c, d vm.Value) (vm.Value, error) {
+	if fn, ok := target.(vm.Fn); ok {
+		return ec.Invoke4(fn, a, b, c, d)
+	}
+	return InvokeValueEC(ec, target, []vm.Value{a, b, c, d})
+}
+
+// BoxNativeFn wraps a Go func as a let-go callable. Lowered Go uses it for a
+// capture-free fn literal that cannot be a closure struct (a Go signature that
+// is not uniformly vm.Value); a capturing literal is always a closure struct.
 func BoxNativeFn(fn any) vm.Value {
 	v, err := vm.NativeFnType.Box(fn)
 	if err != nil {
@@ -228,6 +356,34 @@ func AddValue(a, b vm.Value) vm.Value {
 	return r
 }
 
+// UncheckedAddValue / UncheckedSubValue / UncheckedMulValue back the IR's
+// :unchecked-add/-sub/-mul when an operand is not a proven int. They call the
+// same vm.NumUnchecked* implementation as the opcode and the core fn, so they
+// coerce and wrap identically, and panic (like AddValue) on what ToInt rejects.
+func UncheckedAddValue(a, b vm.Value) vm.Value {
+	r, err := vm.NumUncheckedAdd(a, b)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+func UncheckedSubValue(a, b vm.Value) vm.Value {
+	r, err := vm.NumUncheckedSubtract(a, b)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+func UncheckedMulValue(a, b vm.Value) vm.Value {
+	r, err := vm.NumUncheckedMultiply(a, b)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
 func SubValue(a, b vm.Value) vm.Value {
 	r, err := vm.NumSub(a, b)
 	if err != nil {
@@ -305,8 +461,12 @@ func UnsignedBitShiftRightValue(a, b vm.Value) vm.Value {
 
 // BoxRestArgs boxes a variadic rest-args slice into a vm.Value list.
 // Used by the Go lowering when lowering :load-arg for the rest arg of
-// a variadic function (where the Go param is ...vm.Value).
+// a variadic function (where the Go param is ...vm.Value). An empty rest
+// binds nil, as the bytecode VM and Clojure bind it: (fn [& xs] xs) => nil.
 func BoxRestArgs(args []vm.Value) vm.Value {
+	if len(args) == 0 {
+		return vm.NIL
+	}
 	v, _ := vm.ListType.Box(args)
 	return v
 }

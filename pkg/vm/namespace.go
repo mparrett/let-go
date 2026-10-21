@@ -56,6 +56,12 @@ type Namespace struct {
 	refers   map[Symbol]*Refer
 	aliases  map[Symbol]*Namespace
 	excludes map[Symbol]bool // names excluded from clojure.core auto-refer
+	unmapped map[Symbol]bool // names explicitly ns-unmap'd — hidden from refers too
+
+	// meta is the namespace's metadata map (nil until first alter-meta!).
+	// Guarded by mu like the maps; read through Meta(), written through
+	// AlterMeta() only.
+	meta Value
 }
 
 // coreNamespacePtr is set by the rt package after clojure.core is registered.
@@ -151,6 +157,13 @@ func (n *Namespace) excludedLocked(s Symbol) bool {
 	return n.excludes[s]
 }
 
+// unmappedLocked reports whether the symbol was explicitly ns-unmap'd.
+func (n *Namespace) unmappedLocked(s Symbol) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.unmapped[s]
+}
+
 // cacheAlias rewrites an alias to its freshly-resolved target. Extracted from
 // Lookup so the write is a single guarded op rather than inline under a read.
 func (n *Namespace) cacheAlias(s Symbol, target *Namespace) {
@@ -186,7 +199,42 @@ func NewNamespace(name string) *Namespace {
 		refers:   map[Symbol]*Refer{},
 		aliases:  map[Symbol]*Namespace{},
 		excludes: map[Symbol]bool{},
+		unmapped: map[Symbol]bool{},
 	}
+}
+
+// Meta returns the namespace metadata, or NIL when none has been set.
+func (n *Namespace) Meta() Value {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.meta == nil {
+		return NIL
+	}
+	return n.meta
+}
+
+// AlterMeta replaces the namespace metadata with f(current). f runs
+// WITHOUT the namespace lock held, so it may safely call back into this
+// namespace (e.g. read or alter its own meta) without deadlocking —
+// matching Var.AlterMeta. As with Var, concurrent AlterMeta calls on the
+// same namespace are last-writer-wins: each reads current meta, computes
+// its own next value, and stores it, so a racing writer's result can be
+// clobbered.
+func (n *Namespace) AlterMeta(f func(Value) (Value, error)) error {
+	n.mu.RLock()
+	cur := n.meta
+	n.mu.RUnlock()
+	if cur == nil {
+		cur = NIL
+	}
+	next, err := f(cur)
+	if err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.meta = next
+	n.mu.Unlock()
+	return nil
 }
 
 func (n *Namespace) RegistrySize() int {
@@ -216,6 +264,49 @@ func isShadowingCoreRefer(n *Namespace, s Symbol) bool {
 	return false
 }
 
+// warnOnCoreShadow emits the Clojure-parity warning when namespace `n` is about
+// to intern `s` while `s` is currently referred in from clojure.core.
+//
+// Both intern paths call this. `Def` is the Go-side path. `LookupOrAdd` is the
+// path compiled code takes: the `def` special form interns through it
+// (pkg/compiler/compiler.go), so a warning emitted only from `Def` never fires
+// for user code — which is how this check came to be dead for the case it was
+// written for.
+//
+// Clojure JVM only warns on shadow-of-refer, not on raw name overlap:
+//
+//	(ns foo (:refer-clojure :only [defn]))
+//	(defn reset! [x] x)  ;; no warning — reset! was never referred in
+//
+// Stdlib Go-side namespaces that don't auto-refer clojure.core therefore stay
+// silent, while user code using the default (ns ...) form warns. Callers must
+// not hold n.mu: the check reads n's and core's maps through brief accessors.
+// The warning is best-effort, so a benign TOCTOU against a concurrent intern is
+// acceptable.
+func warnOnCoreShadow(n *Namespace, s Symbol) {
+	if coreNamespacePtr == nil || n == coreNamespacePtr || suppressShadowWarn {
+		return
+	}
+	if n.excludedLocked(s) || n.unmappedLocked(s) {
+		return
+	}
+	if !isShadowingCoreRefer(n, s) {
+		return
+	}
+	existing := coreNamespacePtr.localVar(s)
+	if existing == nil || existing.isPrivate {
+		return
+	}
+	// Only warn the first time we shadow in this ns; re-defs of our own var
+	// don't re-warn.
+	if n.localVar(s) != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"WARNING: %s already refers to: #'clojure.core/%s in namespace: %s, being replaced by: #'%s/%s\n",
+		s, s, n.name, n.name, s)
+}
+
 func (n *Namespace) Def(name string, val Value) *Var {
 	s := Symbol(name)
 	// Warn-on-core-shadow: emit Clojure-parity warning when a non-core
@@ -233,27 +324,10 @@ func (n *Namespace) Def(name string, val Value) *Var {
 	// auto-refered :all, so it does warn on shadow. The check reads core's
 	// and this ns's maps via brief accessors (no lock held across the write
 	// below); the warning itself is best-effort so a benign TOCTOU is fine.
-	if coreNamespacePtr != nil && n != coreNamespacePtr && !n.excludedLocked(s) && !suppressShadowWarn {
-		if isShadowingCoreRefer(n, s) {
-			if existing := coreNamespacePtr.localVar(s); existing != nil && !existing.isPrivate {
-				// Only warn the first time we shadow in this ns; subsequent
-				// re-defs of our own var don't re-warn.
-				if n.localVar(s) == nil {
-					fmt.Fprintf(os.Stderr,
-						"WARNING: %s already refers to: #'clojure.core/%s in namespace: %s, being replaced by: #'%s/%s\n",
-						name, name, n.name, n.name, name)
-				}
-			}
-		}
-	}
+	warnOnCoreShadow(n, s)
 	va := NewVar(n, n.name, name)
 	va.SetRoot(val)
-	if val.Type() == NativeFnType {
-		val.(*NativeFn).SetName(name)
-	}
-	if f, ok := val.(*Func); ok {
-		f.SetName(name)
-	}
+	nameDefValue(name, val)
 	n.mu.Lock()
 	// A re-def replaces the Var object; a guarded native-primitive root
 	// (see Var.GuardRoot) must carry over so the deviation counter still
@@ -262,6 +336,28 @@ func (n *Namespace) Def(name string, val Value) *Var {
 	n.registry[s] = va
 	n.mu.Unlock()
 	return va
+}
+
+// Intern sets the root of name's local Var to val, interning the Var when the
+// namespace has none. Unlike Def it keeps an existing Var, so code already
+// compiled against that Var sees the new root, as with Clojure's intern and a
+// source-level (def name val). The Var's flags and metadata are left as they
+// are. LookupOrAdd rechecks the registry under the write lock, so concurrent
+// first-time calls for one name all get the same Var.
+func (n *Namespace) Intern(name string, val Value) *Var {
+	va := n.LookupOrAdd(Symbol(name)).(*Var)
+	nameDefValue(name, val)
+	return va.SetRoot(val)
+}
+
+// nameDefValue names a function value after the Var it is defined under.
+func nameDefValue(name string, val Value) {
+	if val.Type() == NativeFnType {
+		val.(*NativeFn).SetName(name)
+	}
+	if f, ok := val.(*Func); ok {
+		f.SetName(name)
+	}
 }
 
 // LookupLocal checks only the namespace's own registry, not refers or aliases.
@@ -274,6 +370,9 @@ func (n *Namespace) LookupLocal(symbol Symbol) *Var {
 // Baseline namespaces (clojure.core, let-go.core, etc.) are lowest-priority:
 // explicit refers shadow them. Private vars are always hidden.
 func (n *Namespace) lookupViaRefers(sym Symbol) *Var {
+	if n.unmappedLocked(sym) {
+		return nil
+	}
 	var baselineHit *Var
 	for _, ref := range n.refersSnapshot() {
 		v := ref.ns.localVar(sym)
@@ -319,6 +418,10 @@ func (n *Namespace) LookupOrAdd(symbol Symbol) Value {
 	if v := n.localVar(symbol); v != nil {
 		return v
 	}
+	// The compiler's `def` path lands here, so this is where user code gets
+	// the core-shadow warning. Checked before taking n.mu, and only on the
+	// interning branch, so a repeated def of our own var stays silent.
+	warnOnCoreShadow(n, symbol)
 	// Intern an UNBOUND var (no root) rather than Def(NIL): the compiler
 	// calls this while compiling a `(def x v)` form before it runs, and
 	// `defonce` must be able to tell that interned-but-unrun state from a
@@ -336,6 +439,18 @@ func (n *Namespace) LookupOrAdd(symbol Symbol) Value {
 }
 
 func (n *Namespace) Lookup(symbol Symbol) Value {
+	return n.lookup(symbol, false)
+}
+
+// LookupIncludingPrivate resolves like Lookup but ignores the private flag
+// on qualified references. It backs the var special form (#'ns/sym): Clojure
+// enforces privacy only on bare qualified symbol references — (var ns/sym)
+// reaches private vars in any namespace.
+func (n *Namespace) LookupIncludingPrivate(symbol Symbol) Value {
+	return n.lookup(symbol, true)
+}
+
+func (n *Namespace) lookup(symbol Symbol, includePrivate bool) Value {
 	noteLookup(n.name, string(symbol))
 	sns, sym, hasNS := symbol.NamespacedRaw()
 	if !hasNS {
@@ -372,7 +487,7 @@ func (n *Namespace) Lookup(symbol Symbol) Value {
 		if v == nil {
 			v = target.lookupViaRefers(sym)
 		}
-		if v == nil || v.isPrivate {
+		if v == nil || (v.isPrivate && !includePrivate) {
 			return NIL
 		}
 		return v
@@ -385,7 +500,7 @@ func (n *Namespace) Lookup(symbol Symbol) Value {
 			// within its own namespace — `my.ns/-priv` is legal inside my.ns
 			// (e.g. a macro that expands to a qualified call to a private helper
 			// in the same ns).
-			if v != nil && (!v.isPrivate || target == n) {
+			if v != nil && (!v.isPrivate || target == n || includePrivate) {
 				return v
 			}
 		}
@@ -393,7 +508,7 @@ func (n *Namespace) Lookup(symbol Symbol) Value {
 	// Fallback via refers
 	if refer, ok := n.referFor(sns); ok {
 		v := refer.ns.localVar(sym)
-		if v == nil || v.isPrivate {
+		if v == nil || (v.isPrivate && !includePrivate) {
 			return NIL
 		}
 		if !refer.all {
@@ -409,10 +524,20 @@ func (n *Namespace) Lookup(symbol Symbol) Value {
 	return NIL
 }
 
+// Refer installs a refer entry for ns into this namespace. An explicit
+// refer — :all here, or a later ReferList call — is how Clojure lets you
+// undo a prior ns-unmap: it clears the `unmapped` tombstone for any symbol
+// the refer newly brings into scope, so (resolve sym) sees it again. ns's
+// PublicVars snapshot is read BEFORE n's own lock is taken, honoring the
+// no-nested-namespace-locks invariant above.
 func (n *Namespace) Refer(ns *Namespace, alias string, all bool) {
 	nom := ns.Name()
 	if alias != "" {
 		nom = alias
+	}
+	var pub map[Symbol]*Var
+	if all {
+		pub = ns.PublicVars()
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -421,9 +546,13 @@ func (n *Namespace) Refer(ns *Namespace, alias string, all bool) {
 		ns:   ns,
 		only: nil,
 	}
+	for sym := range pub {
+		delete(n.unmapped, sym)
+	}
 }
 
-// ReferList refers only selected symbols from the given namespace into this namespace.
+// ReferList refers only selected symbols from the given namespace into this
+// namespace. Clears any `unmapped` tombstone on those symbols — see Refer.
 func (n *Namespace) ReferList(ns *Namespace, symbols []Symbol) {
 	set := make(map[Symbol]bool, len(symbols))
 	for _, s := range symbols {
@@ -436,6 +565,9 @@ func (n *Namespace) ReferList(ns *Namespace, symbols []Symbol) {
 		all:  false,
 		only: set,
 	}
+	for _, s := range symbols {
+		delete(n.unmapped, s)
+	}
 }
 
 // Alias creates a symbol alias to another namespace in this namespace.
@@ -445,11 +577,17 @@ func (n *Namespace) ReferList(ns *Namespace, symbols []Symbol) {
 // short name for different libs, or (historically) cross-namespace alias-table
 // contamination during dependency loading. Rather than letting the last writer
 // silently win, warn so the conflict is visible. Re-aliasing to the SAME target
-// (idempotent ns reload) and first-time aliasing are silent.
+// (idempotent ns reload) and first-time aliasing are silent. Sameness is by
+// NAME, not pointer: a reload that re-creates the namespace object (e.g. the
+// jank suite benchmark re-running the whole corpus per iteration) is still the
+// idempotent case — pointer comparison made it warn "already points to X,
+// being repointed to X", and since `go test` merges the test binary's stderr
+// into its stdout, that spam landed between a benchmark's name and its
+// metrics line, making benchfmt drop the suite [bytecode] results entirely.
 func (n *Namespace) Alias(alias Symbol, target *Namespace) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if prev, ok := n.aliases[alias]; ok && prev != nil && target != nil && prev != target {
+	if prev, ok := n.aliases[alias]; ok && prev != nil && target != nil && prev.Name() != target.Name() {
 		fmt.Fprintf(os.Stderr,
 			"WARNING: alias %s in namespace %s already points to %s, being repointed to %s\n",
 			string(alias), n.name, string(prev.Name()), string(target.Name()))
@@ -484,14 +622,21 @@ func (n *Namespace) String() string {
 	return fmt.Sprintf("<ns %s>", n.Name())
 }
 
-// registrySnapshot copies the registry so FuzzySymbolLookup can scan it (and
-// recurse into refers) without holding the lock across other-namespace reads.
-func (n *Namespace) registrySnapshot() map[Symbol]*Var {
+// registryPrefixSymbols returns the registry's symbols whose name starts with
+// prefix, filtering under the read lock so FuzzySymbolLookup doesn't have to
+// copy (and then mostly discard) the entire registry on every call.
+func (n *Namespace) registryPrefixSymbols(prefix Symbol, includePrivate bool) []Symbol {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	out := make(map[Symbol]*Var, len(n.registry))
+	var out []Symbol
 	for k, v := range n.registry {
-		out[k] = v
+		if !strings.HasPrefix(string(k), string(prefix)) {
+			continue
+		}
+		if v.isPrivate && !includePrivate {
+			continue
+		}
+		out = append(out, k)
 	}
 	return out
 }
@@ -512,18 +657,190 @@ func (n *Namespace) PublicVars() map[Symbol]*Var {
 	return out
 }
 
-func FuzzySymbolLookup(ns *Namespace, s Symbol, lookupPrivate bool) []Symbol {
-	ret := []Symbol{}
-	for _, r := range ns.refersSnapshot() {
-		ret = append(ret, FuzzySymbolLookup(r.ns, s, false)...)
+// AllVars snapshots every interned var (public and private). Diagnostic use.
+func (n *Namespace) AllVars() map[Symbol]*Var {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[Symbol]*Var, len(n.registry))
+	for k, v := range n.registry {
+		out[k] = v
 	}
-	for k, v := range ns.registrySnapshot() {
-		if strings.HasPrefix(string(k), string(s)) {
-			if v.isPrivate && !lookupPrivate {
+	return out
+}
+
+// AliasesSnapshot copies the namespace's alias table (short-name -> target
+// namespace, as installed by `:as`/`alias`). Backs the ns-aliases core fn.
+func (n *Namespace) AliasesSnapshot() map[Symbol]*Namespace {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[Symbol]*Namespace, len(n.aliases))
+	for k, v := range n.aliases {
+		out[k] = v
+	}
+	return out
+}
+
+// ReferredVars snapshots every var visible in this namespace via refer —
+// baseline auto-refers (clojure.core, let-go.core, …) plus explicit
+// (:require ... :refer) / (use ...) refers — keyed by unqualified symbol.
+// Mirrors lookupViaRefers's precedence: an explicit refer for a symbol
+// shadows a baseline hit for that same symbol. Backs the ns-refers core fn.
+// Vars this namespace interns itself are NOT included here — those belong to
+// AllVars/PublicVars (ns-interns/ns-publics); ns-map (the union) overlays
+// AllVars on top of this result to reproduce that shadowing.
+func (n *Namespace) ReferredVars() map[Symbol]*Var {
+	out := make(map[Symbol]*Var)
+	if coreNamespacePtr != nil && coreNamespacePtr != n {
+		for k, v := range coreNamespacePtr.PublicVars() {
+			out[k] = v
+		}
+	}
+	for _, b := range lgBaselineNamespaces {
+		if b == n {
+			continue
+		}
+		for k, v := range b.PublicVars() {
+			out[k] = v
+		}
+	}
+	for _, ref := range n.refersSnapshot() {
+		if isBaselineNS(ref.ns) {
+			// Already contributed above at baseline priority; an explicit
+			// refer of a baseline namespace (rare) adds nothing new.
+			continue
+		}
+		if ref.all {
+			for k, v := range ref.ns.PublicVars() {
+				out[k] = v
+			}
+			continue
+		}
+		for sym := range ref.only {
+			if v := ref.ns.localVar(sym); v != nil && !v.isPrivate {
+				out[sym] = v
+			}
+		}
+	}
+	n.mu.RLock()
+	for sym := range n.unmapped {
+		delete(out, sym)
+	}
+	n.mu.RUnlock()
+	return out
+}
+
+// Unmap removes a symbol's mapping from this namespace, whether it is a
+// locally interned var or one only visible via refer. Backs the ns-unmap
+// core fn. Clojure semantics: after ns-unmap, the symbol resolves to
+// nothing in this namespace until re-interned or re-referred — so beyond
+// deleting any local registry entry, the symbol is recorded in `unmapped`,
+// which lookupViaRefers and ReferredVars both honor to hide it from refers
+// too. This is deliberately a separate set from `excludes` (:refer-clojure
+// :exclude): that one only suppresses the warn-on-shadow message and must
+// NOT block refer resolution — some core namespaces (e.g. string.lg) declare
+// :exclude for a name while still relying on it resolving to clojure.core's
+// version until their own same-named def further down the file runs. A
+// later (def name ...) still works fine here regardless: Lookup checks the
+// local registry before ever consulting refers. The tombstone isn't
+// permanent: Refer/ReferList clear it for any symbol they newly bring back
+// into scope, so an explicit re-refer restores visibility just like Clojure.
+func (n *Namespace) Unmap(name Symbol) {
+	n.mu.Lock()
+	delete(n.registry, name)
+	n.unmapped[name] = true
+	n.mu.Unlock()
+}
+
+// referredSymbolsPrefix mirrors ReferredVars's visibility rules (baseline
+// auto-refers, explicit :refer / :refer [only], private filtering, the
+// ns-unmap tombstone) but filters by prefix as it walks each source
+// namespace's registry under that namespace's own read lock, via
+// registryPrefixSymbols. ReferredVars builds a map of every visible var
+// first and lets the caller filter afterward — fine for ns-refers, but
+// FuzzySymbolLookup calls this on every keystroke of interactive completion,
+// and clojure.core alone has hundreds of public vars that a narrow prefix
+// would otherwise copy and immediately discard. Returns bare symbols (no
+// *Var payload) since that's all a completion candidate list needs.
+func (n *Namespace) referredSymbolsPrefix(prefix Symbol) []Symbol {
+	seen := map[Symbol]bool{}
+	var out []Symbol
+	add := func(syms []Symbol) {
+		for _, s := range syms {
+			if seen[s] {
 				continue
 			}
-			ret = append(ret, k)
+			seen[s] = true
+			out = append(out, s)
 		}
+	}
+	if coreNamespacePtr != nil && coreNamespacePtr != n {
+		add(coreNamespacePtr.registryPrefixSymbols(prefix, false))
+	}
+	for _, b := range lgBaselineNamespaces {
+		if b == n {
+			continue
+		}
+		add(b.registryPrefixSymbols(prefix, false))
+	}
+	for _, ref := range n.refersSnapshot() {
+		if isBaselineNS(ref.ns) {
+			// Already contributed above at baseline priority; an explicit
+			// refer of a baseline namespace (rare) adds nothing new.
+			continue
+		}
+		if ref.all {
+			add(ref.ns.registryPrefixSymbols(prefix, false))
+			continue
+		}
+		for sym := range ref.only {
+			if seen[sym] || !strings.HasPrefix(string(sym), string(prefix)) {
+				continue
+			}
+			if v := ref.ns.localVar(sym); v != nil && !v.isPrivate {
+				seen[sym] = true
+				out = append(out, sym)
+			}
+		}
+	}
+	n.mu.RLock()
+	filtered := out[:0]
+	for _, sym := range out {
+		if !n.unmapped[sym] {
+			filtered = append(filtered, sym)
+		}
+	}
+	n.mu.RUnlock()
+	return filtered
+}
+
+// FuzzySymbolLookup collects every symbol visible from ns whose name starts
+// with s. Visibility matches Lookup: the ns's own registry, then the referred
+// set (baseline auto-refers, explicit :refer / :refer [only], private
+// filtering, and the ns-unmap tombstone — see referredSymbolsPrefix). Refer
+// is not transitive — a cyclic refer graph cannot make this recurse.
+//
+// Locals are merged on top of the referred set so a re-Def after ns-unmap
+// still completes (Lookup checks the registry before refers; the tombstone
+// only hides refer resolution), and a locally-def'd name that shadows a
+// referred one appears once.
+func FuzzySymbolLookup(ns *Namespace, s Symbol, lookupPrivate bool) []Symbol {
+	if ns == nil {
+		return nil
+	}
+	seen := make(map[Symbol]struct{})
+	var ret []Symbol
+	// Locals first: registry wins over refers, and is not filtered by the
+	// unmapped tombstone (see Unmap's doc comment).
+	for _, sym := range ns.registryPrefixSymbols(s, lookupPrivate) {
+		seen[sym] = struct{}{}
+		ret = append(ret, sym)
+	}
+	for _, sym := range ns.referredSymbolsPrefix(s) {
+		if _, ok := seen[sym]; ok {
+			continue
+		}
+		seen[sym] = struct{}{}
+		ret = append(ret, sym)
 	}
 	return ret
 }

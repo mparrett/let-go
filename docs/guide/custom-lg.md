@@ -1,0 +1,255 @@
+---
+status: active
+last-verified: 2026-10-15
+---
+
+# Building a custom `lg`
+
+let-go's own `lg` binary wraps whatever Go packages `pkg/rt` was compiled with.
+If you need bindings for a package that isn't in the tree — a database driver, a
+parser, your own library — you don't have to fork let-go. Generate the bindings
+into your own module and build a binary that *is* `lg`, with your namespaces
+linked in.
+
+The whole thing is about ten lines of Go plus one generator invocation.
+
+## The module
+
+```
+mytool/
+├── go.mod
+├── main.go
+└── interop/           # generated, do not edit
+    └── interop_sqlite3.go
+```
+
+`main.go`:
+
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/nooga/let-go/pkg/cli"
+
+	_ "example.com/mytool/interop"  // registers the generated namespaces
+	_ "github.com/mattn/go-sqlite3" // driver registers itself with database/sql
+)
+
+func main() { os.Exit(cli.Main("dev", "none")) }
+```
+
+That binary is `lg`: same flags, same REPL, same resolver, same `-c` and `-b`.
+[`cli.Main`](../../pkg/cli/cli.go) returns the exit code for normal runs
+instead of calling `os.Exit` itself. One carve-out: flags live on the
+process-global `flag.CommandLine`, which parses with `ExitOnError` — `-h` and
+a malformed flag terminate the process from inside `Main`, as they do for any
+Go command — so shutdown logic that must run unconditionally has to happen
+before `Main` is called, not after it returns.
+
+The two strings you pass to `Main` are *your* binary's version and commit (the
+ldflags contract), and drive `-v` output. They do not become the runtime's
+identity: `(System/getProperty "let-go.version")` still reports the let-go
+version your module actually links, read from Go build info.
+
+`-w` is another exception: it needs your module and the package named
+explicitly. See [`-w` and custom namespaces](#-w-and-custom-namespaces) below.
+
+Both imports are blank on purpose. The generated package registers its
+namespaces from `init()`, and a driver like go-sqlite3 registers itself with
+`database/sql` the same way — neither exports anything you call directly.
+
+## Generating the bindings
+
+```
+go get github.com/mattn/go-sqlite3
+go run github.com/nooga/let-go/cmd/lginterop@<version> \
+  -packages github.com/mattn/go-sqlite3 -out-pkg interop -out ./interop
+```
+
+`-out-pkg` is what makes the output usable outside the let-go tree; without it
+the generator emits `package rt` for in-tree compilation. See
+[Out-of-tree generation](go-interop.md#out-of-tree-generation) for what exactly
+changes, and for the module-context caveat — the scan resolves imports against
+the current directory's module, so `go get` the package first.
+
+Re-run the generator whenever you bump the wrapped package. The generated file
+records its own invocation in the header — flags, any non-default alias (as
+`-packages path=alias`), and the generator version when it was run
+`@<version>` — so regenerating from that line round-trips. Only `-out` is
+omitted: pass the directory the file lives in.
+
+### Why `init()` calls the installer directly
+
+Generated in-tree files hand their installer to `rt.RegisterInstaller`.
+Out-of-tree files must not: `pkg/rt` drains its installer queue during its own
+package `init`, and Go runs an imported package's `init` before the importing
+package's. Anything queued from your module arrives after the drain and silently
+never runs — no error, just a namespace that isn't there. The generator emits a
+direct call instead, which is safe because `rt` is fully initialized by then.
+
+You only need to know this if you hand-write a binding file; `-out-pkg` handles
+it.
+
+## Using it
+
+The generated namespace is named for the package alias, and its members keep
+their Go names. Using the stdlib package the e2e wraps, to show a call whose
+value you can check:
+
+```clojure
+(require '[crc32])
+(println (crc32/ChecksumIEEE (.getBytes "hello")))   ; => 907060870
+```
+
+Run it the way you run `lg`:
+
+```
+./mytool script.lg
+./mytool -e "(require '[crc32]) (println (crc32/ChecksumIEEE (.getBytes \"hello\")))"
+./mytool -r script.lg     # REPL with your namespaces loaded
+```
+
+The raw generated namespace mirrors the Go names exactly, which keeps it easy to
+cross-reference against Go docs. Most projects put a hand-written `.lg` veneer
+over it for idiomatic naming — that split is covered in
+[Wrapping Go packages](go-interop.md).
+
+## Shipping the veneer in your package
+
+A veneer kept as a `.lg` file next to your scripts has to be on
+`-source-paths` wherever the binary runs. To ship it inside the Go package
+instead, embed it and register it from `init()`, next to the package's
+`rt.RegisterNS` calls:
+
+```go
+//go:embed lg/crc.lg
+var crcSrc string
+
+func init() { rt.RegisterEmbeddedSource("mytool.crc", crcSrc) }
+```
+
+`(require 'mytool.crc)` then resolves in any binary that links the package,
+with no source path: your custom `lg`, a `-b` bundle of it, and the `-w` and
+`lg compile` builds below when they `-import` the package. A package with
+several files registers each one.
+
+- **Precedence.** Registered namespaces resolve before `-source-paths`, so one
+  shadows a file of the same name there. Give library namespaces a qualified
+  name (`mytool.crc`, not `crc`).
+- **Refusals.** `RegisterEmbeddedSource` panics on an empty source (the
+  `//go:embed` didn't populate), on the name of a core namespace or of a native
+  namespace already registered (such as `os`), and on a name that is already
+  registered. A native namespace registered later under the same name isn't
+  caught, and its natives win, so give the lg source a name of its own rather
+  than one of your `rt.RegisterNS` names.
+- **Loading.** A registered namespace loads as interpreted source the first time
+  it is required, as it would from a file. It is not precompiled or lowered
+  with let-go's core.
+
+## Distributing a single binary
+
+`-b` bundles a script into a standalone executable by copying a base binary and
+appending bytecode. **Your custom binary must be its own base**, which is the
+default when you run its own `-b`:
+
+```
+./mytool -b myapp script.lg
+./myapp
+```
+
+A stock `lg` as the base would produce a binary without your natives linked, and
+the `(require ...)` would fail at runtime. This is also why the custom binary
+has to be full `lg` rather than a bytecode-only host: compilation itself runs
+top-level forms, so a veneer's `(:require)` has to resolve the native namespace
+at build time too.
+
+For cross-OS bundling, `-bundle-base` takes a path to a target-platform build of
+*your* binary — build `mytool` for each target, then bundle against each.
+
+## `-w` and custom namespaces
+
+Unlike `-b`, which copies the running binary, `-w` builds a new Go program for
+the browser. By default it scaffolds a fresh module whose `main.go` imports
+let-go's runtime packages only, so your generated namespaces are not in it: a
+script that requires one compiles into the image and then fails to resolve it at
+runtime.
+
+To carry them over, build inside your own module and name the packages to link:
+
+```
+./mytool -w web -w-module . -import example.com/mytool/interop script.lg
+```
+
+- `-w-module <dir>` builds inside the Go module at `<dir>`. lg writes the
+  generated `main.go`, `program.lgb` and lowered packages into
+  `<dir>/lgprogram/` and nowhere else, and replaces that directory on every
+  build. It refuses an `lgprogram/` it did not create, which it recognizes by
+  the `.lg-generated` marker inside.
+- `-import <pkg>` blank-imports `<pkg>` into the generated program, so its
+  `init()` registers its namespaces as it does in your custom `lg`, including
+  any lg source it registers with `rt.RegisterEmbeddedSource`. Repeat it for
+  each package, drivers included. It needs `-w-module`.
+
+The module's `go.mod` and `go.sum` are used as they are: the build runs with
+`-mod=readonly`, so a package that no `require` provides fails the build with
+Go's own error instead of being added. `-mod=readonly` also means a `vendor/`
+directory in the module is ignored; dependencies come from the module cache.
+With `LETGO_USE_TINYGO=1` the same holds: tinygo has no `-mod` flag, so lg
+appends `-mod=readonly` to `GOFLAGS` for it.
+Add `lgprogram/` to `.gitignore`.
+
+`lg compile` takes the same pair as `-module <dir>` and `-import <pkg>`, for a
+native binary built in your module.
+
+Run both from your custom binary, not a stock `lg`: compiling the program
+resolves its `(:require ...)` forms, so the namespaces have to exist at build
+time as well as in the output, for the reason given under
+[Distributing a single binary](#distributing-a-single-binary).
+
+### How `-w` finds let-go
+
+Without `-w-module`, the WASM build scaffolds a fresh Go module, so it has to
+decide which let-go that module requires. (With `-w-module`, your `go.mod`
+decides.) It reads your binary's build info and reproduces your
+`go.mod`'s `replace` directive for `github.com/nooga/let-go` verbatim:
+
+- a directory replace (`=> /src/let-go`) becomes the same directory replace;
+- a module replace (`=> example.com/fork v1.2.3`, or a pin of the stock module
+  at another version) becomes the same module and version, resolved with
+  `go get` — so a fork is built against the fork, never against
+  `github.com/nooga/let-go` at the fork's version number.
+
+With no `replace`, the module requires the let-go version your binary links.
+
+One case cannot be honored: a **relative** directory replace (`=> ../let-go`).
+Go records the path exactly as spelled and no module root to anchor it, so a
+built binary has no way to find that checkout again. `-w` refuses it with an
+error rather than guessing from the working directory. Set `LETGO_SRC` to the
+checkout, or build your host with an absolute path in the replace. `LETGO_SRC`
+always wins when it is set, whatever build info says.
+
+## Build metadata
+
+`cli.Main(version, commit)` takes your binary's own version strings; they feed
+`-v`. Wire them to your release tooling the way let-go wires goreleaser:
+
+```go
+var version, commit = "dev", "none"  // -X main.version=... -X main.commit=...
+
+func main() { os.Exit(cli.Main(version, commit)) }
+```
+
+These describe *your* module, and only your module. The runtime's own
+identity is resolved separately from build info: `(System/getProperty
+"let-go.version")` reports the let-go your binary actually links, and `-w`
+reads the same build info (see [How `-w` finds let-go](#how--w-finds-let-go)),
+so passing your version here is correct and cannot mispin either one.
+
+## A worked, hermetic example
+
+`test/e2e/custom_main_test.go` builds exactly this shape end to end — generate
+interop for a stdlib package, build a custom main against a local let-go via a
+`replace` directive, run a script through it, and bundle with `-b`. It's the
+shortest complete reference if something here doesn't line up.

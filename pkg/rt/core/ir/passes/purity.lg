@@ -40,6 +40,7 @@
     :add :sub :mul
     :bit-and :bit-or :bit-xor :bit-and-not
     :bit-shift-left :bit-shift-right :unsigned-bit-shift-right
+    :unchecked-add :unchecked-sub :unchecked-mul
     :quot :lt :lte :gt :gte :eq :inc :dec :bit-not})
 
 (def trapping-ops
@@ -66,8 +67,13 @@
 (def pure-terminator-ops
   "Terminator ops that are themselves side-effect-free (control flow /
    dataflow only). A block whose terminator is in this set can be
-   pure-block? if all its body Insts are pure."
-  #{:branch :branch-if :return})
+   pure-block? if all its body Insts are pure.
+
+   :recur-fn belongs here for the same reason :branch does — a
+   function-level recur is a back-edge that rebinds args and jumps, with
+   no effect of its own. Omitting it would keep LICM and the other
+   pure-block passes off every recur-fn loop."
+  #{:branch :branch-if :return :recur-fn})
 
 (defn pure-terminator-op?
   [op]
@@ -401,8 +407,7 @@
    "walk"   "clojure.walk"
    "edn"    "clojure.edn"
    "zip"    "clojure.zip"
-   "data"   "clojure.data"
-   "pprint" "clojure.pprint"})
+   "data"   "clojure.data"})
 
 (defn canonical-ns
   "Map an internal ns name to the Var-facing alias name. Identity for

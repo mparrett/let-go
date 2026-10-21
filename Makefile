@@ -5,23 +5,57 @@
 ifneq (,$(or $(if $(shell which go),,1),$(GO-VERSION)))
 R := https://github.com/makeplus/makes
 M := .cache/makes
-$(shell [ -d '$M' ] || git clone -q $R '$M')
+# Pin makeplus/makes so a HEAD change there can't break `make` with no change
+# in this repo. Same rationale as the Clojure toolchain pin in go.yml
+# (unpinned makeplus install → setup-clojure). Bump MAKES-SHA after verifying
+# the new tip; delete .cache/makes first so the next `make` reclones.
+# The trailing `rm -rf` matters: $(shell ...) discards exit status, so without
+# it a failed checkout would leave a valid-looking clone at floating HEAD — the
+# exact thing this pin defends against — and the [ -d ] guard would make that
+# state stick forever. Removing it fails the include loudly and retries next run.
+MAKES-SHA := 7f28494955c20e5a87ca82ae351464842a7236de
+$(shell [ -d '$M' ] || (git clone -q $R '$M' && git -C '$M' -c advice.detachedHead=false checkout -q $(MAKES-SHA)) || rm -rf '$M')
 include $M/init.mk
-# override default Go version with: `make ... GO-VERSION=1.x.y`
-GO-VERSION ?= 1.26.3
+# go.mod is the single repository-owned Go version pin: prefer the toolchain
+# directive; `go mod tidy` erases it when it equals the go directive, so fall
+# back to a full-patch go directive. Anything weaker fails loudly rather than
+# guessing. Override only for an explicit one-off bootstrap:
+# `make ... GO-VERSION=1.x.y`.
+GO-VERSION ?= $(shell sed -n 's/^toolchain go//p' go.mod)
+ifeq ($(strip $(GO-VERSION)),)
+GO-VERSION := $(shell sed -n 's/^go \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$$/\1/p' go.mod)
+endif
+ifeq ($(strip $(GO-VERSION)),)
+$(error cannot derive GO-VERSION: go.mod needs 'toolchain goX.Y.Z' or a full 'go X.Y.Z' directive)
+endif
 include $M/go.mk
 include $M/shell.mk
 endif
 
 # Prefer - to _ for make var names (won't conflict with env vars):
-LG := lg
-LG-PROFILE ?= lg-profile
-GOLANGCI-LINT := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI-LINT-VERSION ?= v2.12.2
-GOLANGCI-LINT-VERSION-NO-V := $(patsubst v%,%,$(GOLANGCI-LINT-VERSION))
-GOLANGCI-LINT-BIN := $(CURDIR)/.cache/local/bin/golangci-lint
+# Build outputs live under build/; bin/ holds the promoted current copy that a
+# PATH entry or a script can point at. Both are gitignored as directories, so a
+# new binary needs no new ignore entry, and `make clean` removes both.
+BUILD-DIR := build
+BIN-DIR := bin
+# $(LG) is the freshly built CANDIDATE. Gates and ratchets below run against it
+# deliberately: they validate the compiler that was just built, not the last
+# copy that happened to pass promotion. $(LG-PROMOTED) is the promoted copy.
+LG := $(BUILD-DIR)/lg
+LG-PROFILE ?= $(BUILD-DIR)/lg-profile
+LG-PROMOTED := $(BIN-DIR)/lg
+BOOTPROBE := $(BUILD-DIR)/bootprobe
+BOOTPROBE-SOURCES := $(wildcard cmd/bootprobe/*.go)
+SMOKE-SOURCES := scripts/smoke.lg scripts/smoke-boot.sh
+# Boot budget sits ~2x above the measured median-of-5 ceiling (4.10ms on an
+# idle M3) so it does not flake, while still catching the #663 class.
+SMOKE-BOOT-BUDGET-MS ?= 8
+SMOKE-BOOT-SAMPLES ?= 5
+# golangci-lint is pinned by the `tool` directive in go.mod, exactly as the Go
+# toolchain is pinned by its `toolchain` directive: one version, one file. Both
+# consumers read it from there -- `go tool` below, and the CI action, which
+# finds the version in go.mod on its own (.github/workflows/go.yml).
 GOLANGCI-LINT-CACHE := $(CURDIR)/.cache/local/golangci-lint
-GOLANGCI-LINT-GOENV := GOPATH=$(CURDIR)/.cache/local/go GOBIN=$(CURDIR)/.cache/local/bin GOMODCACHE=$(CURDIR)/.cache/local/go/pkg/mod GOCACHE=$(CURDIR)/.cache/local/cache/go-build
 REPORT-SCRIPT := scripts/clojure_compat_report.sh
 
 # Resource caps for test invocations. GOMEMLIMIT bounds the Go heap
@@ -50,13 +84,43 @@ GO-TEST-ENV := GOMEMLIMIT=$(GOMEMLIMIT)
 GO-TEST-FLAGS := -timeout $(GO-TEST-TIMEOUT)
 
 
+.PHONY: all default run build
+
+all: build
+
 # Start repl by default:
 default:: run
 
 run: $(LG)
 	./$<
 
-build: $(LG)
+# Promotion is part of the build rule rather than a separate step, so bin/lg
+# cannot silently lag build/lg.
+build: $(LG-PROMOTED)
+
+# Promotion gate. build/lg is the CANDIDATE; bin/lg is the promoted copy.
+# A candidate is promoted only after `smoke` passes, so bin/lg means "booted,
+# booted fast, and not obviously broken" — NOT "verified correct". Deep
+# correctness is make test / ir-stress-gate / gogen-diff, each ~2 min, which is
+# too slow to run on every promotion.
+$(LG-PROMOTED): $(LG) $(BOOTPROBE) $(SMOKE-SOURCES)
+	@$(MAKE) --no-print-directory smoke
+	@mkdir -p $(BIN-DIR)
+	install -m 0755 $(LG) $@
+	@echo "promoted $(LG) -> $@"
+
+$(BOOTPROBE): $(GO) $(BOOTPROBE-SOURCES) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
+	@mkdir -p $(BUILD-DIR)
+	go build -o $@ ./cmd/bootprobe
+
+# Fast promotion gate: minimal correctness + a boot-time budget. Seconds, not
+# minutes. Override the budget with: make smoke SMOKE-BOOT-BUDGET-MS=12
+.PHONY: smoke
+smoke: $(LG) $(BOOTPROBE)
+	@echo ">> smoke: correctness"
+	@$(LG) scripts/smoke.lg
+	@echo ">> smoke: boot budget"
+	@./scripts/smoke-boot.sh $(BOOTPROBE) $(SMOKE-BOOT-BUDGET-MS) $(SMOKE-BOOT-SAMPLES)
 
 build-profile: $(LG-PROFILE)
 
@@ -69,7 +133,23 @@ build-profile: $(LG-PROFILE)
 CORE-LG-FILES := $(shell find pkg/rt/core -name '*.lg' -type f 2>/dev/null)
 LGBGEN-SOURCES := $(shell find cmd/lgbgen -name '*.go' -type f 2>/dev/null)
 ROOT-GO-FILES := $(shell find . -maxdepth 1 -name '*.go' -type f 2>/dev/null)
-pkg/rt/core_compiled.lgb: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
+
+# Primitive registrar. lgprimgen scans pkg/rt's //lg:native-annotated Go sources
+# and emits this file. It is a PURE go/ast codegen tool (no pkg/compiler / pkg/rt
+# import), so it MUST run before the lgbgen bootstrap that consumes it: when a
+# primitive is hoisted out of installLangNS into a //lg:native decl, the bootstrap
+# runtime cannot boot until this file carries its registration. A runtime-coupled
+# generator here would depend on the very artifact it produces. Making the bundle
+# depend on it breaks that cycle.
+PRIMGEN-SOURCES := $(shell find pkg/rt -maxdepth 1 -name '*.go' -type f -not -name 'zz_*' -not -name '*_test.go' 2>/dev/null) $(shell find cmd/lgprimgen internal/primgen -name '*.go' -type f 2>/dev/null)
+pkg/rt/zz_primitives_generated.go: $(PRIMGEN-SOURCES) $(GO)
+	go run ./cmd/lgprimgen -primitives pkg/rt -go-pkg github.com/nooga/let-go/pkg/rt -primitives-out pkg/rt/zz_primitives_generated.go
+
+COREFNS-SOURCES := $(shell find pkg/rt/corefns -maxdepth 1 -name '*.go' -type f -not -name 'zz_*' -not -name '*_test.go' 2>/dev/null) $(shell find cmd/lgprimgen internal/primgen -name '*.go' -type f 2>/dev/null)
+pkg/rt/corefns/zz_primitives_generated.go: $(COREFNS-SOURCES) $(GO)
+	go run ./cmd/lgprimgen -primitives pkg/rt/corefns -go-pkg github.com/nooga/let-go/pkg/rt/corefns -primitives-out pkg/rt/corefns/zz_primitives_generated.go
+
+pkg/rt/core_compiled.lgb: pkg/rt/zz_primitives_generated.go pkg/rt/corefns/zz_primitives_generated.go $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 	go run -tags bootstrap ./cmd/lgbgen
 
 # Lowered-Go target. The -tags gogen_ir build path links these generated
@@ -78,25 +158,36 @@ pkg/rt/core_compiled.lgb: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 # the two engines silently disagree (parity-full diverges on bucket
 # hashes even when pass/fail counts match). lower_go.go is the timestamp
 # anchor for the whole tree — every regen rewrites it.
-pkg/rt/core_go_lowered/ir/lower_go/lower_go.go: $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
+pkg/rt/core_go_lowered/ir/lower_go/lower_go.go: pkg/rt/zz_primitives_generated.go pkg/rt/corefns/zz_primitives_generated.go $(CORE-LG-FILES) $(LGBGEN-SOURCES) $(GO)
 	go run -tags bootstrap ./cmd/lgbgen --target=go
 
 # Regenerate every committed code-gen artifact via the let-go orchestrator
 # scripts/generate.lg: the three Go-gen files (op_generated.go,
 # ir_bridge_generated.go, ir/data/generated.lg), the core_compiled.lgb bundle,
 # and the lowered-Go tree. Requires ./lg, so it builds first. The orchestrator
-# uses os/sh + os/exec* to run ./lg on the pkg/rt/gogen sources and to run
+# uses os/sh + os/exec* to run ./lg on the IR-gen specs (which require the
+# embedded gogen macros, #425) and to run
 # `go run -tags bootstrap ./cmd/lgbgen [--target=go]` for the bundle/lowered
 # tree. (Replaces the former generate-ir-{ops,bridge,data}.sh shell scripts.)
 generate: build
-	./lg scripts/generate.lg --go "$$(command -v go)" --lg ./lg --source-paths pkg/rt/gogen
+	$(LG) scripts/generate.lg --go "$$(command -v go)" --lg $(LG)
 
 # Short commit for `-X main.commit` so SHA-pin require-letgo checks can fire on
 # `make` builds. Release builds get this from goreleaser; a bare `make` build
 # previously reported commit="none", so SHA pins always warn-and-skipped.
 # `version` deliberately stays "dev" (no honest release version on an untagged
 # build). Falls back to "none" outside a git checkout.
-COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+#
+# NOT `git rev-parse HEAD`: a colocated jj repo keeps one git HEAD for the whole
+# repository, tracking whatever the default workspace last exported, so a build
+# from any jj workspace stamped the WRONG commit — and this value becomes
+# let-go.semver/current-commit, which SHA-pinned require-letgo constraints
+# prefix-match against. scripts/current-commit.sh asks jj for this workspace's
+# commit and verifies plain git can resolve it, falling back to rev-parse where
+# jj is absent. It emits 12 characters rather than git's default abbreviation:
+# still a valid pin (the spec accepts 7-40 hex, prefix-matched) and less
+# ambiguous, while goreleaser continues to stamp the full 40.
+COMMIT := $(shell scripts/current-commit.sh 2>/dev/null || echo none)
 PERF-TIMELINE-DIR ?= docs/perf/timeline
 PERF-SNAPSHOT ?= $(PERF-TIMELINE-DIR)/$(shell date -u +%Y%m%dT%H%M%SZ)-$(COMMIT).json
 
@@ -115,10 +206,12 @@ check-lowered-fresh:
 
 $(LG): $(GO) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
 	which go
+	@mkdir -p $(BUILD-DIR)
 	go build -ldflags="-s -w -X main.commit=$(COMMIT)" -o $@ .
 
 $(LG-PROFILE): $(GO) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
 	which go
+	@mkdir -p $(BUILD-DIR)
 	go build -tags lg_profile -ldflags="-s -w -X main.commit=$(COMMIT)" -o $@ .
 
 # -short skips the heavyweight e2e tests that each shell out to a full core
@@ -126,8 +219,48 @@ $(LG-PROFILE): $(GO) $(ROOT-GO-FILES) pkg/**/* pkg/rt/core_compiled.lgb
 # They are testing.Short()-gated and run full in dedicated CI jobs
 # (.github/workflows/go.yml "Expensive lowering e2e" + the gogen-diff job), so
 # the local `make test` loop stays fast without losing CI coverage.
+
+# Unified test narrowing parameters:
+PKG ?= ./test/...
+RUN ?= $(TEST)
+SHORT ?= true
+TAGS ?=
+COUNT ?= 1
+
+ifeq ($(SHORT),false)
+  SHORT_FLAG := -short=false
+else ifeq ($(SHORT),0)
+  SHORT_FLAG := -short=false
+else
+  SHORT_FLAG := -short
+endif
+
+TAGS_FLAG := $(if $(TAGS),-tags $(TAGS),)
+RUN_PATTERN := $(if $(RUN),$(if $(findstring /,$(RUN)),$(RUN),TestRunner/.*$(RUN)|^$(RUN)|Test.*$(RUN)),)
+RUN_FLAG := $(if $(RUN_PATTERN),-run '$(RUN_PATTERN)',)
+
+# Deprecated: use `make test` instead.
+.PHONY: test-gogen-diff-gate
+test-gogen-diff-gate:
+	@echo "Notice: target 'test-gogen-diff-gate' is deprecated; use 'make test' instead." >&2
+	@scripts/test-gogen-diff-short.sh
+
 test: pkg/**/* pkg/rt/core_compiled.lgb $(GO)
-	$(GO-TEST-ENV) go test $(GO-TEST-FLAGS) -short -count=1 -v ./test/...
+ifeq ($(strip $(RUN)$(LG_TEST)),)
+ifeq ($(PKG),./test/...)
+ifeq ($(COUNT),1)
+	@scripts/test-gogen-diff-short.sh
+endif
+endif
+endif
+	$(GO-TEST-ENV) LG_TEST=$(LG_TEST) go test $(GO-TEST-FLAGS) $(SHORT_FLAG) -count=$(COUNT) $(TAGS_FLAG) $(RUN_FLAG) -v $(PKG)
+
+# Manual entrypoint for the stderr-sensitive shell harness. The Go wrapper in
+# test/namespace_shadow_warning_harness_test.go runs it under direct `go test`
+# so CI covers it without executing the harness twice from `make test`.
+.PHONY: shadow-warning-test
+shadow-warning-test: $(LG)
+	@LG=$(LG) bash test/namespace_shadow_warning_test/run.sh
 
 clojure-compat-report: $(GO)
 	@$(REPORT-SCRIPT)
@@ -147,12 +280,21 @@ clojure-compat-report: $(GO)
 #
 # All three are anchor-normalized — see cmd/bench-ratchet/main.go
 # and docs/perf/ratchet.md.
+#
+# BENCH_WRAP prefixes every bench-ratchet run. A machine that idle-sleeps
+# or throttles mid-capture moves the anchor, so where `caffeinate` exists
+# (macOS) the default holds the system awake for the run. The name uses _
+# rather than this file's usual - so the environment can set it; set it
+# empty to run bare:
+#   BENCH_WRAP= make bench-ratchet
+BENCH_WRAP ?= $(shell command -v caffeinate >/dev/null 2>&1 && echo caffeinate -is)
 perf-page: $(GO)
-	go run ./cmd/perf-page -out docs/perf/index.html
+	go run ./cmd/perf-page -out docs/perf/index.html \
+		-viewer-out docs/perf/explore/index.html
 
 perf-snapshot: lowered $(GO)
 	mkdir -p $(PERF-TIMELINE-DIR)
-	go run ./cmd/bench-ratchet -full -baseline $(PERF-SNAPSHOT) snapshot
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet -full -baseline $(PERF-SNAPSHOT) snapshot
 
 # Regenerate the gitignored gogen_ir lowered tree (a build artifact, not
 # committed — see check-generated). Any target that builds -tags gogen_ir
@@ -173,9 +315,10 @@ lowered: $(GO)
 .PHONY: check-selfhost
 check-selfhost: lowered $(GO)
 	@echo ">> 3b: build native-passes lgbgen (-tags 'bootstrap gogen_ir')"
-	@go build -tags "bootstrap gogen_ir" -o .selfhost-lgbgen ./cmd/lgbgen
+	@mkdir -p $(BUILD-DIR)
+	@go build -tags "bootstrap gogen_ir" -o $(BUILD-DIR)/selfhost-lgbgen ./cmd/lgbgen
 	@echo ">> 3b: re-lower the whole core with the NATIVE compiler"
-	@tmp=$$(mktemp -d); ./.selfhost-lgbgen --target=go "$$tmp" >/dev/null; \
+	@tmp=$$(mktemp -d); $(BUILD-DIR)/selfhost-lgbgen --target=go "$$tmp" >/dev/null; \
 	echo ">> 4: fixpoint — native re-lowering vs the committed tree"; \
 	if diff -rq "$$tmp" pkg/rt/core_go_lowered >/dev/null 2>&1; then \
 		echo "OK: native self-hosting fixpoint holds (byte-identical)."; rc=0; \
@@ -183,29 +326,91 @@ check-selfhost: lowered $(GO)
 		echo "FAIL: native re-lowering differs — a pass changed; run 'make lowered' first:"; \
 		diff -rq "$$tmp" pkg/rt/core_go_lowered 2>&1 | head; rc=1; \
 	fi; \
-	rm -rf "$$tmp" .selfhost-lgbgen; exit $$rc
+	rm -rf "$$tmp" $(BUILD-DIR)/selfhost-lgbgen; exit $$rc
 
-# Differential self-AOT execution gate: build let-go twice (bytecode + the
-# -tags gogen_ir native), run each test/gold-aot/*.lg fixture under both, and
-# diff the last output line. A new cross-engine divergence fails; the
-# shrink-only allowlist test/gogen_aot_xfail.txt tracks known ones. `lowered`
-# keeps the gogen_ir tree fresh so the native build reflects current sources.
-# Re-seed the allowlist (after a reviewed change) with:
-#   LETGO_AOT_REDERIVE=1 go test -run TestGogenAOTDiff -count=1 ./test/e2e/
+# Deprecated: use `make lowered && make test SHORT=false PKG=./test/e2e RUN='TestEngineParityGate|TestGogenAOTDiff'` instead.
 .PHONY: gogen-diff
-gogen-diff: lowered $(GO)
-	go test -run TestGogenAOTDiff -count=1 -v ./test/e2e/
+gogen-diff: engine-parity-gate
+	@echo "Notice: target 'gogen-diff' is deprecated; use 'make lowered && make test SHORT=false PKG=./test/e2e RUN=\"TestEngineParityGate|TestGogenAOTDiff\"' instead." >&2
+	go test -short=false -run TestGogenAOTDiff -count=1 -v ./test/e2e/
+
+# Complete-corpus engine-output parity and strict-capability gate. The strict
+# wrapper measures whether each fixture can execute with fallback forbidden; it
+# does not prove fixture-source generated-Go or native-entry execution.
+# The gate always logs a deterministic sorted coverage report: per-fixture
+# category plus the measured lowering reason behind every non-full fixture, and
+# a bucket census of distinct reasons. Report content is informational: it never
+# changes classification, ratchets, or rederive. The one exit-status coupling is
+# deliberate — an explicitly requested report write that fails is reported as a
+# test error. Save a copy with:
+#   LETGO_PARITY_REPORT=/tmp/parity-report.txt make engine-parity-gate
+# The gate also enforces the committed case ledger test/parity-ledger.txt: a
+# diffable record of every measured case plus tombstones for removed fixtures.
+# A normal run fails with per-case ADDED / REMOVED / STATUS-CHANGED lines, on a
+# reappearing tombstoned fixture, and on any UNEXPLAINED tombstone.
+# Re-derive the ledger and both neutral shrink-only baselines (written as one
+# rollback-safe set) after a reviewed improvement with:
+#   LETGO_PARITY_REDERIVE=1 make engine-parity-gate
+# Explain fixtures that disappear in the same rederive; unexplained tombstones
+# fail later runs:
+#   LETGO_PARITY_TOMBSTONE_REASON="a.lg=merged into b.lg;c.lg=obsolete" \
+#     LETGO_PARITY_REDERIVE=1 make engine-parity-gate
+# Drop tombstones inherited from earlier revisions (keeping this revision's) with:
+#   LETGO_PARITY_LEDGER_CLEANUP=1 LETGO_PARITY_REDERIVE=1 make engine-parity-gate
+# A revision is the jj change id when available, else the git commit; when the
+# revision cannot be resolved, cleanup is skipped and nothing is dropped.
+# Deprecated: use `make test SHORT=false PKG=./test/e2e RUN=TestEngineParityGate` instead.
+.PHONY: engine-parity-gate
+engine-parity-gate: lowered $(GO)
+	@echo "Notice: target 'engine-parity-gate' is deprecated; use 'make test SHORT=false PKG=./test/e2e RUN=TestEngineParityGate' instead." >&2
+	go test -short=false -run TestEngineParityGate -count=1 -v ./test/e2e/
+
+# Historical compatibility aliases for existing local automation. The names
+# predate the complete result-driven census; neither denotes a phase-limited or
+# separately curated audit tier.
+.PHONY: parity-gate-phase1 strict-audit
+parity-gate-phase1 strict-audit: engine-parity-gate
+
+# Native-entry AST gate: for every fixture in test/native-entry/, lower the
+# fixture through the production path (scripts/lg-compile --entry-frame),
+# assert the generated Go's structure with internal/gofragment + go/ast, build
+# a real binary, and require its stdout to equal the committed <fixture>.expect.
+# Three AST-located mutants (oracle / call site / returned value) must each
+# fail, so a green run cannot be vacuous.
+#
+# The same target also runs TestJankSuiteDirectABIGeneratedGo: the pinned jank
+# `identical?` deftest is lowered to a real Go test package (generated into a
+# temp dir, never into the repo), matched against an inline Go AST oracle (plus
+# its falsifier), executed with `go test`, and killed by an AST-located
+# semantic mutant. It is gated here rather than left
+# incidental. It needs test/clojure-test-suite; that submodule is only
+# materialized in the primary git worktree, so in a jj workspace run
+# `scripts/link-clojure-test-suite.sh <workspace>` first. The harness FAILS
+# loudly (never skips) when the suite is missing.
+#
+# The gate is testing.Short()-gated (it builds and runs binaries), so it must
+# run with -short=false. An ambient GOFLAGS=-short — exported by fast CI lanes
+# and by some local shells — would otherwise turn the whole gate into a silent
+# skip: strip it from GOFLAGS AND pass -short=false explicitly (the later flag
+# wins over anything GOFLAGS injects).
+# Deprecated: use `make test SHORT=false PKG=./test/e2e RUN='TestNativeEntryASTGate|TestJankSuiteDirectABIGeneratedGo'` instead.
+.PHONY: native-entry-gate
+native-entry-gate: $(GO)
+	@echo "Notice: target 'native-entry-gate' is deprecated; use 'make test SHORT=false PKG=./test/e2e RUN=\"TestNativeEntryASTGate|TestJankSuiteDirectABIGeneratedGo\"' instead." >&2
+	GOFLAGS="$(filter-out -short -test.short,$(GOFLAGS))" $(GO-TEST-ENV) go test $(GO-TEST-FLAGS) -run 'TestNativeEntryASTGate|TestJankSuiteDirectABIGeneratedGo' -short=false -count=1 -v ./test/e2e/
+
+.PHONY: bench-ratchet
 
 # Default gate (~1 min): the jank suite under BOTH VM variants (bytecode +
 # gogen_ir-lowered) + the calibration anchor. This is what CI runs.
 bench-ratchet: lowered $(GO)
-	go run ./cmd/bench-ratchet check
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet check
 
 bench-ratchet-update: lowered $(GO)
-	go run ./cmd/bench-ratchet update
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet update
 
 bench-ratchet-show: lowered $(GO)
-	go run ./cmd/bench-ratchet show
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet show
 
 # Parity checks: untagged vs -tags gogen_ir across jank + ir-stress.
 # `parity-check` is the default cadence (~3 min); `parity-quick` for
@@ -223,10 +428,12 @@ parity-full: $(GO)
 # gated in PR CI — run by hand when investigating a specific regression. Pair
 # with `update` to refresh the full baseline.
 bench-ratchet-full: lowered $(GO)
-	go run ./cmd/bench-ratchet -full check
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet -full check
 
 bench-ratchet-full-update: lowered $(GO)
-	go run ./cmd/bench-ratchet -full update
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet -full update
+
+.PHONY: clean-lowered clean distclean
 
 clean-lowered:
 	$(RM) -r pkg/rt/core_go_lowered
@@ -234,7 +441,7 @@ clean-lowered:
 	@echo "Cleaned lowered Go tree and wireup files"
 
 clean: clean-lowered
-	$(RM) $(LG)
+	$(RM) -r $(BUILD-DIR) $(BIN-DIR)
 
 distclean: clean
 ifneq (,$(wildcard .cache))
@@ -242,14 +449,34 @@ ifneq (,$(wildcard .cache))
 	$(RM) -r .cache
 endif
 
-lint: install-golangci-lint
-	GOLANGCI_LINT_CACHE=$(GOLANGCI-LINT-CACHE) $(GOLANGCI-LINT-BIN) run
+# `lint` runs both linters: golangci-lint over the Go sources, and the comment
+# linter over the .lg sources. CI lints Go through the golangci-lint action
+# rather than this target, so adding the second linter here costs CI nothing.
+lint: lint-go lint-comments
 
-install-golangci-lint: $(GO)
-	@mkdir -p $(dir $(GOLANGCI-LINT-BIN)) $(GOLANGCI-LINT-CACHE)
-	@if ! test -x $(GOLANGCI-LINT-BIN) || ! $(GOLANGCI-LINT-BIN) --version | grep -q 'version $(GOLANGCI-LINT-VERSION-NO-V)'; then \
-	  $(GOLANGCI-LINT-GOENV) $(GO) install $(GOLANGCI-LINT)@$(GOLANGCI-LINT-VERSION); \
-	fi
+.PHONY: lint-go lint-comments
+
+# `run` drops formatter findings in paths the linters exclude, test files
+# included, so formatting is checked separately with `fmt --diff`, which honors
+# only the formatters' own exclusions.
+lint-go:
+	@mkdir -p $(GOLANGCI-LINT-CACHE)
+	GOLANGCI_LINT_CACHE=$(GOLANGCI-LINT-CACHE) go tool golangci-lint run
+	GOLANGCI_LINT_CACHE=$(GOLANGCI-LINT-CACHE) go tool golangci-lint fmt --diff
+
+# Report-only, deliberately. `--gate KIND` is the only way to make the linter
+# fail, and it accepts four kinds: commented-out-code, restatement,
+# duplicated-comment, comment-density-outlier. Everything else it reports --
+# dividers, devlog phrases, churn, the code-pattern catalog -- is advisory and
+# cannot be gated at all. Each of the four still fires today, so each would
+# have to be cleared first; commented-out-code is the smallest at 3 findings,
+# but R1 misses any commented-out form that has a prose line above it (#873),
+# so that count is a floor and gating it would not enforce the rule until the
+# false negative is fixed. Running the linter here keeps it honest in a second
+# way: it is itself a let-go program, so a runtime regression that breaks it
+# shows up as a failure to run rather than as silence. See docs/comment-lint.md.
+lint-comments: $(LG)
+	$(LG) scripts/lint.lg
 
 # Register the local git merge drivers for the generated artifacts (see
 # .gitattributes). Merge drivers live in .git/config, which is not shared, so
@@ -270,57 +497,29 @@ install-hooks:
 # Non-mutating front gate: fail before any target has a chance to refresh
 # pkg/rt/generated.sums. This catches the exact drift that a prior go generate
 # or lgbgen invocation would otherwise mask in CI.
+# Both names collide with real filenames (`go build ./cmd/check-generated`
+# produces ./check-generated). Without .PHONY, a stray binary makes make report
+# the target up to date and exit 0 without running the gate.
+.PHONY: check-generated check-generated-manifest
 check-generated-manifest: $(GO)
-	@go run ./cmd/check-generated
+	@go run ./cmd/check-generated || { \
+		echo "ERROR: dependency manifest stale or check errored — run 'make generate'."; \
+		exit 1; \
+	}
 
-# Single gate for every generated artifact. One target to remember, and it
-# treats the two artifacts by their actual nature. VCS-agnostic by design:
-# it shells out to no `git` (this repo is used with jj, whose secondary
-# workspaces have no .git, so a `git diff` gate breaks there).
-#
-#   * core_compiled.lgb is byte-deterministic, so it gets a CONTENT gate:
-#     stash the committed bytes, regenerate, and `cmp`. A difference means the
-#     committed bundle was stale. Survives a fresh checkout (an mtime
-#     `find -newer` check silently passes after any VCS checkout — in fact the
-#     old check-lowered-fresh pointed at a path that no longer exists and had
-#     been a silent no-op).
-#
-#   * core_go_lowered/ (+ the gogen_ir wireup files) is NOT committed — it is
-#     a build artifact, regenerated on demand and gitignored. Its self-lower
-#     uses *typeinfer-max-drains* (a deterministic drain-count, not wall-clock),
-#     ensuring the bytes are reproducible across processes. Here it is regenerated
-#     fresh, then gated behaviorally: it must compile under -tags gogen_ir AND
-#     dispatch natively (dce -> NativeFn). gogen_ir consumers (this gate, the
-#     parity job, any -tags gogen_ir build) regenerate it first; the untagged
-#     build and the shipped bytecode binary never need it.
-#
-# This is the gate CI runs. After a merge/rebase touching pkg/rt/core/**, run
-# `make check-generated` (or `make generate` to refresh, then commit).
-check-generated: check-generated-manifest $(GO)
-	@echo ">> regenerate bundle + lowered tree from a SINGLE core compile (--target=both)"
-	@cp pkg/rt/core_compiled.lgb pkg/rt/.core_compiled.lgb.committed
-	@go run -tags bootstrap ./cmd/lgbgen --target=both >/dev/null
-	@echo ">> bundle: verify lockstep (content-based, VCS-agnostic)"
-	@if cmp -s pkg/rt/core_compiled.lgb pkg/rt/.core_compiled.lgb.committed; then \
-		rm -f pkg/rt/.core_compiled.lgb.committed; \
-		echo "OK: core_compiled.lgb in lockstep with the .lg sources."; \
-	else \
-		rm -f pkg/rt/.core_compiled.lgb.committed; \
-		echo "ERROR: pkg/rt/core_compiled.lgb is stale — the regenerated bytes differ."; \
-		echo "       Run 'make generate' and commit the regenerated bundle."; \
-		exit 1; \
-	fi
-	@echo ">> lowered tree: compile + dispatch natively under -tags gogen_ir"
-	@go build -tags gogen_ir ./pkg/rt/...
-	@out=$$(printf '(require (quote ir.passes.dce)) (println "DCE-TYPE:" (type ir.passes.dce/dce))' \
-	        | go run -tags gogen_ir . /dev/stdin 2>&1); \
-	if echo "$$out" | grep -q "DCE-TYPE: let-go.lang.NativeFn"; then \
-		echo "OK: core_go_lowered/ compiles + dispatches natively (dce -> NativeFn)."; \
-	else \
-		echo "FAIL: ir.passes.dce/dce did not dispatch to a NativeFn override"; \
-		echo "$$out" | tail -5; \
-		exit 1; \
-	fi
+# Default-build dependency gate: an untagged build must not link the optional
+# heavy subsystems. See scripts/check-default-deps.sh for why the patterns are
+# anchored — the stdlib's vendored x/text copies would otherwise trip it.
+.PHONY: check-default-deps
+check-default-deps: $(GO)
+	@scripts/check-default-deps.sh
+
+# Content-check every committed generated artifact, then verify the gitignored
+# lowered tree compiles and dispatches natively. The state-management and gate
+# logic live in scripts/check-generated.sh; keep this target as the stable CI
+# and contributor entry point.
+check-generated: $(GO)
+	@scripts/check-generated.sh
 
 # Fanout ratchet: gate on the size of the generated -tags gogen_ir lowered tree.
 # Gates the byte-sum of ALREADY-TRACKED modules against a percent band; new
@@ -329,13 +528,13 @@ check-generated: check-generated-manifest $(GO)
 #   fanout-ratchet-update  recompute + MIN-merge the baseline (tighten-only)
 #   fanout-ratchet-show    print current metrics, write nothing
 fanout-ratchet: build
-	./lg scripts/fanout-ratchet.lg check --go "$$(command -v go)"
+	$(LG) scripts/fanout-ratchet.lg check --go "$$(command -v go)"
 
 fanout-ratchet-update: build
-	./lg scripts/fanout-ratchet.lg update --go "$$(command -v go)"
+	$(LG) scripts/fanout-ratchet.lg update --go "$$(command -v go)"
 
 fanout-ratchet-show: build
-	./lg scripts/fanout-ratchet.lg show --go "$$(command -v go)"
+	$(LG) scripts/fanout-ratchet.lg show --go "$$(command -v go)"
 
 # IR-stress: lower-go AOT pass-rate over the committed corpus allow-list
 # (scripts/ir-stress-corpus.edn = every shipped + test/example/script .lg minus
@@ -345,7 +544,7 @@ ir-stress: build
 	LG_STRESS_PASSES=$${LG_STRESS_PASSES:-1} \
 	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
 	  LG_STRESS_LOG=$${LG_STRESS_LOG:-/tmp/ir-stress.log} \
-	  ./lg scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
 
 # Jank lowering-coverage gate: lower-go AOT pass-rate over the vendored jank
 # Clojure-compat suite (test/clojure-test-suite, a git submodule). Unlike the
@@ -361,7 +560,7 @@ jank-stress: build
 	  LG_STRESS_PASSES=$${LG_STRESS_PASSES:-1} \
 	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
 	  LG_STRESS_LOG=$${LG_STRESS_LOG:-/tmp/jank-lowering.log} \
-	  ./lg scripts/ir-stress.lg lower-go $(JANK_SUITE_DIR) \
+	  $(LG) scripts/ir-stress.lg lower-go $(JANK_SUITE_DIR) \
 	    $$(cd $(JANK_SUITE_DIR) && ls core_test/*.cljc string_test/*.cljc)
 
 # ITER-0021 lowering-coverage ratchet gate. Runs the ir-stress corpus and fails
@@ -372,7 +571,37 @@ ir-stress-gate: build
 	LG_STRESS_PASSES=1 \
 	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
 	  LG_STRESS_BASELINE=docs/perf/ir-stress-baseline.edn \
-	  ./lg scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+
+# Bytecode-path census. Same corpus, but lowers through ir.lower (the backend
+# `(set! *ir-compile* true)` actually drives at runtime) instead of lower_go.
+# The lower-go ratchet is NOT a proxy for this: the two backends fail on
+# different things — lower.lg materializes by stack position, lower_go.lg works
+# off structurize's control tree, which lower.lg doesn't use — so a form can
+# lower natively to Go and still fail to bytecode. Separate baseline file so
+# the two ratchets can't overwrite each other.
+ir-stress-bytecode: build
+	LG_STRESS_PASSES=$${LG_STRESS_PASSES:-1} \
+	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
+	  LG_STRESS_BACKEND=lower \
+	  LG_STRESS_LOG=$${LG_STRESS_LOG:-/tmp/ir-stress-bytecode.log} \
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+
+ir-stress-bytecode-gate: build
+	LG_STRESS_PASSES=1 \
+	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
+	  LG_STRESS_BACKEND=lower \
+	  LG_STRESS_BASELINE=docs/perf/ir-stress-bytecode-baseline.edn \
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+
+ir-stress-bytecode-rebaseline: build
+	LG_STRESS_PASSES=1 \
+	  LG_STRESS_TIMEOUT_MS=$${LG_STRESS_TIMEOUT_MS:-15000} \
+	  LG_STRESS_BACKEND=lower \
+	  LG_STRESS_BASELINE=docs/perf/ir-stress-bytecode-baseline.edn \
+	  LG_STRESS_REBASELINE=1 \
+	  LG_STRESS_DATE=$$(date +%F) \
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
 
 # Rewrite the committed coverage baseline from a fresh census (tool-maintained;
 # never hand-edit the EDN). Run after an intentional corpus or coverage change,
@@ -383,7 +612,7 @@ ir-stress-rebaseline: build
 	  LG_STRESS_BASELINE=docs/perf/ir-stress-baseline.edn \
 	  LG_STRESS_REBASELINE=1 \
 	  LG_STRESS_DATE=$$(date +%F) \
-	  ./lg scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
+	  $(LG) scripts/ir-stress.lg corpus scripts/ir-stress-corpus.edn
 
 # Combined speed + size gates. Both ratchets need the gogen_ir lowered tree, and
 # each would otherwise regenerate it (the dominant cost). `ratchets` regenerates
@@ -391,12 +620,12 @@ ir-stress-rebaseline: build
 # with --no-regen so it reuses the same tree — ~halving wall time vs running
 # `make bench-ratchet fanout-ratchet`. Use this in CI.
 ratchets: build lowered $(GO)
-	go run ./cmd/bench-ratchet check
-	./lg scripts/fanout-ratchet.lg check --go "$$(command -v go)" --no-regen
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet check
+	$(LG) scripts/fanout-ratchet.lg check --go "$$(command -v go)" --no-regen
 
 ratchets-update: build lowered $(GO)
-	go run ./cmd/bench-ratchet update
-	./lg scripts/fanout-ratchet.lg update --go "$$(command -v go)" --no-regen
+	$(BENCH_WRAP) go run ./cmd/bench-ratchet update
+	$(LG) scripts/fanout-ratchet.lg update --go "$$(command -v go)" --no-regen
 
 # PHONY targets are for ones that have conflicting files/dirs present:
 .PHONY: test clean clean-lowered ir-stress-gate
@@ -405,3 +634,31 @@ ratchets-update: build lowered $(GO)
 .PHONY: browser-inspector
 browser-inspector:
 	$(MAKE) -C examples/browser-inspector build
+
+# Code quality report (docs/superpowers/specs/2026-09-11-code-quality-score-design.md).
+# Every input is pinned in the report header, so two runs at the same commit
+# with the same QUALITY_* values print byte-identical output.
+#   QUALITY_SINCE=YYYY-MM-DD   defect-density window (default: 180 days back)
+#   QUALITY_GO_COVER=file      Go coverprofile for dynamic coverage
+#   QUALITY_CI_SECONDS=n       CI wall time, for the coverage-efficiency term
+#   QUALITY_EDN=path           also write the machine-readable report there
+#   QUALITY_TOP=n              size of the "top complexity" section
+# The Go half of the quality corpus is measured by its own Go tool. Assigned
+# before the target that names it: make expands a rule's prerequisites when it
+# reads the rule, so a later assignment would leave the prerequisite empty.
+GO-CALLABLES = $(BUILD-DIR)/go-callables
+
+.PHONY: quality quality-aot
+quality: build
+# Generated output has its own corpus; rebuild it before measuring the emitter.
+quality-aot: generate
+quality-aot: QUALITY-FLAGS = --generated
+quality quality-aot: $(GO-CALLABLES)
+	QUALITY_GO_CALLABLES=$(GO-CALLABLES) QUALITY_LG=$(LG) \
+	LG_SOURCE_PATHS=scripts $(LG) scripts/quality.lg $(QUALITY-FLAGS) \
+	  --since $${QUALITY_SINCE:-$$(date -v-180d +%Y-%m-%d 2>/dev/null || date -d '180 days ago' +%Y-%m-%d)} \
+	  $${QUALITY_GO_COVER:+--go-cover $$QUALITY_GO_COVER} $${QUALITY_CI_SECONDS:+--ci-seconds $$QUALITY_CI_SECONDS} \
+	  $${QUALITY_EDN:+--edn $$QUALITY_EDN} $${QUALITY_TOP:+--top $$QUALITY_TOP}
+
+$(GO-CALLABLES): $(shell find cmd/go-callables -name '*.go')
+	go build -o $@ ./cmd/go-callables

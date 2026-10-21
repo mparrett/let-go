@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -17,6 +18,17 @@ var lgBin string
 var repoRoot string
 
 func TestMain(m *testing.M) {
+	if os.Getenv(fakePodHelperEnv) == "1" {
+		runFakePod()
+	}
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "GIT_") {
+			if err := os.Unsetenv(name); err != nil {
+				panic(err)
+			}
+		}
+	}
 	tmp, err := os.MkdirTemp("", "lg-fanout-*")
 	if err != nil {
 		panic(err)
@@ -27,14 +39,34 @@ func TestMain(m *testing.M) {
 	if out, err := build.CombinedOutput(); err != nil {
 		panic("build lg: " + err.Error() + "\n" + string(out))
 	}
+	// .lg tests that shell out to an engine (the spec-evidence CLI tests) run
+	// in this process under TestRunner, and no lg binary exists at the repo
+	// root in CI. Hand them the binary built above.
+	if err := os.Setenv("CLJ_ENGINE", lgBin); err != nil {
+		panic("set CLJ_ENGINE: " + err.Error())
+	}
 	repoRoot, _ = filepath.Abs("..")
-	appliedPatches := applyJankPatches()
 	code := m.Run()
 	// Leave the submodule worktree as we found it — these are test-time
 	// overlays, not checkout changes the run should persist.
-	revertJankPatches(appliedPatches)
+	revertJankPatches(jankPatches)
 	os.RemoveAll(tmp)
 	os.Exit(code)
+}
+
+func TestHookGitEnvIsolated(t *testing.T) {
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "GIT_") {
+			t.Errorf("inherited Git environment variable %s was not cleared", name)
+		}
+	}
+	if os.Getenv("PATH") == "" {
+		t.Error("PATH was cleared along with Git environment variables")
+	}
+	if value, ok := os.LookupEnv("LG_TEST_HOOK_SENTINEL"); ok && value != "kept" {
+		t.Errorf("non-Git sentinel = %q, want kept", value)
+	}
 }
 
 func TestPatchOverlayApplyIdempotentAndRevert(t *testing.T) {
@@ -80,6 +112,7 @@ func TestPatchOverlayApplyIdempotentAndRevert(t *testing.T) {
 }
 
 func TestJankSuiteCoversLetGoUnicodeScalar(t *testing.T) {
+	ensureJankSuite()
 	fixture := filepath.Join("clojure-test-suite", "test", "clojure", "core_test", "char.cljc")
 	got, err := os.ReadFile(fixture)
 	if os.IsNotExist(err) {
@@ -90,6 +123,96 @@ func TestJankSuiteCoversLetGoUnicodeScalar(t *testing.T) {
 	}
 	if !bytes.Contains(got, []byte(`:lg      (= (first "𐅧") (char 65895))`)) {
 		t.Fatal("patched fixture lacks the let-go Unicode scalar expectation")
+	}
+}
+
+// jankSuiteSetup gates suite preparation so it happens once, and only when a
+// test or benchmark that actually reads the suite runs. TestMain must not do
+// this eagerly: it executes before the -run filter applies, so an eager sync
+// would move the submodule checkout for every `go test ./test` invocation,
+// including runs that never touch the suite.
+var (
+	jankSuiteSetup sync.Once
+	jankPatches    []string
+)
+
+// ensureJankSuite syncs the submodule to its pinned SHA and overlays the :lg
+// fixture patches. Call it at the top of anything that reads clojure-test-suite.
+// Patches are reverted by TestMain after the run.
+func ensureJankSuite() {
+	jankSuiteSetup.Do(func() {
+		syncJankSubmodule()
+		jankPatches = applyJankPatches()
+	})
+}
+
+// filterHookEnv removes GIT_* variables that the pre-push hook environment
+// sets. These variables break git -C repo discovery in subprocess calls (see
+// issue #679): the hook passes GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, and
+// GIT_PREFIX to its subprocesses; when those processes exec git with -C,
+// git honors the hook's GIT_* bindings over -C's path-based discovery,
+// breaking overlay patch application in worktree contexts.
+func filterHookEnv() []string {
+	const (
+		gitDir       = "GIT_DIR="
+		gitWorkTree  = "GIT_WORK_TREE="
+		gitIndexFile = "GIT_INDEX_FILE="
+		gitPrefix    = "GIT_PREFIX="
+	)
+	var filtered []string
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, gitDir) &&
+			!strings.HasPrefix(e, gitWorkTree) &&
+			!strings.HasPrefix(e, gitIndexFile) &&
+			!strings.HasPrefix(e, gitPrefix) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+// syncJankSubmodule brings the clojure-test-suite working tree to the commit
+// the parent repo pins in its gitlink, before the compat suite runs. jj does
+// not update git submodules on checkout, so a jj working copy can sit at an
+// older suite revision than the gitlink records — producing compat failures
+// that do not reproduce on CI (which runs `git submodule update --init`).
+// Self-heal so the local pre-push gate matches CI. Best-effort: never fail the
+// run here; a still-drifted suite fails loudly on its own assertions, which
+// beats a silent stale pass. jj ignores the submodule, so checking out a
+// different SHA in its worktree creates no jj snapshot churn.
+func syncJankSubmodule() {
+	const path = "test/clojure-test-suite"
+	// `git submodule status <path>` leading char: ' ' in sync, '+' the checkout
+	// differs from the pin, '-' uninitialized, 'U' merge conflicts. Run from the
+	// repo root (tests run in test/).
+	cmd := exec.Command("git", "-C", "..", "submodule", "status", path)
+	cmd.Env = filterHookEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return // not a git checkout / submodule absent — suite skips itself elsewhere
+	}
+	switch out[0] {
+	case ' ':
+		return // already at the pinned SHA — the common fast path
+	case '-':
+		return // uninitialized — applyJankPatches' os.Stat skip handles it
+	}
+	// The SHA `git submodule status` prints for a '+' entry is the CURRENT
+	// checkout, not the pin; the pin is the gitlink recorded in the index.
+	checkout := strings.TrimLeft(strings.Fields(string(out))[0], "+-U ")
+	pin := "?"
+	lsCmd := exec.Command("git", "-C", "..", "ls-files", "-s", path)
+	lsCmd.Env = filterHookEnv()
+	if idx, err := lsCmd.Output(); err == nil {
+		if f := strings.Fields(string(idx)); len(f) >= 2 {
+			pin = f[1]
+		}
+	}
+	fmt.Fprintf(os.Stderr, "note: %s checkout %.12s differs from pin %.12s; running `git submodule update --init`\n", path, checkout, pin)
+	updateCmd := exec.Command("git", "-C", "..", "submodule", "update", "--init", path)
+	updateCmd.Env = filterHookEnv()
+	if o, err := updateCmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "note: submodule sync failed (%v); running against the drifted checkout\n%s", err, o)
 	}
 }
 
@@ -122,15 +245,21 @@ func applyPatchOverlay(repo, patch string) bool {
 	// Already applied? A reverse-check succeeds only when the :lg branches
 	// are present, so treat that as "nothing to do" — and don't revert state
 	// we didn't create.
-	if exec.Command("git", "-C", repo, "apply", "--reverse", "--check", patch).Run() == nil {
+	reverseCheckCmd := exec.Command("git", "-C", repo, "apply", "--reverse", "--check", patch)
+	reverseCheckCmd.Env = filterHookEnv()
+	if reverseCheckCmd.Run() == nil {
 		return false
 	}
 	// Applies cleanly against the current (base) fixtures?
-	if err := exec.Command("git", "-C", repo, "apply", "--check", patch).Run(); err != nil {
+	checkCmd := exec.Command("git", "-C", repo, "apply", "--check", patch)
+	checkCmd.Env = filterHookEnv()
+	if err := checkCmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "note: jank patch %s does not apply cleanly (upstream moved?); running unpatched\n", filepath.Base(patch))
 		return false
 	}
-	if out, err := exec.Command("git", "-C", repo, "apply", patch).CombinedOutput(); err != nil {
+	applyCmd := exec.Command("git", "-C", repo, "apply", patch)
+	applyCmd.Env = filterHookEnv()
+	if out, err := applyCmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "note: failed to apply jank patch %s: %v\n%s", filepath.Base(patch), err, out)
 		return false
 	}
@@ -147,7 +276,9 @@ func revertJankPatches(applied []string) {
 // revertPatchOverlay is best-effort: cleanup failures are reported without
 // masking the test result.
 func revertPatchOverlay(repo, patch string) {
-	if out, err := exec.Command("git", "-C", repo, "apply", "--reverse", patch).CombinedOutput(); err != nil {
+	revertCmd := exec.Command("git", "-C", repo, "apply", "--reverse", patch)
+	revertCmd.Env = filterHookEnv()
+	if out, err := revertCmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "note: failed to revert jank patch %s: %v\n%s", filepath.Base(patch), err, out)
 	}
 }

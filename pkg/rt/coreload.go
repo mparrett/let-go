@@ -7,6 +7,7 @@ package rt
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/nooga/let-go/pkg/bytecode"
@@ -41,25 +42,32 @@ type CoreLoadOptions struct {
 // baseline namespaces (let-go.core, let-go.types) which are auto-refer'd
 // everywhere but never explicitly required, then optionally the hybrid
 // namespace chunks. Non-core/non-baseline namespaces are marked NeedsLoad so a
-// configured loader picks them up on (require ...). Returns the decoded unit so
-// a caller can read its const pool or chunk map.
+// configured loader picks them up on (require ...); their chunks are not even
+// decoded until then (unit.NSChunk). Returns the decoded unit so a caller can
+// read its const pool or materialize a namespace's chunk.
 //
-// It folds together what were three parallel implementations (#506):
-// compiler.loadPrecompiledBundle, rt.LoadCore, and rt.BootCore. Two invariants
-// that used to live in only some of them are now unconditional here:
+// It is the one implementation behind compiler.loadPrecompiledBundle,
+// rt.LoadCore, and rt.BootCore. Two invariants hold here:
 //
-//   - *ns* is saved before the replay and restored after. Each chunk runs its
-//     (ns …) form under a frame with no ExecContext, so in-ns falls through to
-//     CurrentNS.SetRoot and mutates the global root; unrestored, a caller that
-//     returns straight to user code (BootCore) would deref a *ns* left pointing
-//     at whichever chunk ran last. loadPrecompiledBundle only got away without
-//     this because api.NewContext re-establishes *ns* before user code.
-//   - the eager hybrid loop iterates unit.NSOrder (dependency order), not the
-//     NSChunks map, so replay order is deterministic, and calls
+//   - for every caller, *ns* is saved before the replay and restored after.
+//     Each chunk runs its (ns …) form under a frame with no ExecContext, so
+//     in-ns falls through to CurrentNS.SetRoot and mutates the global root;
+//     unrestored, a caller that returns straight to user code (BootCore) would
+//     deref a *ns* left pointing at whichever chunk ran last.
+//   - under EagerHybrids, the hybrid loop iterates unit.NSOrder (dependency
+//     order), not the NSChunks map, so replay order is deterministic, and calls
 //     ReapplyGeneratedPrimitives after each chunk — the chunk's bootstrap defs
 //     overwrite the native adapters #438 Def'd at init, so without the reapply
 //     a bundle that eager-re-Defs one would strand its callers on the
 //     trampoline and lose the direct-call fast path.
+//
+// nativeBackedNS is the namespace set LoadCoreBundle saw before its first
+// decode in this process; see the hybrid-detection comment there.
+var (
+	nativeBackedNSOnce sync.Once
+	nativeBackedNS     map[string]bool
+)
+
 func LoadCoreBundle(opts CoreLoadOptions) (*bytecode.ExecUnit, error) {
 	if len(CoreCompiledLGB) == 0 {
 		return nil, fmt.Errorf("LoadCoreBundle: embedded core is empty (built -tags bootstrap?)")
@@ -69,16 +77,40 @@ func LoadCoreBundle(opts CoreLoadOptions) (*bytecode.ExecUnit, error) {
 	savedNS := CurrentNS.Deref()
 	defer CurrentNS.SetRoot(savedNS)
 
-	// Namespaces present before decode are native-backed (installers ran at
-	// package init). A bundle chunk for one of them is a HYBRID namespace whose
-	// chunk must run eagerly (qualified refs bypass the on-demand loader).
-	preexisting := map[string]bool{}
-	for name := range AllNSes() {
-		preexisting[name] = true
+	// Namespaces present before the FIRST decode in this process are
+	// native-backed (installers ran at package init). A bundle chunk for one of
+	// them is a HYBRID namespace whose chunk must run eagerly (qualified refs
+	// bypass the on-demand loader). The set is captured once: a decode registers
+	// a placeholder for every bundled namespace, so a second boot in the same
+	// process (a test, a benchmark iteration) that judged hybrids from the live
+	// registry would replay every lazy namespace eagerly and no longer measure
+	// what startup does.
+	nativeBackedNSOnce.Do(func() {
+		nativeBackedNS = map[string]bool{}
+		for name := range AllNSes() {
+			nativeBackedNS[name] = true
+		}
+	})
+	preexisting := nativeBackedNS
+
+	// Decode only what this boot runs. A namespace left for the on-demand
+	// loader keeps its chunks undecoded until its first require
+	// (bytecode.DecodeBundle); NSChunk materializes it then. Whether a hybrid
+	// counts as run-at-boot follows EagerHybrids, so the two callers defer
+	// exactly the set they will not replay here.
+	baseline := map[string]bool{}
+	for _, name := range LgBaselineNSNames() {
+		baseline[name] = true
+	}
+	deferNS := func(name string) bool {
+		if name == NameCoreNS || baseline[name] {
+			return false
+		}
+		return !opts.EagerHybrids || !preexisting[name]
 	}
 
 	tDecode := time.Now()
-	unit, err := bytecode.DecodeToExecUnitBytes(CoreCompiledLGB, LGBVarResolver)
+	unit, err := bytecode.DecodeBundle(CoreCompiledLGB, LGBVarResolver, deferNS)
 	if err != nil {
 		return nil, fmt.Errorf("decode core bundle: %w", err)
 	}
@@ -88,9 +120,12 @@ func LoadCoreBundle(opts CoreLoadOptions) (*bytecode.ExecUnit, error) {
 
 	// Replay core's def/defn/defmacro definitions.
 	tCore := time.Now()
-	if err := runChunk(unit.MainChunk); err != nil {
+	if err := runUnitChunk(unit, unit.MainChunk); err != nil {
 		return nil, fmt.Errorf("run core chunk: %w", err)
 	}
+	// Every replayed namespace takes back the Go overrides its lowered
+	// package registered, which the replay's defs just replaced.
+	ApplyGoOverrides(LookupNS(NameCoreNS))
 	if opts.OnPhase != nil {
 		opts.OnPhase("run-core-chunk", tCore)
 	}
@@ -102,19 +137,21 @@ func LoadCoreBundle(opts CoreLoadOptions) (*bytecode.ExecUnit, error) {
 	// lg baseline namespaces depend on core's defs — run eagerly, right after.
 	// A Go-only baseline (let-go.types, predicates Def'd in Go) has no chunk;
 	// rt.runChunk does not nil-guard, so skip those here.
-	baseline := map[string]bool{}
 	for _, name := range LgBaselineNSNames() {
-		baseline[name] = true
 		if ch := unit.NSChunks[name]; ch != nil {
-			if err := runChunk(ch); err != nil {
+			if err := runUnitChunk(unit, ch); err != nil {
 				return nil, fmt.Errorf("run baseline %s: %w", name, err)
 			}
+			ApplyGoOverrides(LookupNS(name))
 		}
 	}
 
-	// Everything else loads on demand.
-	for name := range unit.NSChunks {
+	// Everything else loads on demand. A deferred namespace may have had none
+	// of its var references decoded yet, so register it here rather than rely
+	// on the decode's VarRef pass having created it.
+	for _, name := range unit.NSOrder {
 		if name != NameCoreNS && !baseline[name] {
+			DefNSBare(name)
 			MarkNSNeedsLoad(name)
 		}
 	}
@@ -128,11 +165,12 @@ func LoadCoreBundle(opts CoreLoadOptions) (*bytecode.ExecUnit, error) {
 			if ch == nil {
 				continue
 			}
-			if err := runChunk(ch); err != nil {
+			if err := runUnitChunk(unit, ch); err != nil {
 				return nil, fmt.Errorf("run hybrid %s: %w", name, err)
 			}
 			ClearNSNeedsLoad(name)
 			ReapplyGeneratedPrimitives(name)
+			ApplyGoOverrides(LookupNS(name))
 		}
 	}
 

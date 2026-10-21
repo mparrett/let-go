@@ -175,15 +175,36 @@
 
 (defn identity [x] x)
 
+;; Convention for every library validation throw under pkg/rt/core: use
+;; (ex-info msg {:fn ... :type ... :value ...}) — never throw a bare
+;; string or a bare `str`-built message directly — see task-16-brief.md.
+;; Three keys, always:
+;;   :fn    — keyword naming the throwing fn/macro (or the internal callee
+;;            it delegates to), so a handler knows where this came from
+;;            without parsing the message.
+;;   :type  — (type value): a cheap discriminator a handler can branch on
+;;            without forcing or printing the offending value itself.
+;;   :value — the offending value itself, for actual diagnosis. Programmatic
+;;            handling needs the real value, not just its shape, so this is
+;;            kept even though it can be large or a lazy/infinite seq.
+;; NOTE: printing an unbounded :value (e.g. an infinite lazy seq) on the
+;; error-reporting path (str e / pr-str e / the test harness's
+;; render-actual) is unbounded today. *print-length* / *print-level* are
+;; declared in this file (below) for exactly this purpose but the printer
+;; (pkg/vm/exinfo.go's ExceptionInfo.String, which calls e.data.String()
+;; directly) does not consult them. That is a pre-existing printer defect,
+;; not specific to ex-info's data map — it affects printing any unbounded
+;; value anywhere, not just here — and is out of scope for this convention;
+;; the fix belongs in the VM printing layer with its own tests.
 (defn zero? [x]
   (if (number? x)
     (== 0 x)
-    (throw (str "zero? requires a number, got " x))))
+    (throw (ex-info (str "zero? requires a number, got " x) {:fn :zero? :type (type x) :value x}))))
 (defn pos? [x] (> x 0))
 (defn neg? [x] (< x 0))
 (defn even? [x]
   (when-not (integer? x)
-    (throw (str "even? requires an integer, got " x)))
+    (throw (ex-info (str "even? requires an integer, got " x) {:fn :even? :type (type x) :value x})))
   (= 0 (mod x 2)))
 (defn odd? [x]
   (not (even? x)))
@@ -217,12 +238,20 @@
 (defn unchecked-add-int [x y] (unchecked-add x y))
 (defn unchecked-multiply-int [x y] (unchecked-multiply x y))
 
-;; *unchecked-math*: a JVM compiler knob toggling unchecked arithmetic for
-;; the +/-/* family. let-go has no such compile mode, so this is an honest
-;; no-op dynamic var (default false), present so code that `set!`s it loads.
+;; *unchecked-math*: a compile-time knob toggling unchecked arithmetic for
+;; the +/-/* family, as on the JVM. The compiler reads it when compiling each
+;; form and rewrites the checked op to its wrapping unchecked-* counterpart.
+;; CompileMultiple evaluates each top-level form before compiling the next, so
+;; a top-level `set!` applies to everything after it in the file.
 (def ^:dynamic *unchecked-math*
-  "Compatibility var for Clojure's unchecked arithmetic mode. let-go accepts
-   and dynamically binds the value, but it has no code-generation effect."
+  "When truthy at compile time, + - * inc dec compile to their wrapping
+   unchecked-* counterparts instead of raising on int64 overflow.
+
+   Arity follows Clojure: the identity arities ((+) (*) (+ x) (* x)) are left
+   alone, (- x) becomes unchecked-negate, two arguments map directly, and
+   higher arities left-nest -- (+ a b c) is (unchecked-add (unchecked-add a b) c).
+   Float arguments keep float arithmetic, since they have no int64 overflow
+   to wrap. A lexically shadowed + is never rewritten."
   false)
 
 ;; Unlike Clojure's JVM reflection warning, this reports let-go call sites
@@ -244,7 +273,7 @@
 (defn num [x]
   (if (nil? x) nil
     (if (number? x) x
-      (throw (str "Expected a number, got " (type x))))))
+      (throw (ex-info (str "Expected a number, got " (type x)) {:fn :num :type (type x) :value x})))))
 
 (defn ffirst [x] (first (first x)))
 (defn fnext [x] (first (next x)))
@@ -277,11 +306,13 @@
 (defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
 (defn qualified-symbol? [x] (and (symbol? x) (some? (namespace x))))
 
-;; bleh
+;; A vector is an ArrayVector (every literal and small vector) or a
+;; PersistentVector (a large one built incrementally). Compared as type
+;; objects: printing the type name per call cost a string and its boxing.
 (defn vector? [x]
   (let [t (type x)]
-    (or (= t (type []))
-        (= "let-go.lang.PersistentVector" (str t)))))
+    (or (= t let-go.lang.ArrayVector)
+        (= t let-go.lang.PersistentVector))))
 ;; list?, map?, and set? are native builtins (handle seq/list distinctions and sorted variants)
 (defn symbol? [x] (= (type x) (type 'x)))
 (defn keyword? [x] (= (type x) (type :x)))
@@ -309,21 +340,18 @@
   (cond
     (map? coll)
     (reduce (fn [acc pair] (f acc (first pair) (second pair))) init coll)
-    (= "let-go.lang.TransientMap" (str (type coll)))
+    (= (type coll) let-go.lang.TransientMap)
     (reduce (fn [acc pair] (f acc (first pair) (second pair))) init coll)
-    ;; Vectors: both ArrayVector (literal []) and PersistentVector (large
-    ;; vectors built incrementally) need integer-keyed iteration. Test via
-    ;; counted+nth contract rather than exact type, since IR insts grow
-    ;; large enough to migrate from ArrayVector to PersistentVector.
-    (or (vector? coll)
-        (= "let-go.lang.PersistentVector" (str (type coll))))
+    ;; Vectors, ArrayVector and PersistentVector alike, need integer-keyed
+    ;; iteration.
+    (vector? coll)
     (let [n (count coll)]
       (loop [i 0 acc init]
         (if (>= i n)
           acc
           (recur (inc i) (f acc i (nth coll i))))))
     (nil? coll) init
-    :else (throw (str "reduce-kv: unsupported coll type: " (type coll)))))
+    :else (throw (ex-info (str "reduce-kv: unsupported coll type: " (type coll)) {:fn :reduce-kv :type (type coll) :value coll}))))
 
 (defmacro time [& body]
   (let [then    (gensym "time__")
@@ -535,7 +563,7 @@
 (defmacro when-let
   [bindings & body]
   (if (not (= 2 (count bindings)))
-    (throw "when-let requires exactly two forms in binding vector")
+    (throw (ex-info "when-let requires exactly two forms in binding vector" {:fn :when-let :type (type bindings) :value bindings}))
     (let [form (bindings 0) tst (bindings 1)]
       `(let [temp# ~tst]
          (when temp#
@@ -743,7 +771,7 @@
       (destructure* o)
       (let [x (first e)]
         (cond
-          (= x '&) (recur (drop 2 e) i (conj o (second e) (list 'drop i n)))
+          (= x '&) (recur (drop 2 e) i (conj o (second e) (list 'clojure.core/seq (list 'drop i n))))
           (= x :as) (recur (drop 2 e) i (conj o (second e) n))
           :else (recur (next e) (inc i) (conj o x (list 'nth n i nil))))))))
 
@@ -861,13 +889,57 @@
       name
       (list 'with-meta sym meta))))
 
+;; fn-arglists: the :arglists metadata Clojure attaches to defn/defmacro vars
+;; — a seq of param vectors, one per arity — read straight off the
+;; (unevaluated) arity forms a defn/defn- macro invocation was handed. Inlines
+;; its own arity-vector unwrap (rather than calling the later-defined
+;; unwrap-fn-arity-vector) because defn- calls this DURING its own
+;; macroexpansion, and unwrap-fn-arity-vector's own definition further below
+;; is itself a (defn- ...) — a genuine bootstrap ordering cycle otherwise.
+(defn ^:private fn-arglists [forms]
+  (let [unwrap (fn [form]
+                 (if (and (seq? form)
+                          (= 'with-meta (first form))
+                          (vector? (second form)))
+                   (second form)
+                   form))
+        first-form (unwrap (first forms))]
+    (if (vector? first-form)
+      (list first-form)
+      ;; apply list, not bare map: :arglists becomes a def-time bytecode
+      ;; CONSTANT (see defCompiler's apply-def-meta! emission), and the
+      ;; encoder can't serialize a lazy seq — apply forces it into a real
+      ;; List before it ever reaches the const pool.
+      (apply list (map #(unwrap (first %)) forms)))))
+
 (defmacro defn- [name & forms]
   (let [doc   (if (string? (first forms)) (first forms) nil)
         forms (if (string? (first forms)) (next forms) forms)
         attr  (if (map? (first forms)) (first forms) nil)
         forms (if (map? (first forms)) (next forms) forms)
-        attr  (assoc (if (nil? attr) {} attr) :private true)]
+        attr  (assoc (if (nil? attr) {} attr) :private true :arglists (fn-arglists forms))]
     `(def ~(def-meta-name name doc attr) (fn ~@forms))))
+
+;; Builds a map from a kwargs rest-seq, Clojure 1.11 semantics: pairs are
+;; assoc'd in order, and a call may end with a single trailing map whose
+;; entries are assoc'd in place - so (f :a 1 {:b 2}) binds {:a 1 :b 2}. A
+;; trailing non-map with an odd argument count is the same error it always
+;; was. Defined this early in the bootstrap (fn-expand emits calls to it),
+;; so the body sticks to primitives that already exist here - no into, no
+;; docstring.
+(defn seq-to-map-for-destructuring
+  [s]
+  (if (nil? (seq s))
+    nil
+    (loop [m {} s (seq s)]
+      (if (nil? s)
+        m
+        (if (nil? (next s))
+          (if (map? (first s))
+            (reduce conj m (seq (first s)))
+            (throw (ex-info "kwargs call has an odd number of arguments and no trailing map"
+                            {:trailing (first s)})))
+          (recur (assoc m (first s) (first (next s))) (next (next s))))))))
 
 (defn ^:private fn-expand [bindings body]
   (let [conditions (when (and (next body) (map? (first body))) (first body))
@@ -895,8 +967,11 @@
             rest-sym (gensym "rest__")
             map-sym (gensym "map__")
             new-bindings (conj pre '& rest-sym)
-            ;; Build: (let [map-sym (apply hash-map rest-sym) mdestr map-sym] body...)
-            let-binds (vector map-sym (list 'apply 'hash-map rest-sym) mdestr map-sym)
+            ;; Build: (let [map-sym (seq-to-map-for-destructuring rest-sym) mdestr map-sym] body...)
+            ;; seq-to-map-for-destructuring returns nil for an empty/nil rest,
+            ;; so {:as o} binds to nil (not {}) when no kwargs were passed —
+            ;; matching Clojure — while also merging a Clojure 1.11 trailing map.
+            let-binds (vector map-sym (list 'seq-to-map-for-destructuring rest-sym) mdestr map-sym)
             let-form (list* 'let let-binds body)]
         (fn-expand new-bindings (list let-form)))
       (if (some (complement symbol?) bindings)
@@ -943,7 +1018,14 @@
       (vector? (unwrap-fn-arity-vector (first forms)))
       (cons 'fn* (fn-expand (unwrap-fn-arity-vector (first forms)) (next forms)))
 
-      (list? (first forms))
+      ;; `seq?`, not `list?`: an arity clause built by a macro is often a
+      ;; Cons rather than a List (anything built with `cons`/`concat`), and
+      ;; `list?` is false for those. The :else arm below returns nil, so a
+      ;; Cons clause used to make the whole `fn` silently evaluate to nil —
+      ;; a multi-arity defmacro with an injected &form binding hit exactly
+      ;; this. The vector? arm above still runs first, so a single-arity
+      ;; `[args]` form never reaches here.
+      (seq? (first forms))
       `(fn* ~@(map #(fn-expand (unwrap-fn-arity-vector (first %)) (next %)) forms))
 
       :else
@@ -972,11 +1054,30 @@
 ;; fallback events for testing/analysis.
 (def ^:dynamic *ir-compile-fallback-log* (atom []))
 
+;; When true, a defn that cannot be IR-compiled THROWS instead of quietly
+;; falling back to the bytecode compiler.
+;;
+;; The hybrid fallback is deliberate and stays the default: without it a
+;; single unlowerable defn aborts a whole corpus, turning *ir-compile* into
+;; an all-or-nothing switch. But "falls back" and "falls back SILENTLY" are
+;; separable, and only the first is a feature. With the default settings a
+;; coverage loss is indistinguishable from success — you pay the full IR
+;; compile cost, run bytecode anyway, and nothing says so. *ir-compile-verbose*
+;; reports it but does not fail, so nothing in CI can gate on it.
+;;
+;; Turn this on when you are measuring coverage rather than shipping code:
+;; corpus censuses, pipeline development, and any test asserting that a form
+;; really lowers. Note this catches what *strict-structured?* cannot — that
+;; var is scoped to structured-control-flow drift in the GO backend, and
+;; never sees a bytecode-path lowering failure.
+(def ^:dynamic *ir-compile-strict* false)
+
 (defmacro defn [name & forms]
   (let [doc        (if (string? (first forms)) (first forms) nil)
         forms      (if (string? (first forms)) (next forms) forms)
         attr       (if (map? (first forms)) (first forms) nil)
         forms      (if (map? (first forms)) (next forms) forms)
+        attr       (assoc (if (nil? attr) {} attr) :arglists (fn-arglists forms))
         def-name   (def-meta-name name doc attr)
         first-form (unwrap-fn-arity-vector (first forms))
         single?    (vector? first-form)
@@ -989,7 +1090,7 @@
     (if *ir-compile*
       (let [cf-var (resolve 'ir.passes.pipeline/compile-form)]
         (when (nil? cf-var)
-          (throw "*ir-compile* is true but ir.passes.pipeline isn't loaded; (require 'ir.passes.pipeline) first"))
+          (throw (ex-info "*ir-compile* is true but ir.passes.pipeline isn't loaded; (require 'ir.passes.pipeline) first" {:fn :ir-compile-strict :type (type name) :value name})))
         ;; HYBRID: attempt to lower this body through the IR pipeline, but fall
         ;; back to the standard bytecode compile when compile-form can't handle
         ;; it (interop, unsupported forms, …). Without this, a single
@@ -1012,10 +1113,24 @@
                     (let [error-msg (str e)]
                       (println (str "ir-compile: defn " name " fell back to direct compile: " error-msg))
                       (swap! *ir-compile-fallback-log* conj [name error-msg])))
+                  ;; Strict mode: refuse the silent downgrade. Rethrow with the
+                  ;; defn named, so a coverage loss is a failure you can gate on
+                  ;; rather than a bytecode-speed function that looks compiled.
+                  (when *ir-compile-strict*
+                    (throw (ex-info (str "ir-compile-strict: defn " name
+                                         " failed to IR-compile: " e)
+                                    {:fn :ir-compile-strict :type (type name) :value name})))
                   nil)))
             ;; Fallback: standard bytecode compile (same as *ir-compile* off).
             `(def ~def-name (fn ~@forms))))
       `(def ~def-name (fn ~@forms)))))
+
+;; Bound by the compiler (and macroexpand) to the whole macro call form for
+;; the duration of one expander invocation. defmacro exposes it as &form.
+(def ^:dynamic *macro-form* nil)
+
+;; Path of the file being loaded, or "NO_SOURCE_PATH" at the REPL (spec 4.3).
+(def ^:dynamic *file* "NO_SOURCE_PATH")
 
 (defmacro defmacro [name & forms]
   (let [doc   (if (string? (first forms)) (first forms) nil)
@@ -1031,11 +1146,42 @@
         ;; `(var ..)` ref — `var` only accepts a Symbol.
         bare  (if (and (seq? name) (= 'with-meta (first name)))
                 (first (next name))
-                name)]
+                name)
+        ;; &env is NOT implemented: it is hard-coded nil here, unlike &form
+        ;; (which is real, bound from *macro-form*). Clojure's compiler binds
+        ;; &env to a map of the lexical environment visible at the macro call
+        ;; site; this runtime tracks no such map, so there is nothing real to
+        ;; bind. A reader should not assume &env has parity with &form just
+        ;; because both are exposed — this is deliberate and pinned by a test
+        ;; (not a placeholder to fill in casually); implementing real &env is
+        ;; separate future work, not something to do here.
+        ;; Returns the arity's body forms, not one form: a leading pre/post
+        ;; condition map has to stay the FIRST form of the body, where
+        ;; `fn-expand` looks for it. Wrapping the whole body in the
+        ;; &form/&env `let` buried it one level down and silently disabled
+        ;; `{:pre [..]}` on a macro (mparrett, #863). The recognition rule is
+        ;; `fn-expand`'s own: a map is a condition map only when the body has
+        ;; a form after it, so `(defmacro m [] {:a 1})` still returns a map.
+        wrap-body (fn [b]
+                    (let [conds  (when (and (next b) (map? (first b))) (first b))
+                          inner  (if conds (next b) b)
+                          wrapped (cons 'let
+                                        (cons [(symbol "&form") '*macro-form*
+                                               (symbol "&env") nil]
+                                              inner))]
+                      (if conds (list conds wrapped) (list wrapped))))
+        ;; `args` is a vector for a single-arity macro (`[a b] body...`), or
+        ;; the first arity-clause list for a multi-arity macro (each clause
+        ;; is `([a b] body...)`). Wrap the body of every arity in the
+        ;; &form/&env let so &form is visible regardless of which arity ran.
+        tail  (if (vector? args)
+                (cons args (wrap-body body))
+                (map (fn [clause] (cons (first clause) (wrap-body (next clause))))
+                     forms))]
     (list 'do
           (cons 'defn (cons name (concat (if (string? doc) (list doc) nil)
                                          (if (nil? attr) nil (list attr))
-                                         (cons args body))))
+                                         tail)))
           (list 'set-macro! (list 'var bare)))))
 
 (defmacro while [test & body]
@@ -1151,7 +1297,7 @@
 (defmacro when-first
   [bindings & body]
   (if (not (= 2 (count bindings)))
-    (throw "when-first requires exactly two forms in binding vector")
+    (throw (ex-info "when-first requires exactly two forms in binding vector" {:fn :when-first :type (type bindings) :value bindings}))
     (let [x (bindings 0) coll (bindings 1)
           s (gensym "s__")]
       `(when-let [~s (seq ~coll)]
@@ -1424,14 +1570,14 @@
 (defn random-sample
   ([prob]
    (when (nil? prob)
-     (throw "random-sample probability must be a number"))
+     (throw (ex-info "random-sample probability must be a number" {:fn :random-sample :type (type prob) :value prob})))
    (cond
      (<= prob 0) (filter (fn [_] false))
      (>= prob 1) (filter (fn [_] true))
      :else (filter (fn [_] (< (rand) prob)))))
   ([prob coll]
    (when (nil? prob)
-     (throw "random-sample probability must be a number"))
+     (throw (ex-info "random-sample probability must be a number" {:fn :random-sample :type (type prob) :value prob})))
    (cond
      (<= prob 0) ()
      (>= prob 1) coll
@@ -1518,7 +1664,7 @@
 (defn select-keys
   [map keyseq]
   (when (and (some? map) (not (map? map)) (not (set? map)) (not (vector? map)))
-    (throw (str "select-keys not supported on " (type map))))
+    (throw (ex-info (str "select-keys not supported on " (type map)) {:fn :select-keys :type (type map) :value map})))
   (loop [ret {} keys (seq keyseq)]
     (if keys
       (let [entry (find map (first keys))]
@@ -1916,8 +2062,27 @@
 ;; is gated so it costs nothing until *lg-trace* is first set truthy.
 (def ^:dynamic *lg-trace* false)
 
-;; --- print/read tuning dynamic vars (stubs; not yet honored by writers) ---
+;; --- print/read tuning dynamic vars ---
 
+;; Extensible tagged-literal handlers. Keys are tag symbols and values are
+;; one-argument functions invoked with the normally read payload form, or a
+;; native raw reader that consumes the payload text itself (importing the Go
+;; package pkg/gofragments installs one for #go). Empty by default, as in
+;; Clojure; #inst and #uuid live in default-data-readers.
+(def ^:dynamic *data-readers* {})
+
+(def default-data-readers
+  "Data readers consulted after *data-readers*, as in Clojure: #inst and
+   #uuid. Rebinding *data-readers* leaves them in place."
+  {'inst (fn read-instant [form] (-read-builtin-tagged 'inst form))
+   'uuid (fn read-uuid [form] (-read-builtin-tagged 'uuid form))})
+
+;; Called with the tag symbol and the form for a tag that neither
+;; *data-readers* nor the built-in #inst/#uuid handles. When it is nil, or
+;; returns nil, reading the tag throws "No reader function for tag".
+(def ^:dynamic *default-data-reader-fn* nil)
+
+;; Print tuning vars are compatibility stubs; writers do not honor them yet.
 (def ^:dynamic *print-level* nil)
 (def ^:dynamic *print-length* nil)
 (def ^:dynamic *print-meta* false)
@@ -1925,19 +2090,18 @@
 (def ^:dynamic *print-dup* false)
 (def ^:dynamic *flush-on-newline* true)
 
-;; --- macro implicit context (stubs) ---
+;; --- macro implicit context ---
 ;; Clojure's compiler binds &env (lexical-env map) and &form (the current
-;; form being expanded) inside macro bodies. let-go's macro invoker doesn't
-;; thread these in yet, so we bind them globally to nil so macros that
-;; reference them at least resolve. Behavior for code that branches on
-;; their value will differ from Clojure — but the file loads.
+;; form being expanded) inside macro bodies. &form IS real here — defmacro's
+;; wrap-body (above, in defmacro's own definition) shadows it per-expansion
+;; with *macro-form*. &env is NOT implemented: let-go's macro invoker threads
+;; no lexical-environment map, so defmacro's wrap-body always shadows it with
+;; a hard-coded nil. These top-level defs are just the fallback root binding
+;; for code that references &env/&form outside any macro body (so it at
+;; least resolves instead of erroring). Do not assume &env has parity with
+;; &form — code that branches on &env's value will differ from Clojure.
 (def &env nil)
 (def &form nil)
-
-;; tagged-literal? — let-go has no TaggedLiteral type yet, so no value
-;; is ever a tagged literal. Returning false unconditionally matches
-;; how Clojure treats anything that didn't go through (tagged-literal …).
-(defn tagged-literal? [_] false)
 
 ;; ->AssertionError (not AssertionError.) so syntax-quote qualifies it to
 ;; core/->AssertionError: hygienic against caller shadowing, and the dotted
@@ -2076,19 +2240,18 @@
 ;; Shadowing: a `bound` set tracks names introduced by enclosing binding forms
 ;; (method params, let/loop/fn/...) so a local that shares a field's name wins.
 ;; The first method parameter is the receiver (`this`), like mainline Clojure.
-;; KNOWN LIMITATIONS: `for`, `doseq` (their :let/:when/:while modifiers break the
-;; plain [target init] pair assumption) and `letfn` (locally-bound fn names) are
-;; not treated as binding forms — a local in one of those that shares a field's
-;; name would be wrongly rewritten. These are rare in deftype method bodies;
-;; add them to -dt-let-like with modifier-aware handling if needed.
+;; Any other macro is expanded before rewriting, so the binding forms it
+;; expands to (for, doseq and letfn become let*/loop*/fn*) shadow through the
+;; arms below.
 (declare -dt-rewrite-let)
 (declare -dt-rewrite-fn)
 (declare -dt-rewrite-case)
 
 ;; binding forms with a clean `[target init ...]` vector (no for/doseq-style
 ;; modifiers). Their inits are rewritten in the outer scope; targets shadow.
-;; NB: a *quoted* set literal '#{..} reads as a (hash-set ..) form in let-go,
-;; not a set value — build the set explicitly.
+;; NB: set literals read as set VALUES (not as (hash-set ..) forms), so this
+;; could be written as a literal; it is built explicitly to stay readable
+;; alongside the other -dt-* tables.
 (def -dt-let-like
   (set '(let let* loop loop* when-let when-let* if-let if-let*
           when-some if-some binding with-open with-local-vars dotimes)))
@@ -2110,11 +2273,38 @@
 (def -dt-kw-emit  (fn [recv f] (list (keyword f) recv)))
 
 (defn- -dt-rewrite [emit recv fields muts bound form]
+  ;; Dispatch on the collection LATTICE, not on concrete types. Enumerating
+  ;; vector?/seq? silently dropped every other collection: a map literal
+  ;; `{:k field}` has never been rewritten (pre-existing), and once set
+  ;; literals began reading as sets rather than as (hash-set ..) lists,
+  ;; `#{field}` stopped being rewritten too. The associative arms must come
+  ;; BEFORE vector?, because a map entry IS a vector — descending into it as a
+  ;; 2-vector would rewrite the key as if it were a value. Other non-sequential
+  ;; values pass through as atoms.
   (cond
     (symbol? form)
     (if (and (contains? fields form) (not (contains? bound form)))
       (emit recv form)
       form)
+    ;; Rewriting can make distinct source forms equal (a bare field `x` and an
+    ;; explicit `(.x this)`), and rebuilding a host map or set would keep only
+    ;; one of them, dropping an evaluation. An unchanged literal stays a
+    ;; literal; a changed one becomes a constructor call that keeps every slot.
+    (map? form)
+    (let [original (vec (map (fn [e] [(nth e 0) (nth e 1)]) (seq form)))
+          entries (vec (map (fn [e] [(-dt-rewrite emit recv fields muts bound (nth e 0))
+                                     (-dt-rewrite emit recv fields muts bound (nth e 1))])
+                            original))]
+      (if (= entries original)
+        form
+        (apply list 'clojure.core/array-map
+               (reduce (fn [acc e] (conj (conj acc (nth e 0)) (nth e 1))) [] entries))))
+    (set? form)
+    (let [original (vec (seq form))
+          elements (vec (map (fn [x] (-dt-rewrite emit recv fields muts bound x)) original))]
+      (if (= elements original)
+        form
+        (apply list 'clojure.core/hash-set elements)))
     (vector? form)
     (vec (map (fn [x] (-dt-rewrite emit recv fields muts bound x)) form))
     (not (seq? form)) form
@@ -2135,7 +2325,17 @@
         (or (= h 'fn) (= h 'fn*))
         (-dt-rewrite-fn emit recv fields muts bound form)
         :else
-        (apply list (map (fn [x] (-dt-rewrite emit recv fields muts bound x)) form))))))
+        ;; A macro receives its arguments as source, as it does in Clojure,
+        ;; where a field is a plain local: expand it before rewriting anything
+        ;; inside. Rewriting first handed the macro constructor calls in place
+        ;; of the map and set literals it was given, and field reads in place
+        ;; of symbols it may treat as data.
+        (let [expanded (if (and (symbol? h) (not (contains? bound h)) (not (contains? fields h)))
+                         (macroexpand form)
+                         form)]
+          (if (= expanded form)
+            (apply list (map (fn [x] (-dt-rewrite emit recv fields muts bound x)) form))
+            (-dt-rewrite emit recv fields muts bound expanded)))))))
 
 (defn- -dt-rewrite-let [emit recv fields muts bound form]
   (let [h    (first form)
@@ -2170,9 +2370,6 @@
 ;; so a field-named symbol in a test position must stay a literal, not become a
 ;; field read. Rewrite the dispatch expr and every result expr (plus the
 ;; optional trailing default), but pass each test constant through untouched.
-;; Other symbol-quoting macros (a user macro that treats a symbol as data) are
-;; still not recognized here — a field-named symbol handed to one as a literal
-;; would be wrongly rewritten, same class of limitation as for/doseq/letfn.
 (defn- -dt-rewrite-case [emit recv fields muts bound form]
   (let [e       (-dt-rewrite emit recv fields muts bound (second form))
         clauses (nnext form)]
@@ -2215,7 +2412,9 @@
         fieldset      (set bare-fields)
         mutset        (set (map -dt-field-name (filter -dt-mutable? fields)))
         quoted-fields (map (fn [f] (list 'quote f)) bare-fields)
-        type-def      (cons 'make-deftype (cons (str tname) quoted-fields))
+        ;; The defining namespace names the type for a compiled constant to
+        ;; resolve back to it (vm.DefineDType).
+        type-def      (cons 'make-deftype (cons (str (ns-name *ns*)) (cons (str tname) quoted-fields)))
         pos-ctor-name (symbol (str "->" tname))
         pos-ctor-body (cons 'make-deftype-instance (cons tname bare-fields))
         pos-ctor      (list 'def pos-ctor-name
@@ -2233,7 +2432,7 @@
         bare-fields (map -dt-field-name fields)
         fieldset (set bare-fields)
         field-keywords (map keyword bare-fields)
-        type-def (cons 'make-record-type (cons (str name) field-keywords))
+        type-def (cons 'make-record-type (cons (str (ns-name *ns*)) (cons (str name) field-keywords)))
         ;; Positional constructor: (->Point x y) → (make-record Point {:x x :y y})
         pos-ctor-name (symbol (str "->" name))
         pos-ctor-body (list 'make-record name
@@ -2275,8 +2474,9 @@
                             remaining sigs]
                        (if (keyword? (first remaining))
                          (if (nil? (next remaining))
-                           (throw (str "defprotocol option " (first remaining)
-                                       " requires a value"))
+                           (throw (ex-info (str "defprotocol option " (first remaining)
+                                                " requires a value")
+                                           {:fn :defprotocol :type (type (first remaining)) :value (first remaining)}))
                            (recur (assoc options (first remaining) (second remaining))
                                   (next (next remaining))))
                          [options remaining]))
@@ -2284,7 +2484,8 @@
         sigs         (mapv (fn [sig]
                              (if (and (seq? sig) (symbol? (first sig)))
                                sig
-                               (throw (str "defprotocol signature must start with a symbol: " sig))))
+                               (throw (ex-info (str "defprotocol signature must start with a symbol: " sig)
+                                               {:fn :defprotocol :type (type sig) :value sig}))))
                            (second parsed))
         method-names (mapv first sigs)
         ;; Quote method names so they don't get resolved as vars
@@ -2401,7 +2602,28 @@
                               entry   [proto mname (cons 'core/fn fn-tail)]]
                           (recur (next s) proto (conj result entry))))))))]
     (let [entries (parse specs)
-          by-proto (group-by first entries)
+          ;; Object method overrides are not protocol impls: toString wires
+          ;; into the type's string representation (str/pr-str/println all
+          ;; route through it); everything else — hashCode, equals — is
+          ;; accepted and ignored, because instance hash/equality are
+          ;; identity-based (the JVM default) and the runtime has no hook
+          ;; that could surface a user override's errors.
+          object-entries (filter (fn [e] (= 'Object (first e))) entries)
+          proto-entries  (remove (fn [e] (= 'Object (first e))) entries)
+          ;; Only the documented Object methods are accepted — anything
+          ;; else stays a compile-time error so a misspelling isn't
+          ;; silently swallowed.
+          _ (doseq [[_ mname _] object-entries]
+              (when-not (contains? #{'toString 'hashCode 'equals} mname)
+                (throw (ex-info (str "reify: unsupported Object method " mname
+                                     " (only toString, hashCode, equals are accepted)")
+                                {:fn :reify :type (type mname) :value mname}))))
+          ;; Last duplicate wins, matching Clojure: (reify Object
+          ;; (toString [this] "a") (toString [this] "b")) prints b.
+          to-string (last (keep (fn [[_ mname fn-form]]
+                                  (when (= 'toString mname) fn-form))
+                                object-entries))
+          by-proto (group-by first proto-entries)
           extends (map (fn [[proto-sym methods]]
                          (let [impl-pairs (mapcat (fn [[_ mname fn-form]]
                                                     [(keyword mname) fn-form])
@@ -2412,6 +2634,8 @@
       (cons 'let
             (cons [type-sym (list 'make-deftype (str type-sym))]
                   (concat extends
+                          (when to-string
+                            (list (list '-set-deftype-to-string! type-sym to-string)))
                           (list (list 'make-deftype-instance type-sym))))))))
 
 ;; (extend-protocol Protocol
@@ -2475,18 +2699,18 @@
    binding."
   [vars vals func]
   ;; olds must be captured eagerly (mapv, not lazy map) BEFORE rebinding, or the
-  ;; restore would read the just-installed temp roots. Restore is explicit
-  ;; (not finally), because a try/finally without a catch swallows the throw.
+  ;; restore would read the just-installed temp roots. The restore is a finally,
+  ;; not a catch: a catch clause does not see scope cancellation, and a
+  ;; cancelled body must still put the original roots back.
   (let [olds   (mapv var-get vars)
         rebind (fn [vs xs]
                  (doseq [pair (map vector vs xs)]
                    (alter-var-root (first pair) (constantly (second pair)))))]
     (rebind vars vals)
-    (let [outcome (try {:ok (func)} (catch e {:err e}))]
-      (rebind vars olds)
-      (if (contains? outcome :ok)
-        (:ok outcome)
-        (throw (:err outcome))))))
+    (try
+      (func)
+      (finally
+        (rebind vars olds)))))
 
 (defmacro with-redefs
   "(with-redefs [v1 val1 v2 val2 ...] body...) temporarily redefines the root
@@ -2765,9 +2989,10 @@
         dispatch-fn (first args)
         opts-list (next args)
         _ (when (odd? (count opts-list))
-            (throw (str "defmulti " name
-                        ": options must be key-value pairs. "
-                        "Example: (defmulti name dispatch-fn :default dispatch-value)")))
+            (throw (ex-info (str "defmulti " name
+                                 ": options must be key-value pairs. "
+                                 "Example: (defmulti name dispatch-fn :default dispatch-value)")
+                            {:fn :defmulti :type (type name) :value name})))
         options (apply hash-map opts-list)
         default-val (get options :default :default)]
     `(def ~(def-meta-name name doc attr) (defmulti* ~(str name) ~dispatch-fn ~default-val))))
@@ -2789,7 +3014,7 @@
 ;; ignore it, error clearly if it is set true.
 (defn pr-on [obj writer]
   (when *print-dup*
-    (throw "print-dup is not supported yet (see issue #176); bind *print-dup* to false"))
+    (throw (ex-info "print-dup is not supported yet (see issue #176); bind *print-dup* to false" {:fn :pr-on :type (type obj) :value obj})))
   (print-method obj writer))
 
 ;; print-method collection methods: recurse through pr-on to honor custom
@@ -2820,6 +3045,62 @@
       (recur (next es) false)))
   (.WriteString w "}"))
 
+;; --- tagged literals ---
+
+(defrecord TaggedLiteral [tag form])
+
+(defmethod print-method TaggedLiteral [t w]
+  (.WriteString w "#")
+  (.WriteString w (str (:tag t)))
+  (.WriteString w " ")
+  (pr-on (:form t) w))
+
+(defn tagged-literal
+  "The tagged literal #tag form."
+  [tag form]
+  (when-not (symbol? tag)
+    (throw (ex-info (str "tagged-literal: tag must be a symbol, got " (pr-str tag))
+                    {:fn :tagged-literal :type (type tag) :value tag})))
+  (->TaggedLiteral tag form))
+
+(defn tagged-literal?
+  "True if x was built by tagged-literal."
+  [x]
+  (instance? TaggedLiteral x))
+
+(defn- callable-data-reader [f tag map-name]
+  (if (ifn? f)
+    f
+    (throw (ex-info (str map-name " entry for " tag " must be callable, got " (pr-str (type f)))
+                    {:fn :read-tagged :type (type f) :value f}))))
+
+(defn- data-reader-fn [entry tag map-name]
+  (callable-data-reader (if (var? entry) (deref entry) entry) tag map-name))
+
+(defn- data-reader-entry [readers tag map-name]
+  (if (map? readers)
+    (let [entry (get readers tag)]
+      (if (nil? entry) nil (data-reader-fn entry tag map-name)))
+    (if (nil? readers)
+      nil
+      (throw (ex-info (str map-name " must be a map, got " (pr-str (type readers)))
+                      {:fn :read-tagged :type (type readers) :value readers})))))
+
+(defn -read-tagged
+  "The reader's policy for a tagged literal #tag form, as Clojure's: a
+   *data-readers* entry, else a default-data-readers entry (#inst, #uuid),
+   else *default-data-reader-fn*. A tag none of them handles throws."
+  [tag form]
+  (if-let [f (or (data-reader-entry *data-readers* tag "*data-readers*")
+                 (data-reader-entry default-data-readers tag "default-data-readers"))]
+    (f form)
+    (let [default-fn *default-data-reader-fn*
+          value (when default-fn (default-fn tag form))]
+      (if (some? value)
+        value
+        (throw (ex-info (str "No reader function for tag " tag)
+                        {:fn :read-tagged :type (type tag) :value tag}))))))
+
 ;; --- Array macros ---
 
 ;; (amap a idx ret expr) — map over array, returning new array of same type
@@ -2843,3 +3124,20 @@
 ;; with-out-str — capture printed output as a string
 (defmacro with-out-str [& body]
   `(with-out-str* (fn [] ~@body)))
+
+;; The Clojure language level let-go tracks. Libraries gate version-specific
+;; behavior on this (honeysql's suite enables its 1.11+ named-argument tests
+;; from (clojure-version)), so report the tracked level rather than failing
+;; to resolve.
+(def *clojure-version* {:major 1 :minor 11 :incremental 0 :qualifier nil})
+
+(defn clojure-version
+  "Returns the Clojure language version let-go tracks, as a printable string."
+  []
+  (str (:major *clojure-version*)
+       "."
+       (:minor *clojure-version*)
+       "."
+       (:incremental *clojure-version*)
+       (when-let [q (:qualifier *clojure-version*)]
+         (str "-" q))))

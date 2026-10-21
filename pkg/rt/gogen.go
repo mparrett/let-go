@@ -306,6 +306,29 @@ func cIdentName(v vm.Value) (vm.Value, error) {
 	return vm.String(id.Name), nil
 }
 
+// ident-names returns identifiers in AST order, including nested expressions.
+// Emitters use these names to avoid shadowing captured Go expressions.
+func cIdentNames(v vm.Value) (vm.Value, error) {
+	n, err := unboxNode(v)
+	if err != nil {
+		return vm.NIL, err
+	}
+	if n == nil {
+		return vm.EmptyList, nil
+	}
+	names := []vm.Value{}
+	ast.Inspect(n, func(node ast.Node) bool {
+		if id, ok := node.(*ast.Ident); ok {
+			names = append(names, vm.String(id.Name))
+		}
+		return true
+	})
+	if len(names) == 0 {
+		return vm.EmptyList, nil
+	}
+	return vm.NewArrayVector(names), nil
+}
+
 // type-expr: (gogen/type "spec") -> parsed type expression
 // Uses go/parser so the full Go type grammar is supported.
 //
@@ -679,6 +702,118 @@ func cForStmt(initV, condV, postV, bodyV vm.Value) (vm.Value, error) {
 		Post: post,
 		Body: &ast.BlockStmt{List: body},
 	}), nil
+}
+
+// defer-stmt: (gogen/defer-stmt call-expr) -> defer call-expr
+func cDeferStmt(callV vm.Value) (vm.Value, error) {
+	e, err := unboxExpr(callV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/defer-stmt: %w", err)
+	}
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return vm.NIL, fmt.Errorf("gogen/defer-stmt: expected *ast.CallExpr, got %T", e)
+	}
+	return box(&ast.DeferStmt{Call: call}), nil
+}
+
+// slice-expr: (gogen/slice-expr recv low high) -> recv[low:high]
+// low and/or high may be nil (os.Args[1:], buf[:n], …).
+func cSliceExpr(recvV, lowV, highV vm.Value) (vm.Value, error) {
+	r, err := unboxExpr(recvV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/slice-expr: recv: %w", err)
+	}
+	se := &ast.SliceExpr{X: r}
+	if lowV != vm.NIL {
+		low, err := unboxExpr(lowV)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("gogen/slice-expr: low: %w", err)
+		}
+		se.Low = low
+	}
+	if highV != vm.NIL {
+		high, err := unboxExpr(highV)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("gogen/slice-expr: high: %w", err)
+		}
+		se.High = high
+	}
+	return box(se), nil
+}
+
+// call-variadic: (gogen/call-variadic fn-expr [arg-exprs...])
+// Like call, but sets CallExpr.Ellipsis so the last argument is printed with
+// a trailing `...` (e.g. prog.Main(ec, argv...)).
+func cCallVariadic(fnV, argsV vm.Value) (vm.Value, error) {
+	fn, err := unboxExpr(fnV)
+	if err != nil {
+		return vm.NIL, err
+	}
+	argVals, err := seqToValues(argsV)
+	if err != nil {
+		return vm.NIL, err
+	}
+	if len(argVals) == 0 {
+		return vm.NIL, fmt.Errorf("gogen/call-variadic: need at least one arg to mark with ellipsis")
+	}
+	args := make([]ast.Expr, 0, len(argVals))
+	for i, av := range argVals {
+		e, err := unboxExpr(av)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("gogen/call-variadic: arg %d: %w", i, err)
+		}
+		args = append(args, e)
+	}
+	return box(&ast.CallExpr{
+		Fun:      fn,
+		Args:     args,
+		Ellipsis: allocPos(),
+	}), nil
+}
+
+// range-stmt: (gogen/range-stmt key val ":=" xrange [body])
+// key and/or val may be nil. tok is ":=" or "=".
+func cRangeStmt(keyV, valV, tokV, xV, bodyV vm.Value) (vm.Value, error) {
+	tokStr, err := asString(tokV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/range-stmt: tok: %w", err)
+	}
+	tok, err := opTokenOrErr(tokStr)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/range-stmt: tok: %w", err)
+	}
+	x, err := unboxExpr(xV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/range-stmt: xrange: %w", err)
+	}
+	body, err := stmtSlice(bodyV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/range-stmt: body: %w", err)
+	}
+	rs := &ast.RangeStmt{
+		Tok:  tok,
+		X:    x,
+		Body: &ast.BlockStmt{List: body},
+	}
+	if keyV != vm.NIL {
+		key, err := unboxExpr(keyV)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("gogen/range-stmt: key: %w", err)
+		}
+		rs.Key = key
+	}
+	if valV != vm.NIL {
+		val, err := unboxExpr(valV)
+		if err != nil {
+			return vm.NIL, fmt.Errorf("gogen/range-stmt: val: %w", err)
+		}
+		rs.Value = val
+	}
+	if rs.Key == nil && rs.Value == nil {
+		rs.Tok = token.ILLEGAL
+	}
+	return box(rs), nil
 }
 
 func cExprStmt(v vm.Value) (vm.Value, error) {
@@ -1594,6 +1729,58 @@ func cWithDoc(declV, commentV vm.Value) (vm.Value, error) {
 	return declV, nil
 }
 
+// with-go-directive: (gogen/with-go-directive decl "go:embed file")
+// Like with-doc, but emits `//go:embed file` with no space after `//` —
+// required for compiler directives. directive must start with "go:".
+func cWithGoDirective(declV, directiveV vm.Value) (vm.Value, error) {
+	if declV == vm.NIL {
+		return vm.NIL, nil
+	}
+	directive, err := asString(directiveV)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("gogen/with-go-directive: directive: %w", err)
+	}
+	if !strings.HasPrefix(directive, "go:") {
+		return vm.NIL, fmt.Errorf("gogen/with-go-directive: directive must start with \"go:\", got %q", directive)
+	}
+	n, err := unboxNode(declV)
+	if err != nil {
+		return vm.NIL, err
+	}
+	startPos := allocPos()
+	declPos := allocPos()
+	group := &ast.CommentGroup{List: []*ast.Comment{{
+		Slash: startPos,
+		Text:  "//" + directive,
+	}}}
+	switch x := n.(type) {
+	case *ast.GenDecl:
+		x.Doc = group
+		x.TokPos = declPos
+		if x.Lparen != token.NoPos {
+			x.Lparen = declPos
+		}
+	case *ast.FuncDecl:
+		x.Doc = group
+		if x.Type != nil {
+			x.Type.Func = declPos
+		}
+		if x.Name != nil && x.Name.NamePos < declPos {
+			x.Name.NamePos = declPos
+		}
+	case *ast.ValueSpec:
+		x.Doc = group
+		for _, nm := range x.Names {
+			if nm.NamePos < declPos {
+				nm.NamePos = declPos
+			}
+		}
+	default:
+		return vm.NIL, fmt.Errorf("gogen/with-go-directive: don't know how to attach directive to %T", n)
+	}
+	return declV, nil
+}
+
 // method-decl: (gogen/method-decl [recv-fields] "Name" [params] [results] [body])
 // -> *ast.FuncDecl with Recv set.
 //
@@ -1721,6 +1908,50 @@ func cFile(pkgV, importsV, declsV vm.Value) (vm.Value, error) {
 // operations lg needs to manage imports for the package calls gogen itself
 // introduces (math.NaN / math.Inf for non-finite float literals), without
 // mutating any shared node.
+
+// cCallTargets returns every call target in `node`'s subtree, in source order,
+// as strings: "pkg.Name" for a selector call (rt.NativePrimsIntact,
+// builtins.Nth), ".Name" for a method call on a non-ident receiver, and "Name"
+// for a bare identifier call.
+//
+// Query tooling for the lowered output. Without it, "did this function get a
+// native direct call or a trampoline?" gets answered by regex over rendered
+// text, which is fragile and silently wrong when the emission shape differs
+// from the pattern being matched (e.g. the uncached
+// rt.InvokeValueEC(ec, ec.Deref(rt.LookupVar(...))) form matches neither
+// "CachedVarFn" nor "NativePrimsIntact", so a grep-based count reports zero of
+// both and reads as "no calls"). Walking the AST answers the question the
+// lowerer actually decided, not the one a pattern happens to spell.
+//
+// Read-only: mutates nothing.
+func cCallTargets(nodeV vm.Value) (vm.Value, error) {
+	n, err := unboxNode(nodeV)
+	if err != nil {
+		return vm.NIL, err
+	}
+	if n == nil {
+		return vm.NewArrayVector(nil), nil
+	}
+	var out []vm.Value
+	ast.Inspect(n, func(x ast.Node) bool {
+		call, ok := x.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch f := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			if id, ok := f.X.(*ast.Ident); ok {
+				out = append(out, vm.String(id.Name+"."+f.Sel.Name))
+			} else {
+				out = append(out, vm.String("."+f.Sel.Name))
+			}
+		case *ast.Ident:
+			out = append(out, vm.String(f.Name))
+		}
+		return true
+	})
+	return vm.NewArrayVector(out), nil
+}
 
 // cReferencesPkg reports whether `node` references package `pkg` via a
 // `pkg.<name>` selector anywhere in its subtree. Read-only: walks the boxed
@@ -2168,6 +2399,7 @@ func installGogenNS() {
 		mk(wrap1Named("ident", cIdent)),
 		mk(wrap1Named("ident?", cIdentP)),
 		mk(wrap1Named("ident-name", cIdentName)),
+		mk(wrap1Named("ident-names", cIdentNames)),
 		mk(wrap1Named("type", cType)),
 		mk(wrap1Named("int-lit", cIntLit)),
 		mk(wrap1Named("float-lit", cFloatLit)),
@@ -2198,14 +2430,19 @@ func installGogenNS() {
 		mk(wrap1Named("interface-type", cInterfaceType)),
 		mk(wrap1Named("const-block", cConstBlock)),
 		mk(wrap2Named("with-doc", cWithDoc)),
+		mk(wrap2Named("with-go-directive", cWithGoDirective)),
 		mk(wrap2Named("label-stmt", cLabelStmt)),
+		mk(wrap1Named("defer-stmt", cDeferStmt)),
+		mk(wrap2Named("call-variadic", cCallVariadic)),
 
 		mk(wrap3Named("binary", cBinary)),
 		mk(wrap3Named("assign", cAssign)),
 		mk(wrap3Named("multi-assign", cMultiAssign)),
 		mk(wrap3Named("var-decl", cVarDecl)),
 		mk(wrap3Named("file", cFile)),
+		mk(wrap3Named("slice-expr", cSliceExpr)),
 		mk(wrap2Named("references-pkg?", cReferencesPkg)),
+		mk(wrap1Named("call-targets", cCallTargets)),
 		mk(wrap1Named("file-import-paths", cFileImportPaths)),
 		mk(wrap2Named("add-file-import", cAddFileImport)),
 		mk(wrap1Named("ensure-gen-imports", cEnsureGenImports)),
@@ -2223,6 +2460,7 @@ func installGogenNS() {
 		mk(wrap4Named("const-spec", cConstSpec)),
 
 		mk(wrap5Named("method-decl", cMethodDecl)),
+		mk(wrap5Named("range-stmt", cRangeStmt)),
 
 		mk("import-spec", makeVariadic("import-spec", cImportSpec), nil),
 	}

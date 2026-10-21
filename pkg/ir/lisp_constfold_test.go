@@ -44,13 +44,20 @@ func ensureLoader() {
 		if res.Load("ir.build") == nil {
 			panic("ir.build namespace failed to load — bundle missing or corrupt")
 		}
+		// ir.lower-go loads BEFORE ir.passes.pipeline: pipeline's module-load
+		// block injects ir.passes.liveness/reachable-nids into lower-go's
+		// hook atom, and loading lower-go afterwards re-evaluates its `def`
+		// and empties the atom again — every lowering in this process would
+		// then run without a liveness set, on the uses-table fallback, which
+		// is not what production does.
 		for _, ns := range []string{
 			"ir.zipper", "ir.passes",
 			"ir.passes.dce", "ir.passes.constfold",
 			"ir.passes.mutability", "ir.passes.cse",
 			"ir.passes.typeinfer", "ir.passes.infer-arg-types",
 			"ir.passes.licm", "ir.passes.lambda-lift", "ir.passes.inline", "ir.passes.fusion",
-			"ir.passes.liveness", "ir.passes.blockarg", "ir.passes.cleanup", "ir.passes.legalize", "ir.passes.pipeline", "ir.dump", "ir.dominance", "ir.lower-go"} {
+			"ir.passes.liveness", "ir.passes.blockarg", "ir.passes.cleanup", "ir.passes.legalize",
+			"ir.lower-go", "ir.passes.pipeline", "ir.dump", "ir.dominance"} {
 			if res.Load(ns) == nil {
 				panic("namespace failed to load: " + ns)
 			}
@@ -489,11 +496,10 @@ func TestLispConstFold(t *testing.T) {
 			mustContain: []string{"v0 = LoadArg ; 0", "Return v0"}},
 		{name: "mul-one", src: `(defn mul-one [x] (* x 1))`,
 			mustContain: []string{"v0 = LoadArg ; 0", "Return v0"}},
-		// mul-zero IS rewritten in place (fold-this! writes Const ; 0
-		// over the Mul), so the Mul opcode itself disappears.
+		// mul-zero stays a Mul: a double x gives 0.0, NaN or -0.0, not
+		// Int 0 (#1071), and nothing proves x is an Int.
 		{name: "mul-zero", src: `(defn mul-zero [x] (* x 0))`,
-			mustContain:    []string{"Const ; 0"},
-			mustNotContain: []string{"Mul"}},
+			mustContain: []string{"Mul v0 v1", "v1 = Const ; 0"}},
 		// Strategy 3 — commutative canonicalization (Const goes right).
 		// Const operand should be the SECOND ref of the Add/Mul.
 		{name: "canon-add", src: `(defn canon-add [x] (+ 5 x))`,

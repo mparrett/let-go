@@ -7,6 +7,8 @@
 
 # let-go
 
+> 💬 Come talk about let-go in `#let-go` on [The Fixpoint](https://discord.gg/Ky535CQ9pj) Discord.
+
 Greetings loafers! _(λ-gophers haha, get it?)_
 
 let-go is a Clojure dialect with a bytecode compiler and stack VM, written in Go.
@@ -78,9 +80,11 @@ lens, with no known failures, compile skips, panic skips, or runtime skips.
 Core namespaces cover `clojure.core` (macros, lazy seqs, transducers, protocols,
 records, multimethods, BigInt/BigDecimal) plus `string`, `set`, `walk`, `edn`,
 `pprint`, `test`, and `core.async`, alongside let-go's own `io`, `http`, `json`,
-`transit`, `os`, `System`, `syscall`, and `pods`. See
+`transit`, [`os`](docs/guide/os.md), `System`, `syscall`, and `pods`. See
 [docs/guide/clojure-compatibility.md](docs/guide/clojure-compatibility.md) for
-the full per-namespace status table and the Clojure differences.
+the full per-namespace status table and
+[docs/known-divergences.md](docs/known-divergences.md) for intentional differences,
+temporary mismatches, and the rationale behind shared-suite `:lg` overrides.
 
 ### Babashka pods
 
@@ -135,7 +139,7 @@ so shared `.cljc` stays JVM-loadable. See
 
 Not a drop-in JVM Clojure. The main gaps: no coordinated STM or async agents
 (`ref`/`agent` are atom-backed aliases), no `clojure.spec`, unchunked lazy seqs,
-no custom `*data-readers*`, no JVM host interop on `deftype`/`reify`, and no
+limited JVM host interop on `deftype`/`reify`, and no
 `subseq`/`rsubseq` range queries. Behavior also differs in places — pragmatic
 numeric tower, always-blocking channels, real-goroutine `go` blocks, and `re2`
 (not Java) regex.
@@ -217,6 +221,19 @@ lg -b myapp app.lg                # bundle into a self-contained binary
 The standalone binary is a copy of `lg` with your bytecode appended. Copy it
 to another machine and it runs.
 
+Release artifacts can split source maps and local-variable tables into a
+digest-bound debug companion:
+
+```bash
+lg -strip -c app.lgb app.lg       # writes app.lgb + app.lgb.debug
+lg -strip -b myapp app.lg         # writes myapp + myapp.debug
+```
+
+Archive the `.debug` file while distributing only the smaller runtime artifact.
+Putting it back beside the artifact restores source-located stack traces
+automatically; `LG_DEBUG_FILE=/path/to/app.debug` selects a companion stored
+elsewhere. A companion for a different build is rejected.
+
 ```bash
 lg -w site app.lg                 # compile to a WASM web app
 open site/index.html
@@ -289,8 +306,8 @@ go test ./... -count=1 -timeout 30s
 ## Contributing
 
 After cloning, run `make install-hooks` once to register the `core_compiled.lgb`
-merge driver (each clone needs this — the config lives in `.git/config`, which
-isn't shared). See
+and `generated.sums` merge drivers (each clone needs this — the config lives in
+`.git/config`, which isn't shared). See
 [docs/regenerating-generated-artifacts.md](docs/regenerating-generated-artifacts.md)
 for how generated artifacts are regenerated and kept in sync.
 

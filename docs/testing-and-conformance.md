@@ -2,8 +2,9 @@
 status: active
 last-verified: 2026-06-05
 authoritative-for:
-  - clojure-test-api-design
   - conformance-strategy
+superseded-by:
+  - clojure-test-conformance.md (on clojure-test-api-design — the clojure.test / clojure.test.tap layer is specified there)
 human-verified:
 ---
 
@@ -21,7 +22,7 @@ This document defines how we test let-go: unit/integration/perf tests, a `clojur
 ### Test framework (user-facing)
 
 - `clojure.test`-compatible API (subset):
-  - Macros/functions: `deftest`, `testing`, `is`, `are`, `use-fixtures` (once/each), `run-tests`.
+  - Macros/functions: `deftest`, `testing`, `is`, `are`, `use-fixtures` (once/each), `run-tests`, `run-test-var`/`run-test` for a single var (same fixtures, same namespace switch — what editors call to run the test under the cursor).
   - Output formats: human-readable default; optional TAP and JUnit XML for CI.
   - Selectors: include/exclude by ns or metadata; `:only`, `:focus`, `:skip`.
 - CLI: `lg test` supports:

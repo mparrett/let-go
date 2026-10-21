@@ -1,0 +1,12 @@
+{
+  "note": "Closure over a captured parameter: adder itself is called directly; the returned native fn is applied through rt.InvokeValueEC.",
+  "namespace": "closurecapture",
+  "generatedFile": "closurecapture/closurecapture.go",
+  "entryFn": "Main",
+  "lispFn": "adder",
+  "goFn": "Adder",
+  "lowering": "direct",
+  "functionFragment": "func Adder(ec *vm.ExecContext, arg0 vm.Value) vm.Value {\n\tvar v3 vm.Value\n\tv3 = newClosure_Adder__c3(ec, arg0)\n\treturn v3\n}",
+  "callFragment": "Adder(ec, vm.Int(5))",
+  "semanticWrap": "rt.AddValue(__EXPR__, vm.Int(1))"
+}

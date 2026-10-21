@@ -34,8 +34,8 @@ const (
 	OpLoadClosed    // .Aux = int (closed-over index)
 	OpBlockArg      // block parameter
 	OpSetVar        // .Refs[0] = var (Const aux=*vm.Var), .Refs[1] = value; pushes var back
-	OpCall          // .Refs[0] = fn, .Refs[1:] = args; .Aux = arity int
-	OpTailCall      // tail call ends a block
+	OpCall          // .Refs[0] = fn, .Refs[1:] = args; .Aux = arity int. infer? stays false: the :call arm (call-dtype/call-core-type) is typeinfer-coupled, not yet reified
+	OpTailCall      // tail call ends a block. NOT in typeinfer's terminator-ops set (infers :unknown via default), so infer? is false
 	OpAdd
 	OpSub
 	OpMul
@@ -48,6 +48,9 @@ const (
 	OpUnsignedBitShiftRight // clojure.core/unsigned-bit-shift-right — integer logical right shift
 	OpQuot                  // clojure.core/quot — integer quotient truncated toward zero. int/int lowers to native Go `/` (which truncates identically); any float/ratio/boxed operand lowers via rt.QuotValue (native float `/` does NOT truncate)
 	OpDiv                   // clojure.core// — true division. float/float lowers to native Go `/`; any other operand mix (int/int -> Ratio, mixed -> Float) lowers via rt.DivValue. Distinguished from Quot by op-kw in lower-go (both render Go `/`)
+	OpUncheckedAdd          // clojure.core/unchecked-add — Int+Int wrapping at the platform width; native Go + for int/int, rt.UncheckedAddValue otherwise
+	OpUncheckedSub          // clojure.core/unchecked-subtract — Int-Int wrapping at the platform width; native Go - for int/int, rt.UncheckedSubValue otherwise
+	OpUncheckedMul          // clojure.core/unchecked-multiply — Int*Int wrapping at the platform width; native Go * for int/int, rt.UncheckedMulValue otherwise
 	OpLt
 	OpLte
 	OpGt
@@ -62,59 +65,67 @@ const (
 	OpBranchIf    // .Refs[0] = cond; .Aux = struct{True,False *BranchTarget}
 	OpMakeClosure // .Refs[0] = *Func value (the func to wrap as a closure)
 	OpPushClosed  // .Refs[0] = closure, .Refs[1] = value to attach
-	OpTry         // .Refs[0] = body closure; then optional handler closure (binds the caught value), then optional finally closure; .Aux = {:has-handler bool :has-finally bool}
+	OpTry         // .Refs[0] = body closure; then optional handler closure (binds the caught value), then optional finally closure; .Aux = {:has-handler bool :has-finally bool}. lower? -> TryOp delegates to try-assign-stmts (registered by ir.lower-go)
 	OpDot         // .Refs[0] = obj; .Aux = field symbol; Go struct field selector obj.field (gogen_ir path only)
 	OpDef         // .Refs[0] = var (Const aux=*vm.Var), optional .Refs[1] = value; interns + returns the var (2-ref also sets root)
+	OpRecurFn     // function-level recur back-edge; .Refs = replacement args (no callee), .Aux = argc int
 )
 
 // opInfo describes an Op's structural metadata.
 type opInfo struct {
-	name       string
-	stackIn    int  // -1 = variable (decoded from Aux/arity)
-	stackOut   int  // 0 or 1
-	pure       bool // safe to CSE, fold, hoist
-	terminator bool // ends a basic block
+	name          string
+	stackIn       int  // -1 = variable (decoded from Aux/arity)
+	stackOut      int  // 0 or 1
+	pure          bool // safe to CSE, fold, hoist
+	terminator    bool // ends a basic block
+	localCarrying bool // lowering materialises the result into a Go local
+	inferFacet    bool // typeinfer facet reified on an ir.ops op-type
+	lowerFacet    bool // lower-go facet reified on an ir.ops op-type
 }
 
 var opTable = [...]opInfo{
-	OpInvalid:               {"INVALID", 0, 0, false, false},
-	OpConst:                 {"Const", 0, 1, true, false},
-	OpLoadArg:               {"LoadArg", 0, 1, true, false},
-	OpLoadVar:               {"LoadVar", 0, 1, false, false},
-	OpLoadClosed:            {"LoadClosed", 0, 1, true, false},
-	OpBlockArg:              {"BlockArg", 0, 1, true, false},
-	OpSetVar:                {"SetVar", 2, 1, false, false},
-	OpCall:                  {"Call", -1, 1, false, false},
-	OpTailCall:              {"TailCall", -1, 1, false, true},
-	OpAdd:                   {"Add", 2, 1, true, false},
-	OpSub:                   {"Sub", 2, 1, true, false},
-	OpMul:                   {"Mul", 2, 1, true, false},
-	OpBitAnd:                {"BitAnd", 2, 1, true, false},
-	OpBitOr:                 {"BitOr", 2, 1, true, false},
-	OpBitXor:                {"BitXor", 2, 1, true, false},
-	OpBitAndNot:             {"BitAndNot", 2, 1, true, false},
-	OpBitShiftLeft:          {"BitShiftLeft", 2, 1, true, false},
-	OpBitShiftRight:         {"BitShiftRight", 2, 1, true, false},
-	OpUnsignedBitShiftRight: {"UnsignedBitShiftRight", 2, 1, true, false},
-	OpQuot:                  {"Quot", 2, 1, true, false},
-	OpDiv:                   {"Div", 2, 1, true, false},
-	OpLt:                    {"Lt", 2, 1, true, false},
-	OpLte:                   {"Lte", 2, 1, true, false},
-	OpGt:                    {"Gt", 2, 1, true, false},
-	OpGte:                   {"Gte", 2, 1, true, false},
-	OpEq:                    {"Eq", 2, 1, true, false},
-	OpInc:                   {"Inc", 1, 1, true, false},
-	OpDec:                   {"Dec", 1, 1, true, false},
-	OpBitNot:                {"BitNot", 1, 1, true, false},
-	OpPop:                   {"Pop", 1, 0, false, false},
-	OpReturn:                {"Return", 1, 0, false, true},
-	OpBranch:                {"Branch", 0, 0, false, true},
-	OpBranchIf:              {"BranchIf", 1, 0, false, true},
-	OpMakeClosure:           {"MakeClosure", 1, 1, false, false},
-	OpPushClosed:            {"PushClosed", 2, 1, false, false},
-	OpTry:                   {"Try", -1, 1, false, false},
-	OpDot:                   {"Dot", 1, 1, false, false},
-	OpDef:                   {"Def", -1, 1, false, false},
+	OpInvalid:               {"INVALID", 0, 0, false, false, false, false, false},
+	OpConst:                 {"Const", 0, 1, true, false, false, true, true},
+	OpLoadArg:               {"LoadArg", 0, 1, true, false, false, true, false},
+	OpLoadVar:               {"LoadVar", 0, 1, false, false, false, true, false},
+	OpLoadClosed:            {"LoadClosed", 0, 1, true, false, false, true, false},
+	OpBlockArg:              {"BlockArg", 0, 1, true, false, true, true, false},
+	OpSetVar:                {"SetVar", 2, 1, false, false, false, false, false},
+	OpCall:                  {"Call", -1, 1, false, false, true, false, false},
+	OpTailCall:              {"TailCall", -1, 1, false, true, false, false, false},
+	OpAdd:                   {"Add", 2, 1, true, false, true, true, false},
+	OpSub:                   {"Sub", 2, 1, true, false, true, true, false},
+	OpMul:                   {"Mul", 2, 1, true, false, true, true, false},
+	OpBitAnd:                {"BitAnd", 2, 1, true, false, true, true, false},
+	OpBitOr:                 {"BitOr", 2, 1, true, false, true, true, false},
+	OpBitXor:                {"BitXor", 2, 1, true, false, true, true, false},
+	OpBitAndNot:             {"BitAndNot", 2, 1, true, false, true, true, false},
+	OpBitShiftLeft:          {"BitShiftLeft", 2, 1, true, false, true, true, false},
+	OpBitShiftRight:         {"BitShiftRight", 2, 1, true, false, true, true, false},
+	OpUnsignedBitShiftRight: {"UnsignedBitShiftRight", 2, 1, true, false, true, true, false},
+	OpQuot:                  {"Quot", 2, 1, true, false, true, true, false},
+	OpDiv:                   {"Div", 2, 1, true, false, true, true, false},
+	OpUncheckedAdd:          {"UncheckedAdd", 2, 1, true, false, true, true, false},
+	OpUncheckedSub:          {"UncheckedSub", 2, 1, true, false, true, true, false},
+	OpUncheckedMul:          {"UncheckedMul", 2, 1, true, false, true, true, false},
+	OpLt:                    {"Lt", 2, 1, true, false, true, true, false},
+	OpLte:                   {"Lte", 2, 1, true, false, true, true, false},
+	OpGt:                    {"Gt", 2, 1, true, false, true, true, false},
+	OpGte:                   {"Gte", 2, 1, true, false, true, true, false},
+	OpEq:                    {"Eq", 2, 1, true, false, true, true, false},
+	OpInc:                   {"Inc", 1, 1, true, false, true, true, false},
+	OpDec:                   {"Dec", 1, 1, true, false, true, true, false},
+	OpBitNot:                {"BitNot", 1, 1, true, false, true, true, false},
+	OpPop:                   {"Pop", 1, 0, false, false, false, false, false},
+	OpReturn:                {"Return", 1, 0, false, true, false, true, false},
+	OpBranch:                {"Branch", 0, 0, false, true, false, true, false},
+	OpBranchIf:              {"BranchIf", 1, 0, false, true, false, true, false},
+	OpMakeClosure:           {"MakeClosure", 1, 1, false, false, false, false, false},
+	OpPushClosed:            {"PushClosed", 2, 1, false, false, false, false, false},
+	OpTry:                   {"Try", -1, 1, false, false, true, false, true},
+	OpDot:                   {"Dot", 1, 1, false, false, true, false, false},
+	OpDef:                   {"Def", -1, 1, false, false, true, false, false},
+	OpRecurFn:               {"RecurFn", -1, 0, false, true, false, false, false},
 }
 
 // String returns the op's display name (or "Op?" for an unknown op).
@@ -147,6 +158,30 @@ func (op Op) StackOut() int {
 		return opTable[op].stackOut
 	}
 	return 0
+}
+
+// LocalCarrying reports whether lowering materialises op's result into a Go local.
+func (op Op) LocalCarrying() bool {
+	if int(op) < len(opTable) {
+		return opTable[op].localCarrying
+	}
+	return false
+}
+
+// InferFacet reports whether op's typeinfer facet is reified on an ir.ops op-type.
+func (op Op) InferFacet() bool {
+	if int(op) < len(opTable) {
+		return opTable[op].inferFacet
+	}
+	return false
+}
+
+// LowerFacet reports whether op's lower-go facet is reified on an ir.ops op-type.
+func (op Op) LowerFacet() bool {
+	if int(op) < len(opTable) {
+		return opTable[op].lowerFacet
+	}
+	return false
 }
 
 func isCheapMaterializeOp(op Op) bool {
@@ -198,6 +233,12 @@ func irOpToBytecode(op Op) int32 {
 		return vm.OP_QUOT
 	case OpDiv:
 		return vm.OP_DIV
+	case OpUncheckedAdd:
+		return vm.OP_UNCHECKED_ADD
+	case OpUncheckedSub:
+		return vm.OP_UNCHECKED_SUB
+	case OpUncheckedMul:
+		return vm.OP_UNCHECKED_MUL
 	case OpLt:
 		return vm.OP_LT
 	case OpLte:
@@ -224,6 +265,8 @@ func irOpToBytecode(op Op) int32 {
 		return vm.OP_MAKE_CLOSURE
 	case OpPushClosed:
 		return vm.OP_PUSH_CLOSEDOVER
+	case OpRecurFn:
+		return vm.OP_RECUR_FN
 	default:
 		return vm.OP_NOOP
 	}
@@ -269,6 +312,12 @@ func bytecodeToIROp(op int32) Op {
 		return OpQuot
 	case vm.OP_DIV:
 		return OpDiv
+	case vm.OP_UNCHECKED_ADD:
+		return OpUncheckedAdd
+	case vm.OP_UNCHECKED_SUB:
+		return OpUncheckedSub
+	case vm.OP_UNCHECKED_MUL:
+		return OpUncheckedMul
 	case vm.OP_LT:
 		return OpLt
 	case vm.OP_LTE:
@@ -295,7 +344,105 @@ func bytecodeToIROp(op int32) Op {
 		return OpMakeClosure
 	case vm.OP_PUSH_CLOSEDOVER:
 		return OpPushClosed
+	case vm.OP_RECUR_FN:
+		return OpRecurFn
 	default:
 		return OpInvalid
+	}
+}
+
+var opKeywordNames = []string{"invalid", "const", "load-arg", "load-var", "load-closed", "block-arg", "set-var", "call", "tail-call", "add", "sub", "mul", "bit-and", "bit-or", "bit-xor", "bit-and-not", "bit-shift-left", "bit-shift-right", "unsigned-bit-shift-right", "quot", "div", "unchecked-add", "unchecked-sub", "unchecked-mul", "lt", "lte", "gt", "gte", "eq", "inc", "dec", "bit-not", "pop", "return", "branch", "branch-if", "make-closure", "push-closed", "try", "dot", "def", "recur-fn"}
+
+// OpKeywords returns every catalogued op as its kebab-case keyword name, in Op order.
+func OpKeywords() []string { return opKeywordNames }
+
+func opByKeywordExact(name string) (Op, bool) {
+	switch name {
+	case "invalid":
+		return OpInvalid, true
+	case "const":
+		return OpConst, true
+	case "load-arg":
+		return OpLoadArg, true
+	case "load-var":
+		return OpLoadVar, true
+	case "load-closed":
+		return OpLoadClosed, true
+	case "block-arg":
+		return OpBlockArg, true
+	case "set-var":
+		return OpSetVar, true
+	case "call":
+		return OpCall, true
+	case "tail-call":
+		return OpTailCall, true
+	case "add":
+		return OpAdd, true
+	case "sub":
+		return OpSub, true
+	case "mul":
+		return OpMul, true
+	case "bit-and":
+		return OpBitAnd, true
+	case "bit-or":
+		return OpBitOr, true
+	case "bit-xor":
+		return OpBitXor, true
+	case "bit-and-not":
+		return OpBitAndNot, true
+	case "bit-shift-left":
+		return OpBitShiftLeft, true
+	case "bit-shift-right":
+		return OpBitShiftRight, true
+	case "unsigned-bit-shift-right":
+		return OpUnsignedBitShiftRight, true
+	case "quot":
+		return OpQuot, true
+	case "div":
+		return OpDiv, true
+	case "unchecked-add":
+		return OpUncheckedAdd, true
+	case "unchecked-sub":
+		return OpUncheckedSub, true
+	case "unchecked-mul":
+		return OpUncheckedMul, true
+	case "lt":
+		return OpLt, true
+	case "lte":
+		return OpLte, true
+	case "gt":
+		return OpGt, true
+	case "gte":
+		return OpGte, true
+	case "eq":
+		return OpEq, true
+	case "inc":
+		return OpInc, true
+	case "dec":
+		return OpDec, true
+	case "bit-not":
+		return OpBitNot, true
+	case "pop":
+		return OpPop, true
+	case "return":
+		return OpReturn, true
+	case "branch":
+		return OpBranch, true
+	case "branch-if":
+		return OpBranchIf, true
+	case "make-closure":
+		return OpMakeClosure, true
+	case "push-closed":
+		return OpPushClosed, true
+	case "try":
+		return OpTry, true
+	case "dot":
+		return OpDot, true
+	case "def":
+		return OpDef, true
+	case "recur-fn":
+		return OpRecurFn, true
+	default:
+		return OpInvalid, false
 	}
 }

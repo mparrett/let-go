@@ -1,9 +1,10 @@
 ---
 status: active
-last-verified: 2026-06-05
+last-verified: 2026-10-06
 authoritative-for:
   - go-aot-backend-design
   - two-tier-aot-approach
+  - aot-compile-driver
 human-verified:
 ---
 
@@ -52,7 +53,7 @@ This document proposes a second backend that compiles let-go code to Go, preserv
   - Self-tail recursion: transform to `for { ... update args ... continue }`.
   - Mutual tail recursion: optional trampoline helper (lower priority, can remain dynamic via VM path initially).
 - Calls:
-  - Direct calls to known compiled functions via Go calls when target is statically known and annotations allow devirtualization.
+  - Direct calls to known compiled functions via Go calls, as Clojure's direct linking does: a lowered fn calling another lowered fn calls its Go function, except a `^:redef` or `^:dynamic` fn, which stays a call through its `Var`.
   - Otherwise, call through `Var` indirection: `v := ns.Resolve("sym"); fn := v.Deref().(vm.Fn); return fn.Invoke(args)`.
 - Numerics: continue to use `vm.Int` fast paths per `value-representation-and-numeric-performance.md`.
 
@@ -68,6 +69,18 @@ This document proposes a second backend that compiles let-go code to Go, preserv
   - Library: emit a Go package that can be `import`ed and `init()` registers vars.
   - Binary: emit `main.go` that installs stdlib (image or compiled) and application ns, then runs `-m your.main/ns -f your-fn`.
 
+### Driving lowering: `lg.compiler` and the `lg-compile` shim
+
+Whole-program lowering is driven by `lg.compiler` (`pkg/rt/core/lg/compiler.lg`): it parses each input into a lowering spec, orders the specs by their requires, evaluates only definitional forms (after splicing `do` and expanding macro calls, so a macro-emitted `defn` counts) so cross-namespace references resolve, hands the set to `ir.passes.pipeline/lower-all-ns-to-go-result`, and writes the emitted packages. Entry-frame emission is opt-in.
+
+It is an ordinary embedded core namespace, so a released binary drives AOT lowering with no let-go checkout on disk, and edits to it churn `pkg/rt/generated.sums` like any other core source.
+
+**Core-embedded is not the same as bundled.** Build-time tools are embedded as source but excluded from `core_compiled.lgb`, and load on demand when something requires them — `cmd/lgbgen.isBundleSkippedTool` holds the list. Two families qualify today, the `ir.*` pipeline and `lg.compiler.*`, for the same reason: a plain `lg` script never touches them, so decoding them at every process start is pure cost. It is not a small cost. `lg.compiler` is 30 chunks on its own, but its requires pull the whole IR pipeline and `gogen` into the const pool: bundling it takes `core_compiled.lgb` from 311,302 to 1,097,639 bytes (937 to 2,164 chunks) and costs 3.2 to 3.4 times the boot, 1.9 ms to 6.0 ms median on a quiet host and 2.7 ms to 9.2 ms on a loaded one, against an 8 ms budget (interleaved, 25 pairs per condition, 2026-09-08). That fits the budget on a quiet host and flakes the gate on a loaded one, so the skip is a cost decision rather than a hard failure. Either is acceptable to the project (#735); the skip is kept because the cost buys a plain script nothing. The skip is scoped to the bundle alone — the Go-lowering path must still see these namespaces, so `deriveGoLoweringOrder` does not consult it.
+
+**`scripts/lg-compile` is a compatibility surface, not an implementation.** External orchestrators invoke it by path and read its output, so four things are contract: the path, the positional argv, the printed lines, and the exit code. In particular `EMIT-FAIL <path> pkg=<pkg> returned <type>` is scraped from stdout, and an EMIT-FAIL is deliberately not an exit failure — a function that does not lower stays on the trampoline and the program still runs, so partial lowering is a normal outcome the orchestrator judges for itself. Only a fatal error exits non-zero. `lg.compiler/exit-code` owns that policy and `test/e2e` pins both halves.
+
+The intended destination for this layering, including a thin `lg.commands.compile` CLI adapter and the move of `ir.*` under `lg.compiler.ir.*`, is tracked in #786.
+
 ### MVP scope (Native lowering tier)
 
 - Support non-variadic functions, fixed arity 0–3, no closures.
@@ -80,14 +93,14 @@ This document proposes a second backend that compiles let-go code to Go, preserv
 
 - Closures: compile to Go structs capturing closed-overs and implementing `vm.Fn`.
 - Variadics/rest args: specialized wrappers to minimize allocations; align with VM small-arity opcodes.
-- Direct-call devirtualization when target var is known final (annotated or compiler-proven).
+- Direct linking between lowered fns, as in Clojure: a fn is treated as final unless it is `^:redef` or `^:dynamic`. Compiler-proven finality and deoptimization through the evaluator are planned in #1031.
 - Source maps and improved stack traces.
 
 ### Acceptance criteria
 
 - Mixed execution works: compiled functions can call interpreted functions and vice versa using the same `Var`s.
 - Performance: microbenchmarks show clear wins over VM interpreter for hot functions (call overhead, tight loops, tail recursion).
-- Semantics preserved: dynamic var redefinition observed by compiled code when not inlined.
+- Semantics preserved: a var redefinition is observed by interpreted code and by every call through the `Var`; a lowered caller of a directly linked fn observes it once recompiled, as with Clojure's direct linking.
 
 ### Risks and mitigations
 

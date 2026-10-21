@@ -54,27 +54,37 @@ func (l Keyword) Arity() int {
 }
 
 func (l Keyword) Invoke(pargs []Value) (Value, error) {
-	vl := len(pargs)
-	if vl < 1 || vl > 2 {
-		return NIL, fmt.Errorf("wrong number of arguments %d", vl)
+	switch len(pargs) {
+	case 1:
+		return l.lookup(pargs[0]), nil
+	case 2:
+		return l.lookupOr(pargs[0], pargs[1]), nil
 	}
-	as, ok := pargs[0].(Lookup)
+	return NIL, fmt.Errorf("wrong number of arguments %d", len(pargs))
+}
+
+// lookup is (:k coll): the value at l in coll, nil when coll is no Lookup.
+func (l Keyword) lookup(coll Value) Value {
+	as, ok := coll.(Lookup)
 	if !ok {
-		if vl == 2 {
-			return pargs[1], nil
-		}
-		return NIL, nil
+		return NIL
 	}
 	if kl, ok := as.(KeywordLookup); ok {
-		if vl == 1 {
-			return kl.ValueAtKeyword(l), nil
-		}
-		return kl.ValueAtKeywordOr(l, pargs[1]), nil
+		return kl.ValueAtKeyword(l)
 	}
-	if vl == 1 {
-		return as.ValueAt(l), nil
+	return as.ValueAt(l)
+}
+
+// lookupOr is (:k coll default).
+func (l Keyword) lookupOr(coll, dflt Value) Value {
+	as, ok := coll.(Lookup)
+	if !ok {
+		return dflt
 	}
-	return as.ValueAtOr(l, pargs[1]), nil
+	if kl, ok := as.(KeywordLookup); ok {
+		return kl.ValueAtKeywordOr(l, dflt)
+	}
+	return as.ValueAtOr(l, dflt)
 }
 
 func (l Keyword) NamespacedRaw() (ns Keyword, name Keyword, hasNS bool) {
@@ -101,4 +111,30 @@ func (l Keyword) Namespace() Value {
 		return NIL
 	}
 	return String(ns)
+}
+
+// InvokeMethod implements Receiver so JVM-interop calls on keywords resolve,
+// matching clojure.lang.Keyword's public accessors. Motivated by honeysql,
+// whose :clj branch converts keywords to symbols via (.sym k).
+func (l Keyword) InvokeMethod(name Symbol, args []Value) (Value, error) {
+	if len(args) == 0 {
+		switch string(name) {
+		case "sym":
+			return Symbol(l), nil
+		case "getName":
+			_, kname, _ := l.NamespacedRaw()
+			return String(kname), nil
+		case "getNamespace":
+			ns, _, hasNS := l.NamespacedRaw()
+			if !hasNS {
+				return NIL, nil
+			}
+			return String(ns), nil
+		case "toString":
+			return String(l.String()), nil
+		case "hashCode":
+			return Int(int32(l.Hash())), nil
+		}
+	}
+	return NIL, fmt.Errorf("clojure.lang.Keyword has no method .%s/%d", name, len(args))
 }

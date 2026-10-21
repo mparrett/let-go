@@ -21,7 +21,9 @@
 (ns ir.build
   (:require
    [clojure.set :as set]
-   [ir.data]))
+   [ir.data]
+   [ir.form-heads]
+   [ir.forms :as forms]))
 
 ;; --- builder context -----------------------------------------------------
 
@@ -146,42 +148,43 @@
       {:class nil :binding first-sym :body (vec (drop 1 parts))})))
 
 (defn- desugar-catch-clauses [clauses]
-  "Collapse the catch clauses into ONE bare clause {:binding :body}. A single
-   bare clause passes through (let-go's native form). Typed and/or multiple
-   clauses become a class dispatch in source order that rethrows when nothing
+  "Collapse the catch clauses into ONE bare clause {:binding :body}, always
+   through a class dispatch in source order that rethrows when nothing
    matches, generated EXACTLY like the bytecode compiler's tryCompiler:
 
      (if (core/instance? Class1 caught) (let* [b1 caught] body1…)
        … (core/throw caught))
 
    core/-qualified so user shadowing cannot capture the dispatch. A bare
-   clause tests as always-true, so later clauses are dead."
-  (if (and (= 1 (count clauses)) (nil? (:class (first clauses))))
-    (first clauses)
-    ;; The trailing tab makes the handler symbol unforgeable: the reader
-    ;; cannot produce a symbol containing whitespace, so no user source can
-    ;; shadow it (mirrors the bytecode compiler's freshCaughtSym).
-    (let [caught (symbol (str (gensym "__lg-caught-") "\t"))]
-      {:binding caught
-       :body [(reduce
-                (fn [acc clause]
-                  (let [arm (apply list 'let*
-                                   [(:binding clause) caught]
-                                   (:body clause))]
-                    (if (nil? (:class clause))
-                      arm
-                      ;; catch-matches? resolves the class at dispatch time
-                      ;; (an unmodeled JVM class never matches, rather than
-                      ;; failing compilation) and gives Throwable its
-                      ;; catch-everything role.
-                      (list 'if
-                            (list 'core/catch-matches?
-                                  (list 'quote (:class clause))
-                                  caught)
-                            arm
-                            acc))))
-                (list 'core/throw caught)
-                (reverse clauses))]})))
+   clause dispatches as Throwable — catch-everything, but (per
+   catch-matches?) never the scope-cancellation condition — so later clauses
+   are dead, like Clojure's ordered catch clauses. There is deliberately no
+   fast path for a lone bare clause: routing it through catch-matches? is
+   what keeps (catch e ...) from swallowing cancellation."
+  ;; The trailing tab makes the handler symbol unforgeable: the reader
+  ;; cannot produce a symbol containing whitespace, so no user source can
+  ;; shadow it (mirrors the bytecode compiler's freshCaughtSym).
+  (let [caught (symbol (str (gensym "__lg-caught-") "\t"))]
+    {:binding caught
+     :body [(reduce
+              (fn [acc clause]
+                (let [arm (apply list 'let*
+                                 [(:binding clause) caught]
+                                 (:body clause))
+                      class (or (:class clause) 'Throwable)]
+                  ;; catch-matches? resolves the class at dispatch time
+                  ;; (an unmodeled JVM class never matches, rather than
+                  ;; failing compilation) and gives Throwable its
+                  ;; catch-everything role EXCEPT the scope-cancellation
+                  ;; condition.
+                  (list 'if
+                        (list 'core/catch-matches?
+                              (list 'quote class)
+                              caught)
+                        arm
+                        acc)))
+              (list 'core/throw caught)
+              (reverse clauses))]}))
 
 (defn- parse-try [forms]
   "Split the subforms of a (try …) into [body-forms catch-clause finally-clause].
@@ -207,6 +210,18 @@
           :else
           (recur (rest fs) (conj body head) clauses finally-clause))))))
 
+(defn meta-bearing-coll? [form]
+  (and (or (vector? form) (map? form) (set? form)
+           (forms/set-form? form) (forms/map-form? form))
+       (some? (meta form))))
+
+(defn with-meta-form [form]
+  "The form a metadata-bearing collection value stands for:
+   (with-meta coll meta), as the bytecode compiler's compileAggregateWithMeta
+   compiles it. The metadata map is compiled, so ^{:a (+ 1 1)} [1] carries
+   {:a 2} and a local used only in the metadata is a use."
+  (list 'clojure.core/with-meta (with-meta form nil) (forms/meta-source (meta form))))
+
 (defn captures-of [form known-locals]
   "Return the SET of symbols `form` references that are bound in
    `known-locals`. Used by build-if/build-loop to compute which block-
@@ -228,14 +243,22 @@
   (cond
     (symbol? form)
     (if (known-locals form) #{form} #{})
+    (meta-bearing-coll? form)
+    (captures-of (with-meta-form form) known-locals)
     (or (list? form) (seq? form))
     (let [head (first form)]
+      ;; Dispatch based on form head. Special forms with explicit handlers are
+      ;; gated by the catalog (via ir.form-heads/has-captures-handler?). Editing
+      ;; the catalog changes which forms get special handling — this IS the AC-3 coupling.
       (cond
-        (= head 'quote) #{}
-        (= head 'var)   #{}
-        (= head 'set!)  (let [[_ _sym val] form]
-                          (captures-of val known-locals))
-        (= head 'fn*)
+        (and (= head 'quote) (ir.form-heads/has-captures-handler? head))
+        #{}
+        (and (= head 'var) (ir.form-heads/has-captures-handler? head))
+        #{}
+        (and (= head 'set!) (ir.form-heads/has-captures-handler? head))
+        (let [[_ _sym val] form]
+          (captures-of val known-locals))
+        (and (= head 'fn*) (ir.form-heads/has-captures-handler? head))
         ;; fn* captures its free vars via push-closed in the current
         ;; block. If those captured InstIds live in a different block
         ;; (e.g. the entry block's LoadArgs), the closure-emit creates
@@ -264,7 +287,8 @@
                                                     (shadow-for args-vec))]
                                   (mapcat #(captures-of % inner-known) body)))
                               rest-forms))))
-        (or (= head 'let) (= head 'let*) (= head 'loop) (= head 'loop*))
+        (and (or (= head 'let) (= head 'let*) (= head 'loop) (= head 'loop*))
+             (ir.form-heads/has-captures-handler? head))
         (let [[_ bindings & body] form
               pairs    (partition 2 bindings)
               [used let-bound-set]
@@ -277,7 +301,7 @@
               new-locals    (into known-locals let-bound-set)
               body-captures (into #{} (mapcat #(captures-of % new-locals) body))]
           (into used (set/difference body-captures let-bound-set)))
-        (= head 'try)
+        (and (= head 'try) (ir.form-heads/has-captures-handler? head))
         ;; try guards a body; (catch e …) binds e in the handler body only;
         ;; (finally …) binds nothing. Mirror build-try's split so captures
         ;; (used for cross-block threading) don't treat catch/e/finally as
@@ -293,26 +317,39 @@
                          (mapcat #(captures-of % known-locals) (:body finally-clause))
                          [])]
           (into #{} (concat body-caps catch-caps fin-caps)))
-        (= head '.)
+        (and (= head '.) (ir.form-heads/has-captures-handler? head))
         ;; (. obj field): only obj carries captures; field is literal.
         (let [[_ obj _field] form] (captures-of obj known-locals))
         :else
         (into #{} (mapcat #(captures-of % known-locals) form))))
     (vector? form)
     (into #{} (mapcat #(captures-of % known-locals) form))
+    (set? form)
+    ;; Same reasoning as the map case below: a value captured only inside a set
+    ;; literal must be walked, or loop-header threading misses it.
+    (into #{} (mapcat #(captures-of % known-locals) form))
+    (record? form)
+    (cond
+      (forms/set-form? form)
+      (into #{} (mapcat #(captures-of % known-locals)
+                        (forms/set-form-elements form)))
+      (forms/map-form? form)
+      (into #{} (mapcat #(captures-of % known-locals)
+                        (mapcat identity (forms/map-form-entries form))))
+      :else #{})
     (map? form)
-    ;; Mirror free-vars: a value captured only inside a map literal must be
-    ;; walked too, else loop-header threading (build-loop) misses it and emits
-    ;; a cross-block direct ref to an out-of-scope InstId (same failure class
-    ;; as the cluster-A bugs, for a non-cheap captured value).
-    (into #{} (mapcat #(captures-of % known-locals) (concat (keys form) (vals form))))
+    ;; A value captured only inside a map literal must be walked, else loop-
+    ;; header threading can emit a cross-block ref to an out-of-scope InstId.
+    (into #{} (mapcat #(captures-of % known-locals)
+                      (concat (keys form) (vals form))))
     :else #{}))
 
 ;; --- form dispatch -------------------------------------------------------
 
-(declare build-list build-symbol build-if build-let build-do build-quote
-         build-var build-set! build-def build-loop build-recur build-fn*
-         build-vector build-map build-call build-try build-dot)
+(declare form-heads-dispatcher
+         build-list build-symbol build-if build-let build-let* build-do build-quote
+         build-var build-set! build-def build-loop build-loop* build-recur build-fn*
+         build-vector build-set build-map build-coll-const with-meta-call build-call build-try build-dot)
 
 ;; Sentinel returned by recur / any form whose current-block is already
 ;; terminated. Callers must check for this before emitting more code.
@@ -363,12 +400,22 @@
               (add-inst! ctx (ctx-block ctx) :const [] form)
               (symbol?  form)  (build-symbol form ctx)
               (vector?  form)  (build-vector form ctx)
-              (map?     form)  (build-map form ctx)
+              (set?     form)  (build-set form ctx)
               (list?    form)  (build-list form ctx)
+              ;; Compiler collection forms are records, not map? values. Select
+              ;; them before the generic map builder; other records remain
+              ;; unsupported as they were before this compiler-only node layer.
+              (record?  form)  (cond
+                                 (forms/set-form? form) (build-set form ctx)
+                                 (forms/map-form? form) (build-map form ctx)
+                                 :else (throw (ex-info (str "build-form: unrecognized form "
+                                                            (pr-str form))
+                                                       {:fn :build-form :type (type form) :value form})))
+              (map?     form)  (build-map form ctx)
               ;; pr-str (not str): a BigDecimal's str drops the `M` suffix, so an
               ;; unrecognized 0.0M would mis-report as a float `0.0`. The readable
               ;; form keeps the type legible in the failure bucket.
-              :else (throw (str "build-form: unrecognized form " (pr-str form))))]
+              :else (throw (ex-info (str "build-form: unrecognized form " (pr-str form)) {:fn :build-form :type (type form) :value form})))]
     (when si
       (swap! ctx assoc :source-info old-si))
     nid))
@@ -386,7 +433,7 @@
             ;; (e.g., Go interop calls like xxh3/HashSeed). Emit as :load-var
             ;; with the symbol itself as the constant, allowing runtime resolution.
             (add-inst! ctx (ctx-block ctx) :load-var [] sym)
-            (throw (str "ir/build: unresolved symbol " sym)))
+            (throw (ex-info (str "ir/build: unresolved symbol " sym) {:fn :build-symbol :type (type sym) :value sym})))
           (add-inst! ctx (ctx-block ctx) :load-var [] v))))))
 
 (defn- free-vars [form bound]
@@ -396,13 +443,21 @@
   (cond
     (symbol? form)
     (if (bound form) #{} #{form})
+    (meta-bearing-coll? form)
+    (free-vars (with-meta-form form) bound)
     (or (list? form) (seq? form))
     (let [head (first form)]
+      ;; Dispatch based on form head. Special forms are gated by the catalog.
+      ;; Editing the catalog's free-vars? metadata changes which forms get
+      ;; special handling — this IS the AC-3 coupling.
       (cond
-        (= head 'quote) #{}
-        (= head 'var)   #{}
-        (= head 'set!)  (let [[_ _sym val] form] (free-vars val bound))
-        (= head 'fn*)
+        (and (= head 'quote) (ir.form-heads/has-free-vars-handler? head))
+        #{}
+        (and (= head 'var) (ir.form-heads/has-free-vars-handler? head))
+        #{}
+        (and (= head 'set!) (ir.form-heads/has-free-vars-handler? head))
+        (let [[_ _sym val] form] (free-vars val bound))
+        (and (= head 'fn*) (ir.form-heads/has-free-vars-handler? head))
         (let [[_ maybe-name & raw-rest] form
               has-name?  (symbol? maybe-name)
               name-sym   (if has-name? maybe-name nil)
@@ -423,7 +478,8 @@
                                                  (into #{} args-vec))]
                                   (mapcat #(free-vars % arg-set) body)))
                               rest-forms))))
-        (or (= head 'let) (= head 'let*) (= head 'loop) (= head 'loop*))
+        (and (or (= head 'let) (= head 'let*) (= head 'loop) (= head 'loop*))
+             (ir.form-heads/has-free-vars-handler? head))
         (let [[_ bindings & body] form
               pairs    (partition 2 bindings)
               [used new-bound]
@@ -433,7 +489,7 @@
                       [#{} bound]
                       pairs)]
           (into used (mapcat #(free-vars % new-bound) body)))
-        (= head 'try)
+        (and (= head 'try) (ir.form-heads/has-free-vars-handler? head))
         (let [[body-forms catch-clause finally-clause] (parse-try (rest form))
               body-fv (mapcat #(free-vars % bound) body-forms)
               catch-fv (if catch-clause
@@ -444,13 +500,23 @@
                        (mapcat #(free-vars % bound) (:body finally-clause))
                        [])]
           (into #{} (concat body-fv catch-fv fin-fv)))
-        (= head '.)
+        (and (= head '.) (ir.form-heads/has-free-vars-handler? head))
         ;; (. obj field): field is a literal symbol, not a var; only obj.
         (let [[_ obj _field] form] (free-vars obj bound))
         :else
         (into #{} (mapcat #(free-vars % bound) form))))
     (vector? form)
     (into #{} (mapcat #(free-vars % bound) form))
+    (set? form)
+    (into #{} (mapcat #(free-vars % bound) form))
+    (record? form)
+    (cond
+      (forms/set-form? form)
+      (into #{} (mapcat #(free-vars % bound) (forms/set-form-elements form)))
+      (forms/map-form? form)
+      (into #{} (mapcat #(free-vars % bound)
+                        (mapcat identity (forms/map-form-entries form))))
+      :else #{})
     (map? form)
     (into #{} (mapcat #(free-vars % bound) (concat (keys form) (vals form))))
     (seq? form)
@@ -477,6 +543,9 @@
    'unsigned-bit-shift-right :unsigned-bit-shift-right
    'quot :quot
    '/    :div
+   'unchecked-add      :unchecked-add
+   'unchecked-subtract :unchecked-sub
+   'unchecked-multiply :unchecked-mul
    '<    :lt
    '<=   :lte
    '>    :gt
@@ -489,17 +558,32 @@
 ;; Ops whose arity-1 form is the canonical shape (no n-ary folding).
 (def unary-only-ops #{:inc :dec :bit-not})
 
+;; Ops that exist ONLY at arity 2. The core fns behind them reject any other
+;; arity, so a non-binary call falls back to a generic call and gets the
+;; runtime's arity error instead of a synthetic identity or fold.
+(def binary-only-ops #{:unchecked-add :unchecked-sub :unchecked-mul})
+
 (defn- intrinsic-builtin-op [head ctx]
-  "Return the builtin op keyword only when HEAD is an unqualified symbol,
-   not lexically shadowed, and resolves to the core var of the same name.
-   This matches the bytecode compiler's fast-opcode gate: shadowing or runtime
-   rebinding seams must stay on the ordinary var/call path."
+  "Return the builtin op keyword only when HEAD resolves to the core var of
+   the same name and, if unqualified, is not lexically shadowed. This matches
+   the bytecode compiler's fast-opcode gate: shadowing or runtime rebinding
+   seams must stay on the ordinary var/call path.
+
+   A head qualified to the core ns is what syntax-quote produces, so every
+   macro-emitted `<` or `inc` (dotimes included) arrives this way as core/<
+   (#1045). A qualified symbol cannot be shadowed by a local, so only the
+   identity check applies; resolve follows aliases, and a qualified head
+   naming some other ns's var of that name fails the check. A core/ head that
+   does not resolve falls back to the core var, as the bytecode gate does."
   (when (and (symbol? head)
-             (nil? (namespace head))
-             (nil? (lookup-local ctx head)))
-    (let [op       (get builtin-ops head)
-          resolved (when op (resolve head))
-          core-var (when op (ns-resolve 'clojure.core head))]
+             (or (some? (namespace head))
+                 (nil? (lookup-local ctx head))))
+    (let [sym      (if (namespace head) (symbol (name head)) head)
+          op       (get builtin-ops sym)
+          core-var (when op (ns-resolve 'clojure.core sym))
+          resolved (when op
+                     (or (resolve head)
+                         (when (= "core" (namespace head)) core-var)))]
       (when (and op resolved core-var (= resolved core-var))
         op))))
 
@@ -608,6 +692,10 @@
   ;; Unary-only ops (:inc, :dec) take exactly one ref.
   (let [args (build-args (rest form) ctx)]
     (cond
+      (contains? binary-only-ops op-kw)
+      (if (= 2 (count args))
+        (ir/add-inst (ctx-fn ctx) (ctx-block ctx) op-kw [(nth args 0) (nth args 1)] nil)
+        (build-call form ctx))
       (contains? unary-only-ops op-kw)
       (if (= 1 (count args))
         (ir/add-inst (ctx-fn ctx) (ctx-block ctx) op-kw [(nth args 0)] nil)
@@ -705,30 +793,38 @@
         ctor (symbol (str "->" (subs hn 0 (dec (count hn)))))]
     (cons ctor (rest form))))
 
+;; Form-heads dispatcher: data-driven lookup from the catalog handler map.
+;; Replaces hardcoded cond chain. Adding a form = edit catalog + handler map.
+;; Each form head maps to its handler function; unknown heads fall through to build-call.
+(defn form-heads-dispatcher [form ctx]
+  (cond
+    (empty? form)
+    (add-inst! ctx (ctx-block ctx) :const [] form)
+
+    ;; Look up handler for this form head in the catalog's handler map.
+    ;; The handler function is fetched via form-head-handler (which resolves
+    ;; the function from the handlers-fn thunk). If found, invoke it.
+    :else
+    (let [head (first form)
+          handler-fn (ir.form-heads/form-head-handler head)]
+      (if handler-fn
+        (handler-fn form ctx)
+        (build-call form ctx)))))
+
 (defn build-list [form ctx]
+  ;; Dispatch on form head using the data-driven dispatcher from the form-heads catalog.
+  ;; The dispatcher (form-heads-dispatcher) handles all 14 special forms via catalog lookup
+  ;; and falls through to build-call for others. This consolidates form-head dispatch into
+  ;; a single source (the catalog), replacing the previous hardcoded cond chain.
   (let [head    (first form)
         builtin (intrinsic-builtin-op head ctx)]
     (cond
-      ;; The empty list `()` is a self-evaluating constant (the empty list),
-      ;; NOT a call with no operator. Without this, `head` is nil and the form
-      ;; falls through to (build-call ()), which lowers to an invoke of a nil
-      ;; callee (rt.InvokeValueEC(ec, vm.NIL, …)). The bytecode compiler emits
-      ;; OP_LOAD_CONST vm.EmptyList here; mirror that with a :const Inst.
-      (empty? form)   (add-inst! ctx (ctx-block ctx) :const [] form)
-      (= head 'if)    (build-if form ctx)
-      (= head 'let)   (build-let form ctx)
-      (= head 'let*)  (build-let form ctx)
-      (= head 'do)    (build-do form ctx)
-      (= head 'quote) (build-quote form ctx)
-      (= head 'def)   (build-def form ctx)
-      (= head 'var)   (build-var form ctx)
-      (= head 'set!)  (build-set! form ctx)
-      (= head 'loop)  (build-loop form ctx)
-      (= head 'loop*) (build-loop form ctx)
-      (= head 'recur) (build-recur form ctx)
-      (= head 'fn*)   (build-fn* form ctx)
-      (= head 'try)   (build-try form ctx)
-      (= head '.)     (build-dot form ctx)
+      ;; Delegate to data-driven form-heads dispatcher for all special forms.
+      ;; (form-heads-dispatcher looks up the handler in the catalog's handler map;
+      ;; semantically equivalent to the previous hardcoded cond chain.)
+      (or (empty? form) (contains? (ir.form-heads/form-head-names) head))
+      (form-heads-dispatcher form ctx)
+
       ;; Go method-call interop: (.Method recv arg...). Rewrite to the
       ;; canonical dot form and build as a generic call to `.`.
       (and (method-call-head? head) (seq (rest form)))
@@ -754,7 +850,7 @@
    field name is a literal symbol; only obj is an evaluated sub-expression."
   (let [[_ obj field] form]
     (when-not (symbol? field)
-      (throw (str "ir/build: . field must be a symbol, got " field)))
+      (throw (ex-info (str "ir/build: . field must be a symbol, got " field) {:fn :build-dot :type (type field) :value field})))
     (let [obj-id (build-form obj ctx)]
       (add-inst! ctx (ctx-block ctx) :dot [obj-id] field))))
 
@@ -763,14 +859,28 @@
   (let [[_ x] form]
     (add-inst! ctx (ctx-block ctx) :const [] x)))
 
+(defn- resolve-for-var [sym]
+  "Resolution for the var special form, which ignores privacy — #'p/hidden
+   reaches a private var in another ns, matching bytecode varCompiler's
+   LookupIncludingPrivate. resolve enforces privacy, so on a miss expand a
+   current-ns alias and go through find-var, which does not. Bare symbol
+   references (build-symbol) keep using resolve, so privacy stays enforced
+   there."
+  (or (resolve sym)
+      (when-let [nsname (namespace sym)]
+        (let [target (or (get (ns-aliases *ns*) (symbol nsname))
+                         (find-ns (symbol nsname)))]
+          (when target
+            (find-var (symbol (str (ns-name target)) (name sym))))))))
+
 (defn build-var [form ctx]
   "(var sym) and reader macro #'sym resolve sym at build time and emit
    a Const Inst with the *vm.Var as the Aux — same as bytecode's
    varCompiler: LOAD_CONST of the Var object itself (not its value)."
   (let [[_ sym] form
-        v       (resolve sym)]
+        v       (resolve-for-var sym)]
     (if (nil? v)
-      (throw (str "ir/build: can't resolve var " sym))
+      (throw (ex-info (str "ir/build: can't resolve var " sym) {:fn :build-var :type (type sym) :value sym}))
       (add-inst! ctx (ctx-block ctx) :const [] v))))
 
 (defn build-set! [form ctx]
@@ -781,7 +891,7 @@
   (let [[_ sym val] form
         v           (resolve sym)]
     (when (nil? v)
-      (throw (str "ir/build: set! can't resolve " sym)))
+      (throw (ex-info (str "ir/build: set! can't resolve " sym) {:fn :build-set! :type (type sym) :value sym})))
     (let [var-nid (add-inst! ctx (ctx-block ctx) :const [] v)
           val-nid (build-form val ctx)]
       (add-inst! ctx (ctx-block ctx) :set-var [var-nid val-nid] nil))))
@@ -804,11 +914,11 @@
   (let [args (rest form)
         n    (count args)]
     (when (or (< n 1) (> n 3))
-      (throw (str "ir/build: def wrong number of forms (" n "), need 1-3")))
+      (throw (ex-info (str "ir/build: def wrong number of forms (" n "), need 1-3") {:fn :build-def :type (type n) :value n})))
     (let [doc      (when (= n 3)
                      (let [d (nth args 1)]
                        (when-not (string? d)
-                         (throw "ir/build: def 3-arg form requires a docstring (String) as second argument"))
+                         (throw (ex-info "ir/build: def 3-arg form requires a docstring (String) as second argument" {:fn :build-def :type (type d) :value d})))
                        d))
           raw-sym  (nth args 0)
           ;; (def sym doc val): value is the 3rd arg; (def sym val): 2nd.
@@ -818,7 +928,7 @@
           meta0    (when with-m? (nth raw-sym 2))
           meta     (if doc (assoc (or meta0 {}) :doc doc) meta0)
           _        (when-not (symbol? sym)
-                     (throw (str "ir/build: def name must be a symbol, got " (pr-str sym))))
+                     (throw (ex-info (str "ir/build: def name must be a symbol, got " (pr-str sym)) {:fn :build-def :type (type sym) :value sym})))
           ;; resolve-or-intern: existing var, else intern a fresh one in *ns*.
           var-obj  (or (resolve sym) (intern *ns* sym))
           ;; Apply meta to the build-time var now (the bytecode-lowered path has
@@ -830,36 +940,135 @@
           (add-inst! ctx (ctx-block ctx) :def [var-nid val-nid] meta))
         (add-inst! ctx (ctx-block ctx) :def [var-nid] meta)))))
 
-(defn build-vector [form ctx]
-  "[a b c] → (vector a b c). Empty vector → Const literal.
-   Each element flows through build-form so sub-expressions IR-build
-   correctly; build-args handles cross-block threading."
-  (if (zero? (count form))
-    (add-inst! ctx (ctx-block ctx) :const [] form)
-    (let [fn-id   (add-inst! ctx (ctx-block ctx)
-                    :load-var [] (resolve 'vector))]
-      (build-call-with-head fn-id (seq form) ctx))))
+(def ^:private literal-scalar-preds
+  [nil? integer? float? string? keyword? boolean? char? ratio? decimal? uuid?
+   (fn [v] (instance? java.util.regex.Pattern v))])
 
 (defn is-literal? [v]
-  "Check if v is a literal value (not a symbol or expression)."
-  (or (nil? v) (integer? v) (float? v) (string? v) (keyword? v) (boolean? v)))
+  "True for a self-evaluating scalar: the same set the bytecode compiler's
+   isConstantLiteral admits, so a collection of them is one shared value on
+   every path. An #inst literal is absent because the IR builder has no
+   Instant constant at all."
+  (boolean (some (fn [scalar?] (scalar? v)) literal-scalar-preds)))
+
+(defn constant-literal? [v]
+  "A collection literal that is a constant: every element is a literal or such
+   a collection, and no level carries metadata. Clojure compiles it to one
+   shared value, and so do all three let-go paths (bytecode compiler, IR
+   build, Go lowering)."
+  (or (is-literal? v)
+      (and (nil? (meta v))
+           (cond
+             (vector? v) (every? constant-literal? (seq v))
+             (set? v)    (every? constant-literal? (seq v))
+             (map? v)    (every? (fn [e] (and (constant-literal? (key e)) (constant-literal? (val e)))) (seq v))
+             ;; expand-all turns nested map/set literals into MapForm/SetForm
+             ;; records; their entries are the literal's elements.
+             (forms/set-form? v) (every? constant-literal? (forms/set-form-elements v))
+             (forms/map-form? v) (every? (fn [[k val]] (and (constant-literal? k) (constant-literal? val)))
+                                         (forms/map-form-entries v))
+             :else false))))
+
+(defn constant-value [v]
+  "The data value of a constant literal: MapForm/SetForm records (expand-all's
+   spelling of nested map and set literals) become the maps and sets they
+   denote, so the Const holds exactly what the literal evaluates to."
+  (cond
+    (forms/map-form? v) (apply array-map (mapcat (fn [[k val]] [(constant-value k) (constant-value val)])
+                                                 (forms/map-form-entries v)))
+    (forms/set-form? v) (apply hash-set (map constant-value (forms/set-form-elements v)))
+    (vector? v)         (vec (map constant-value v))
+    (map? v)            (apply array-map (mapcat (fn [e] [(constant-value (key e)) (constant-value (val e))]) (seq v)))
+    (set? v)            (apply hash-set (map constant-value (seq v)))
+    :else v))
+
+(defn build-vector [form ctx]
+  "[a b c] → (vector a b c). A constant vector (constant-literal?) → Const.
+   Each element flows through build-form so sub-expressions IR-build
+   correctly; build-args handles cross-block threading."
+  (if (and (nil? (meta form)) (every? constant-literal? (seq form)))
+    (build-coll-const form (constant-value form) ctx)
+    (with-meta-call form ctx
+      (fn [form ctx]
+        (let [fn-id (add-inst! ctx (ctx-block ctx)
+                      :load-var [] (resolve 'vector))]
+          (build-call-with-head fn-id (seq form) ctx))))))
+
+(defn- set-elements [form]
+  (if (forms/set-form? form)
+    (forms/set-form-elements form)
+    (vec (seq form))))
+
+(defn build-set [form ctx]
+  "Build every set child slot once, then construct the unordered runtime set.
+   Raw set values remain supported for callers that bypass expand-all.
+   Literal-only elements fold to a Const. Metadata is kept as build-coll-const
+   and with-meta-call describe."
+  (let [elements (set-elements form)]
+    (if (and (nil? (meta form)) (every? constant-literal? elements))
+      (build-coll-const form (apply hash-set (map constant-value elements)) ctx)
+      (with-meta-call form ctx
+        (fn [form ctx]
+          (let [fn-id (add-inst! ctx (ctx-block ctx)
+                        :load-var [] (resolve 'clojure.core/hash-set))]
+            (build-call-with-head fn-id elements ctx)))))))
+
+(defn build-coll-const [form value ctx]
+  "A collection whose elements are all literals is the Const value. A literal
+   carrying metadata is not a constant — Clojure evaluates ^{:t 1} [1 2] to a
+   fresh vector each time, and the bytecode compiler applies with-meta per
+   evaluation — so it is compiled as the with-meta form. form is the source
+   collection or its MapForm/SetForm."
+  (if (nil? (meta form))
+    (add-inst! ctx (ctx-block ctx) :const [] value)
+    (build-form (with-meta-form form) ctx)))
+
+(defn with-meta-call [form ctx build-plain]
+  "Build a collection that needs a constructor call. Metadata, if any, is
+   compiled and applied to the result, as the bytecode compiler's
+   compileAggregateWithMeta does; build-plain builds the collection itself."
+  (if (some? (meta form))
+    (build-form (with-meta-form form) ctx)
+    (build-plain form ctx)))
+
+(defn- map-entries [form]
+  (if (forms/map-form? form)
+    (forms/map-form-entries form)
+    (vec (seq form))))
 
 (defn build-map [form ctx]
-  "{:a 1 :b 2} → Const if all keys/values are literals; else (array-map :a 1 :b 2).
-   array-map preserves insertion order. Empty map → Const literal."
-  (if (zero? (count form))
-    (add-inst! ctx (ctx-block ctx) :const [] form)
-    ;; Check if all keys and values are literals (not symbols/expressions).
-    ;; If so, emit as a constant.
-    (let [all-const? (every? (fn [e]
-                               (and (is-literal? (first e)) (is-literal? (second e))))
-                             (seq form))
-          pairs      (vec (mapcat (fn [e] [(first e) (second e)]) (seq form)))]
-      (if all-const?
-        (add-inst! ctx (ctx-block ctx) :const [] form)
-        (let [fn-id   (add-inst! ctx (ctx-block ctx)
-                        :load-var [] (resolve 'array-map))]
-          (build-call-with-head fn-id pairs ctx))))))
+  "Build every map key/value slot once, then construct the map with array-map,
+   as the bytecode compiler does for a literal: insertion-ordered up to the
+   array-map size limit. Raw map values remain supported for callers that
+   bypass expand-all. Literal-only entries fold to a Const. Metadata is kept as
+   build-coll-const and with-meta-call describe.
+
+   A sorted map with a non-literal entry is declined rather than rebuilt: the
+   array-map call would keep the entries and drop the ordering, and there is no
+   form that can carry a sorted-map-by comparator. Declining hands the fn to the
+   bytecode compiler, which rebuilds sorted maps as sorted maps and refuses a
+   custom comparator outright. All-literal sorted maps take the Const arm and
+   carry the real collection, comparator included."
+  (let [entries    (map-entries form)
+        all-const? (and (nil? (meta form))
+                        (every? (fn [[k v]]
+                                  (and (constant-literal? k) (constant-literal? v)))
+                                entries))
+        pairs      (vec (mapcat identity entries))]
+    (cond
+      all-const?
+      (build-coll-const form (if (sorted? form) form (apply array-map (map constant-value pairs))) ctx)
+
+      (sorted? form)
+      (throw (ex-info (str "build-map: can't rebuild a sorted map with non-literal entries " (pr-str form))
+                      {:fn :build-map :type (type form) :value form}))
+
+      :else
+      (with-meta-call form ctx
+        (fn [form ctx]
+          (let [fn-id (add-inst! ctx (ctx-block ctx)
+                        :load-var [] (resolve 'clojure.core/array-map))]
+            (build-call-with-head fn-id pairs ctx)))))))
 
 (defn build-try [form ctx]
   "(try body… (catch [Class] e handler…) (finally fin…)) — guarded region.
@@ -936,6 +1145,11 @@
           (bind-local! ctx sym val)))
       result)))
 
+(defn build-let* [form ctx]
+  "let* (sequential bindings) uses the same lowering as let. The dispatcher
+   aliases both to the same handler."
+  (build-let form ctx))
+
 (defn build-if [form ctx]
   "if emits BranchIf with then/else BranchTargets and a join block.
    Non-cheap captures (values that cannot be re-emitted at use site)
@@ -957,15 +1171,10 @@
         locals-map (current-locals-flat ctx)
         all-caps   (vec (sort-by (fn [sym] (get locals-map sym))
                           (keys locals-map)))
-        ;; Separate cheap (function-scoped) from non-cheap captures.
-        ;; Cheap ops can be re-emitted at any use site; they never need
-        ;; block-arg threading across block edges.
-        non-cheap-caps (vec (remove (fn [sym]
-                                      (let [o (ir/op (get locals-map sym) f)]
-                                        ;; :load-var excluded — var roots are mutable; a set!
-                                        ;; between the load and a later use would let a re-emitted
-                                        ;; rt.LookupVar read the new value, so it must stay threaded.
-                                        (and (ir/op-cheap-load? o) (not= o :load-var))))
+        ;; Separate captures that can be re-emitted at any use site from
+        ;; those that must reach the branches as block args (see
+        ;; ir/reemittable-at-use?: var loads and fn literals are threaded).
+        non-cheap-caps (vec (remove (fn [sym] (ir/reemittable-at-use? (get locals-map sym) f))
                                     all-caps))
         ;; Create blocks for then, else, join.
         then-blk  (ir/add-block f)
@@ -1083,10 +1292,7 @@
         ;; Cheap-load captures (LoadArg/Var/Const/LoadClosed) don't need
         ;; block-arg threading in the loop header — the lowerer re-emits them
         ;; at use site as function-scoped locals.
-        non-cheap-body-caps (vec (remove (fn [sym]
-                                           (let [o (ir/op (lookup-local ctx sym) f)]
-                                             ;; :load-var excluded — mutable var root must stay threaded (P1).
-                                             (and (ir/op-cheap-load? o) (not= o :load-var))))
+        non-cheap-body-caps (vec (remove (fn [sym] (ir/reemittable-at-use? (lookup-local ctx sym) f))
                                          body-caps))
         n-non-cheap-caps    (count non-cheap-body-caps)
         ;; Total header param count = n-slots (loop vars) + n-non-cheap-caps.
@@ -1158,8 +1364,13 @@
                       (update :loop-capture-syms-stack (fn [s] (pop (or s []))))))
       result)))
 
+(defn build-loop* [form ctx]
+  "loop* (parallel bindings) uses the same lowering as loop. The dispatcher
+   aliases both to the same handler."
+  (build-loop form ctx))
+
 (defn build-recur [form ctx]
-  "recur emits Branch back to the current loop header, or :tail-call for
+  "recur emits Branch back to the current loop header, or :recur-fn for
    function-level recursion.
 
    Subtle: ctx-block must be re-read AFTER building the recur args, not
@@ -1184,16 +1395,32 @@
         (ir/add-terminator! f cur :branch [] bt)
         (ir/add-pred! f header cur)
         TERMINATED)
-      ;; Function-level recur: emit :tail-call.
+      ;; Function-level recur: emit :recur-fn.
       (let [arg-syms (get @ctx :fn-arg-syms)]
         (if arg-syms
-          (let [arg-ids (mapv (fn [a] (build-form a ctx)) (rest form))
-                cur     (ctx-block ctx)]
-            ;; :tail-call refs are just the new arg values (self-recursive,
-            ;; no fn ref needed).
-            (ir/add-terminator! f cur :tail-call arg-ids (count arg-ids))
-            TERMINATED)
-          (throw "recur outside of loop or function"))))))
+          (let [recur-args (rest form)]
+            ;; Arity has to match the enclosing fn. OP_RECUR_FN restarts the
+            ;; frame with whatever count it is handed, so a mismatch rebinds
+            ;; the wrong params and the call spins instead of failing — the
+            ;; non-IR compiler rejects this at compile time, and the two paths
+            ;; must agree. Checked before building the args so a rejected form
+            ;; leaves no half-built blocks behind.
+            (when (not= (count recur-args) (count arg-syms))
+              (throw (ex-info (str "ir/build: recur argument count must match function "
+                                   "argument count (got " (count recur-args)
+                                   ", need " (count arg-syms) ")")
+                              {:fn :build-recur :type (type recur-args) :value recur-args})))
+            (let [arg-ids (mapv (fn [a] (build-form a ctx)) recur-args)
+                  cur     (ctx-block ctx)]
+              ;; :recur-fn refs are just the new arg values (self-recursive,
+              ;; no fn ref needed) — which is exactly why this is NOT :tail-call.
+              ;; :tail-call is a call: Refs[0] is a callee and the bytecode
+              ;; lowering emits OP_TAIL_CALL, which resolves that callee off the
+              ;; stack. Emitting it here handed OP_TAIL_CALL a callee-less stack
+              ;; and it read an argument instead (nooga/let-go#638).
+              (ir/add-terminator! f cur :recur-fn arg-ids (count arg-ids))
+              TERMINATED))
+          (throw (ex-info "recur outside of loop or function" {:fn :build-recur :type (type form) :value form})))))))
 
 ;; --- destructuring helpers ------------------------------------------------
 ;; Port of core.lg's destructure* / destructure-vector / destructure-map.
@@ -1231,7 +1458,7 @@
                 out*   (conj out gs (list 'nth sym i nil))]
             (recur (inc i) (rest remaining) (into out* nested)))
           :else
-          (throw (str "unsupported destructuring pattern: " (pr-str x))))))))
+          (throw (ex-info (str "unsupported destructuring pattern: " (pr-str x)) {:fn :expand-vector-pattern :type (type x) :value x})))))))
 
 (defn- expand-map-pattern [sym pat]
   (let [defaults (:or pat)
@@ -1289,6 +1516,9 @@
     (if (and (seq? t) (= 'quote (first t))) (second t) t)))
 
 ;; Numeric hint -> lattice type. double/float -> :float, long/int -> :int.
+;; Array hints (Clojure's ^doubles/^longs/… ) -> [:array K] (#1055); the
+;; 32-bit names follow the constructors they alias (float-array is a
+;; double-array, int-array a long-array).
 ;; A recognized hint that isn't numeric (a class hint like ^String) returns nil:
 ;; it has no native param type, so the param stays vm.Value. The routing site
 ;; warns rather than dropping it silently (#530 review) — see the routing site.
@@ -1300,6 +1530,10 @@
     (cond
       (contains? #{"double" "float"} n) :float
       (contains? #{"long" "int"} n)     :int
+      (contains? #{"doubles" "floats"} n) [:array :float]
+      (contains? #{"longs" "ints"} n)     [:array :int]
+      (= n "bytes")                       [:array :byte]
+      (= n "objects")                     [:array :object]
       :else                              nil)))
 
 (defn- expand-fn-args [args-vec body-forms]
@@ -1336,7 +1570,7 @@
                                  binds (cond
                                          (vector? x) (expand-vector-pattern gs x)
                                          (map? x)    (expand-map-pattern gs x)
-                                         :else (throw (str "unsupported arg pattern: " (pr-str x))))]
+                                         :else (throw (ex-info (str "unsupported arg pattern: " (pr-str x)) {:fn :build-fn-args :type (type x) :value x})))]
                              (recur (rest remaining)
                                     (conj flat-args gs)
                                     (into let-binds binds)
@@ -1355,12 +1589,16 @@
          :variadic? variadic?
          :arg-tags final-arg-tags}))))
 
-(defn- return-hinted-arity-vector? [form]
+;; Public because the lowering pipeline needs the same test: the reader
+;; reifies `(defn f ^long [n] …)` as `(defn f (with-meta [n] {:tag …}) …)`,
+;; so every place that distinguishes single- from multi-arity by `vector?`
+;; has to know this shape is still one arity. See #598.
+(defn return-hinted-arity-vector? [form]
   (and (seq? form)
        (= 'with-meta (first form))
        (vector? (second form))))
 
-(defn- unwrap-arity-vector [form]
+(defn unwrap-arity-vector [form]
   (if (return-hinted-arity-vector? form)
     (second form)
     form))
@@ -1369,7 +1607,7 @@
   (let [inner     (ir/new-fn (str name-sym) (count args-vec) variadic?)
         entry     (ir/entry-block inner)
         inner-ctx (new-context inner)]
-    ;; Stash arg symbols so build-recur can emit :tail-call at function level.
+    ;; Stash arg symbols so build-recur can emit :recur-fn at function level.
     (reset! inner-ctx (assoc @inner-ctx :fn-arg-syms (vec args-vec)))
     (loop [i 0]
       (when (< i (count args-vec))
@@ -1479,6 +1717,17 @@
         forms (if (map? (first forms)) (next forms) forms)]
     [(first forms) (rest forms)]))
 
+(defn declared-return-type [form]
+  "The lattice type declared by a defn's return hint — `(defn f ^long [n] …)`
+   — or nil when there is no hint, or the hint is not one lowering has a native
+   type for. Reuses the same tag decoding as param hints, so the two positions
+   accept exactly the same set (^long/^int → :int, ^double/^float → :float).
+   Public so the lowering pipeline can seed typeinfer with it (#599); the tag
+   itself lives on the arity vector's metadata, which unwrap-arity-vector drops."
+  (let [raw-args (nth (parse-defn-args-body form) 0)]
+    (when (return-hinted-arity-vector? raw-args)
+      (tag->arg-type (hinted-tag raw-args)))))
+
 (defn build-fn [defn-form]
   "Build an IR Function from a (defn name [args] body...) or
    multi-arity (defn name ([args] body...) ([args2] body2...)) form.
@@ -1500,7 +1749,7 @@
             f          (ir/new-fn (str name-sym) arity variadic?)
             entry-blk  (ir/entry-block f)
             ctx        (new-context f)]
-        ;; Stash arg symbols so build-recur can emit :tail-call at function level.
+        ;; Stash arg symbols so build-recur can emit :recur-fn at function level.
         (reset! ctx (assoc @ctx :fn-arg-syms (vec flat-args)))
         (loop [i 0]
           (when (< i arity)
@@ -1531,8 +1780,9 @@
                                  (do (println (str "WARNING: " name-sym
                                                    ": ignoring unsupported param type hint ^"
                                                    (pr-str t)
-                                                   " (only ^double/^float/^long/^int lower to a"
-                                                   " native param; left as vm.Value)"))
+                                                   " (only ^double/^float/^long/^int and the array"
+                                                   " hints ^doubles/^floats/^longs/^ints/^bytes/^objects"
+                                                   " lower to a native param; left as vm.Value)"))
                                      :unknown))))
                          (take arity tags)))))
         f)
@@ -1566,3 +1816,54 @@
             final-blk  (ctx-block ctx)]
         (ir/add-terminator! f final-blk :return [closure-id] nil)
         f))))
+
+;; --- Initialize handler function map (AC-1 data-driven dispatch) ---
+;; Now that all build-* functions are defined, create the actual handler map
+;; mapping form heads to function objects. This makes form-heads-dispatcher
+;; truly data-driven: adding a form = edit catalog + edit this map.
+
+(reset! ir.form-heads/form-head-handlers-fn
+        (fn []
+          {'if       build-if
+           'do       build-do
+           'loop     build-loop
+           'loop*    build-loop*
+           'recur    build-recur
+           'try      build-try
+           'let      build-let
+           'let*     build-let*
+           'fn*      build-fn*
+           'var      build-var
+           'set!     build-set!
+           'def      build-def
+           'quote    build-quote
+           '.        build-dot}))
+
+;; --- Handler coherence check (AC-1: dispatch reads validated handlers) ---
+;; Validate that the handler map we just set matches the catalog, ensuring
+;; the coherence check validates the SAME handlers dispatch uses.
+;; This is the critical AC-1 gate: if a handler is missing here, the check
+;; fails immediately, not silently during lowering.
+
+(defn assert-form-head-coherence! []
+  "Verify handler map matches catalog. Called at load time.
+   Throws ex-info if handlers missing or extra."
+  (let [catalogued (ir.form-heads/form-head-names)
+        handlers   (set (keys (@ir.form-heads/form-head-handlers-fn)))
+        ; Missing from handlers: forms in catalog but not in map
+        missing-from-handlers (set/difference catalogued handlers)
+        ; Extra in handlers: forms in map but not in catalog
+        extra-in-handlers     (set/difference handlers catalogued)]
+
+    (when (seq missing-from-handlers)
+      (throw (ex-info (str "ir.form-heads coherence check FAILED: "
+                           "form heads missing from handler map: " missing-from-handlers)
+                      {:missing missing-from-handlers :catalogued catalogued})))
+
+    (when (seq extra-in-handlers)
+      (throw (ex-info (str "ir.form-heads coherence check FAILED: "
+                           "unexpected form heads in handler map (not in catalog): " extra-in-handlers)
+                      {:extra extra-in-handlers :catalogued catalogued})))))
+
+;; Call at load time to catch steady-state errors
+(assert-form-head-coherence!)

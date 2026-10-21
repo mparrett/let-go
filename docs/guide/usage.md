@@ -1,6 +1,6 @@
 ---
 status: active
-last-verified: 2026-06-19
+last-verified: 2026-08-06
 human-verified:
 ---
 
@@ -24,13 +24,37 @@ lg -r myfile.lg                   # run file, then REPL
 ```bash
 lg -c app.lgb app.lg              # compile to bytecode
 lg app.lgb                        # run bytecode
+lg -c app.lgb -z app.lg           # compile with a compressed bytecode body
 
 lg -b myapp app.lg                # bundle into a self-contained binary
+lg -b myapp -z app.lg             # bundle with compressed bytecode
 ./myapp                           # runs anywhere, no lg needed
 ```
 
+`-z` is opt-in and applies to `-c` and `-b`. The header remains plaintext for
+early compatibility checks; the bytecode body is compressed with DEFLATE and
+inflated transparently by `lg` and `lg-runtime`.
+
 The standalone binary is a copy of `lg` with your bytecode appended — copy it to
 another machine and it runs.
+
+### Split debug information
+
+`-strip` keeps the runtime artifact small without permanently losing its source
+maps or local-variable tables:
+
+```bash
+lg -strip -c app.lgb app.lg       # app.lgb + app.lgb.debug
+lg -strip -b myapp app.lg         # myapp + myapp.debug
+lg -strip -debug-output symbols/app.debug -c app.lgb app.lg
+```
+
+The `.debug` companion is bound to the exact stripped payload by SHA-256. Keep
+it in build artifacts or a symbol store while distributing only the stripped
+`.lgb` or executable. A companion beside the runtime artifact is loaded
+automatically; set `LG_DEBUG_FILE` to load it from another path, or set the
+variable to an empty value to run without debug information. Mismatched
+companions are rejected rather than producing misleading stack traces.
 
 ## Compiler-free deployment: lg-runtime
 
@@ -66,10 +90,28 @@ service worker that supplies the COOP/COEP headers GitHub Pages needs for
 SharedArrayBuffer. Programs that use the `term` namespace get full terminal
 emulation via xterm.js: ANSI colors, cursor positioning, raw keyboard input.
 
+## Native binaries
+
+`lg compile` builds a program into a standalone native executable through the
+Go backend. It needs a Go toolchain on `PATH`.
+
+```bash
+lg compile app.lg                 # writes ./app
+lg compile -o bin/app app.lg      # choose the output path
+lg compile -work gen app.lg       # keep the generated Go module in gen/
+```
+
+One input must define `-main` or `main`, which the binary calls natively.
+Code that lowers runs as Go; what does not lower stays on the VM, and the build
+still succeeds. The generated module requires the let-go this `lg` came from: a
+release pins its own version, and a dev build uses `LETGO_SRC` or the checkout
+it finds, as `-w` does. Pass several files when the program's own namespaces
+should lower too; namespaces you don't pass run from bytecode.
+
 ## Compile-time vars
 
-`*compiling-aot*` is `true` during `-c`/`-b`/`-w` compilation and `false` at
-runtime, useful for keeping side effects out of compile time:
+`*compiling-aot*` is `true` during `-c`/`-b`/`-w` compilation and `false` during
+ordinary runtime execution, useful for keeping side effects out of compile time:
 
 ```clojure
 (defn -main []
@@ -78,6 +120,14 @@ runtime, useful for keeping side effects out of compile time:
 (when-not *compiling-aot*
   (-main))
 ```
+
+`lg compile` does the following step for you. When driving the pipeline by
+hand, compile the embedded bytecode with
+`lg -c program.lgb -entry-frame-entry app/-main app.lg` (use `app/main` when
+that is the selected entry). This omits the selected top-level entry call
+from the bytecode because the native frame calls it. Other top-level forms,
+including guarded initialization in required namespaces, run with
+`*compiling-aot*` false at runtime. Ordinary `lg -c` keeps the entry call.
 
 `*in-wasm*` is `true` when running inside a WASM build.
 

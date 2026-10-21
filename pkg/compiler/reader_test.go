@@ -56,6 +56,207 @@ func TestReaderBasic(t *testing.T) {
 	}
 }
 
+func TestReadStringAttachesMetadataToMap(t *testing.T) {
+	got, err := ReadString(`^{:doc "mapping"} {"a" "b"}`)
+	assert.NoError(t, err)
+
+	m, ok := got.(*vm.PersistentMap)
+	if !ok {
+		t.Fatalf("ReadString returned %T (%v), want metadata-bearing map", got, got)
+	}
+	assert.Equal(t, vm.String("b"), m.ValueAt(vm.String("a")))
+
+	meta, ok := m.Meta().(*vm.PersistentMap)
+	if !ok {
+		t.Fatalf("map metadata is %T (%v), want map", m.Meta(), m.Meta())
+	}
+	assert.Equal(t, vm.String("mapping"), meta.ValueAt(vm.Keyword("doc")))
+}
+
+func TestReadStringAttachesMetadataToCollections(t *testing.T) {
+	tests := []struct {
+		name  string
+		src   string
+		check func(*testing.T, vm.Value)
+	}{
+		{
+			name: "list",
+			src:  `^{:doc "list"} (1 2)`,
+			check: func(t *testing.T, got vm.Value) {
+				if _, ok := got.(*vm.List); !ok {
+					t.Fatalf("got %T (%v), want list", got, got)
+				}
+				assert.Equal(t, "(1 2)", got.String())
+			},
+		},
+		{
+			name: "vector",
+			src:  `^{:doc "vector"} [1 2]`,
+			check: func(t *testing.T, got vm.Value) {
+				if _, ok := got.(vm.PersistentVector); !ok {
+					t.Fatalf("got %T (%v), want metadata-bearing vector", got, got)
+				}
+				assert.Equal(t, "[1 2]", got.String())
+			},
+		},
+		{
+			name: "set",
+			src:  `^{:doc "set"} #{1 2}`,
+			check: func(t *testing.T, got vm.Value) {
+				set, ok := got.(*vm.PersistentSet)
+				if !ok {
+					t.Fatalf("got %T (%v), want metadata-bearing set", got, got)
+				}
+				assert.Equal(t, 2, set.RawCount())
+				assert.Equal(t, vm.TRUE, set.Contains(vm.Int(1)))
+				assert.Equal(t, vm.TRUE, set.Contains(vm.Int(2)))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ReadString(tt.src)
+			assert.NoError(t, err)
+			tt.check(t, got)
+
+			target, ok := got.(vm.IMeta)
+			if !ok {
+				t.Fatalf("got %T (%v), want metadata support", got, got)
+			}
+			meta, ok := target.Meta().(*vm.PersistentMap)
+			if !ok {
+				t.Fatalf("metadata is %T (%v), want map", target.Meta(), target.Meta())
+			}
+			assert.Equal(t, vm.String(tt.name), meta.ValueAt(vm.Keyword("doc")))
+		})
+	}
+}
+
+func TestReadStringPreservesSymbolTypeHintAsData(t *testing.T) {
+	got, err := ReadString(`^String [1]`)
+	assert.NoError(t, err)
+
+	target, ok := got.(vm.IMeta)
+	if !ok {
+		t.Fatalf("got %T (%v), want metadata support", got, got)
+	}
+	meta := target.Meta().(*vm.PersistentMap)
+	assert.Equal(t, vm.Symbol("String"), meta.ValueAt(vm.Keyword("tag")))
+}
+
+func TestReadStringDefersSymbolMetadataToWrapper(t *testing.T) {
+	got, err := ReadString(`^String value`)
+	assert.NoError(t, err)
+	assert.Equal(t, `(with-meta value {:tag (quote String)})`, got.String())
+}
+
+func TestCompilerReaderPreservesMetadataWrapperForms(t *testing.T) {
+	for _, src := range []string{`^:flag [1]`, `^:flag #{1}`} {
+		reader := NewLispReader(strings.NewReader(src), "<reader>")
+		got, err := reader.Read()
+		assert.NoError(t, err)
+
+		form, ok := got.(*vm.List)
+		if !ok {
+			t.Fatalf("%s: compiler reader returned %T (%v), want with-meta form", src, got, got)
+		}
+		assert.Equal(t, vm.Symbol("with-meta"), form.First())
+	}
+}
+
+func TestRuntimeStringReadersAttachCollectionMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "read-string map",
+			src:  `(let [v (read-string "^{:doc \"mapping\"} {\"a\" \"b\"}")] [(map? v) (:doc (meta v))])`,
+			want: `[true "mapping"]`,
+		},
+		{
+			name: "read-string set",
+			src:  `(let [v (read-string "^:flag #{1 2}")] [(set? v) (:flag (meta v))])`,
+			want: `[true true]`,
+		},
+		{
+			name: "read-all-string vector",
+			src:  `(let [v (first (read-all-string "^:flag [1]"))] [(vector? v) (:flag (meta v))])`,
+			want: `[true true]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Eval(tt.src)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got.String())
+		})
+	}
+}
+
+func TestReaderSetLiteralRejectsDuplicateForms(t *testing.T) {
+	for _, input := range []string{
+		`#{1 1}`,
+		`#{[1] [1]}`,
+		`#{(gensym) (gensym)}`,
+		`#{(swap! c inc) (swap! c inc)}`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			r := NewLispReader(strings.NewReader(input), "<reader>")
+			_, err := r.Read()
+			if assert.Error(t, err) {
+				assert.Contains(t, err.Error(), "Duplicate key:")
+			}
+		})
+	}
+}
+
+func TestReaderSetLiteralSplicesReaderConditionals(t *testing.T) {
+	r := NewLispReader(strings.NewReader(`#{#?@(:default [1 2])}`), "<reader>")
+	got, err := r.Read()
+	if assert.NoError(t, err) {
+		set, ok := got.(*vm.PersistentSet)
+		if assert.True(t, ok, "set literal returned %T", got) {
+			assert.Equal(t, 2, set.RawCount())
+			assert.Equal(t, vm.TRUE, set.Contains(vm.Int(1)))
+			assert.Equal(t, vm.TRUE, set.Contains(vm.Int(2)))
+		}
+	}
+
+	r = NewLispReader(strings.NewReader(`[#{#?@(:default [1 2])} :after]`), "<reader>")
+	got, err = r.Read()
+	if assert.NoError(t, err) {
+		outer, ok := got.(vm.ArrayVector)
+		if assert.True(t, ok, "outer literal returned %T", got) && assert.Len(t, outer, 2) {
+			_, ok := outer[0].(*vm.PersistentSet)
+			assert.True(t, ok, "splicing state leaked past set; first element is %T", outer[0])
+			assert.Equal(t, vm.Keyword("after"), outer[1])
+		}
+	}
+
+	r = NewLispReader(strings.NewReader(`[#{#?@(:cljs [1])} :after]`), "<reader>")
+	got, err = r.Read()
+	if assert.NoError(t, err) {
+		outer, ok := got.(vm.ArrayVector)
+		if assert.True(t, ok, "outer literal returned %T", got) && assert.Len(t, outer, 2) {
+			set, ok := outer[0].(*vm.PersistentSet)
+			if assert.True(t, ok, "no-match splicing state leaked; first element is %T", outer[0]) {
+				assert.Zero(t, set.RawCount())
+			}
+			assert.Equal(t, vm.Keyword("after"), outer[1])
+		}
+	}
+
+	r = NewLispReader(strings.NewReader(`#{1 #?@(:default [1])}`), "<reader>")
+	_, err = r.Read()
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "Duplicate key:")
+	}
+}
+
 func TestReaderKeywordInternalColons(t *testing.T) {
 	valid := map[string]vm.Keyword{
 		`:/`:        vm.Keyword(`/`),
@@ -83,6 +284,58 @@ func TestReaderKeywordInternalColons(t *testing.T) {
 	got, err := r.Read()
 	assert.NoError(t, err)
 	assert.Equal(t, vm.Keyword(`keyword-target/:bar`), got)
+}
+
+func TestReaderShebang(t *testing.T) {
+	// A `#!` opener is a line comment, but only as the very first line: it
+	// lets an .lg file run as an executable script (`#!/usr/bin/env lg`).
+	// Anywhere else `#!` is what it always was — an invalid hash macro.
+	// The data reader (clojure.edn parity) never skips shebangs.
+	r := NewLispReader(strings.NewReader("#!/usr/bin/env lg\n(+ 1 2)"), "<reader>")
+	o, err := r.Read()
+	assert.NoError(t, err)
+	assert.Equal(t, vm.EmptyList.Cons(vm.Int(2)).Cons(vm.Int(1)).Cons(vm.Symbol("+")), o)
+
+	// A shebang line ends at end of input like a `;` comment does, so a file
+	// holding only `#!...` with no trailing newline reads as no forms.
+	r = NewLispReader(strings.NewReader("#!shebang"), "<reader>")
+	_, err = r.ReadSkipNoValue()
+	assert.True(t, IsErrorEOF(err), "shebang without newline ends the input cleanly, got %v", err)
+
+	for _, p := range []string{"(+ 1 2)\n#!/not-first\n", "  #!/indented\n(+ 1 2)"} {
+		r := NewLispReader(strings.NewReader(p), "<reader>")
+		var err error
+		for err == nil {
+			_, err = r.ReadSkipNoValue()
+		}
+		assert.ErrorContains(t, err, "invalid hash macro", "input %q: #! off the first line stays an error", p)
+	}
+
+	_, err = ReadDataString("#!shebang\n1")
+	assert.Error(t, err, "data reader keeps Clojure behavior: #! is an error")
+
+	// Every other dispatch macro opening the input reads as before: the
+	// shebang check must not consume the rune after '#'. read-string starts
+	// a fresh reader, so this is also every (read-string "#...").
+	for _, p := range []string{"#{1 2}", "#_(skipped) 3", "#(inc %)", `#"a.b"`, "#'inc", "#?(:default 4)"} {
+		r := NewLispReader(strings.NewReader(p), "<reader>")
+		_, err := r.ReadSkipNoValue()
+		assert.NoError(t, err, "input %q: a first-rune dispatch macro must read", p)
+	}
+	r = NewLispReader(strings.NewReader("#_(skipped) 3"), "<reader>")
+	o, err = r.ReadSkipNoValue()
+	assert.NoError(t, err)
+	assert.Equal(t, vm.Int(3), o)
+}
+
+func TestEvalShebangOnlyFile(t *testing.T) {
+	// sh, python3, node, ruby, perl and clojure all run a file that is only a
+	// shebang line, with or without a trailing newline, as an empty script.
+	for _, src := range []string{"#!/usr/bin/env lg", "#!/usr/bin/env lg\n"} {
+		v, err := Eval(src)
+		assert.NoError(t, err, "input %q", src)
+		assert.Equal(t, vm.NIL, v, "input %q", src)
+	}
 }
 
 func TestReaderSkipsLeadingNoValueForms(t *testing.T) {
@@ -163,4 +416,44 @@ func TestReaderConditionalSplicing(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, e, o)
 	}
+}
+
+func TestDataReaderFollowsClojureDataSemantics(t *testing.T) {
+	// clojure.edn/read-string reads data: metadata attaches (or is dropped
+	// for values without metadata support) instead of producing a
+	// (with-meta ...) call, sets read as sets, and a discard between a key
+	// and its value splices nothing.
+	m, err := ReadDataString(`^{:doc "mapping"} {"a" "b"}`)
+	assert.NoError(t, err)
+	assert.True(t, vm.NewArrayMap([]vm.Value{vm.String("a"), vm.String("b")}).Equals(m), "%v", m)
+	assert.Equal(t, vm.String("mapping"), m.(vm.IMeta).Meta().(vm.Lookup).ValueAt(vm.Keyword("doc")))
+
+	m2, err := ReadDataString(`{"a" #_[:ignored] "b"}`)
+	assert.NoError(t, err)
+	assert.True(t, vm.NewArrayMap([]vm.Value{vm.String("a"), vm.String("b")}).Equals(m2), "%v", m2)
+
+	_, err = ReadDataString(`{:a #_ 1 :b 2}`)
+	assert.Error(t, err, "Clojure: an odd map literal is an error, the key is not dropped")
+	_, err = ReadDataString(`{"a" "x" "a" "y"}`)
+	assert.Error(t, err, "Clojure: duplicate map key is an error")
+	_, err = ReadDataString(`#{1 1}`)
+	assert.Error(t, err, "Clojure: duplicate set element is an error")
+
+	set, err := ReadDataString(`#{1 2}`)
+	assert.NoError(t, err)
+	assert.Equal(t, vm.SetType, set.Type())
+
+	forms, err := ReadAllDataString("#_x {\"a\" \"b\"} ;; trailing\n [1 2]")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(forms))
+
+	_, err = ReadAllDataString(`{"a" "b"} {`)
+	assert.Error(t, err, "EOF mid-form is an error")
+
+	// Code reading returns a set too: a set literal is a set in both modes,
+	// as in Clojure, where `(set? '#{1 2})` and a macro's view of `#{1 2}`
+	// are both true.
+	code, err := ReadString(`#{1 2}`)
+	assert.NoError(t, err)
+	assert.Equal(t, vm.SetType, code.Type())
 }

@@ -7,6 +7,7 @@
 ;;   :bottom :unknown :any
 ;;   :nil :true :false :bool :string :int :float :number :char
 ;;   [:const :int 0] [:const :float 0.0]
+;;   [:array :byte|:int|:float|:object]
 ;;   [:union ...]
 ;;
 ;; Two representations, kept in lockstep for the pure-kind hot path:
@@ -49,7 +50,8 @@
    :lazyseq 19
    :transient-vector 20
    :transient-map 21
-   :transient-set 22})
+   :transient-set 22
+   :array 23})
 
 ;; The concrete collection/seq kinds (keyword lattice members, non-maskable).
 (def collection-kinds #{:vector :map :set :list :cons :lazyseq
@@ -120,6 +122,17 @@
 (defn dtype-type? [t]
   (and (vector? t) (= :dtype (first t)) (= 2 (count t))))
 
+;; [:array K] — a typed array (vm.TypedArray) whose element kind K mirrors
+;; vm.ArrayKind. The kind is DECLARED, by an array constructor or a ^doubles-
+;; style param hint, never inferred from the elements, which is what makes
+;; arrays the tractable subset of native collections (#1055). Non-maskable,
+;; like :dtype: it survives the threaded state as a keyword fact.
+(def array-elem-kinds #{:byte :int :float :object})
+
+(defn array-type? [t]
+  (and (vector? t) (= :array (first t)) (= 2 (count t))
+       (contains? array-elem-kinds (nth t 1))))
+
 (defn maskable-type? [t]
   (cond
     ;; :ratio is a first-class core numeric type but has NO bitset bit — the
@@ -167,6 +180,7 @@
   (let [key (cond
               (const-type? t) (nth t 1)
               (dtype-type? t) :dtype
+              (array-type? t) :array
               :else t)]
     (get type-order key 100)))
 
@@ -182,16 +196,20 @@
 ;; bit-or/bit-and (VM builtins) — no bs-* dependency. Proven ≡ type-join over
 ;; all 26244 non-const pairs by scripts/ti-bitset-proptest.lg.
 (def ^:private kind-bit {:nil 0 :true 1 :false 2 :bool 3 :int 4 :float 5 :string 6 :char 7})
+(def ^:private mask-bottom 0)
 (def ^:private mask-any (bit-shift-left 1 8))
 (def ^:private mask-unknown (bit-shift-left 1 9))
-(def ^:private mask-number (bit-or (bit-shift-left 1 4) (bit-shift-left 1 5)))
+(def ^:private mask-number
+  (bit-or (bit-shift-left 1 (get kind-bit :int))
+          (bit-shift-left 1 (get kind-bit :float))))
 
 (defn- mask-bit? [m b] (not (zero? (bit-and m (bit-shift-left 1 b)))))
 
 (defn type->mask [t]
   (cond
     (dtype-type? t)  nil
-    (= t :bottom)  0
+    (array-type? t)  nil
+    (= t :bottom)  mask-bottom
     (= t :any)     mask-any
     (= t :unknown) mask-unknown
     (= t :number)  mask-number
@@ -213,30 +231,36 @@
 ;; read back by mask->type's precedence. Monotone (bits only set, never cleared).
 (defn mask-join [a b] (bit-or a b))
 
+(def ^:private scalar-mask-types
+  (reduce-kv (fn [types kind bit]
+               (assoc types (bit-shift-left 1 bit) kind))
+             {mask-bottom :bottom mask-number :number}
+             kind-bit))
+
 (defn mask->type [m]
-  (cond
-    (mask-bit? m 8) :any
-    (mask-bit? m 9) :unknown
-    (zero? m) :bottom
-    :else
-    (let [set? (fn [b] (mask-bit? m b))
-          members (vec (concat
-                         (if (set? 0) [:nil] [])
-                         (if (set? 3)
-                           [:bool]
-                           (concat (if (set? 1) [:true] [])
-                                   (if (set? 2) [:false] [])))
-                         (cond
-                           (and (set? 4) (set? 5)) [:number]
-                           (set? 4) [:int]
-                           (set? 5) [:float]
-                           :else [])
-                         (if (set? 6) [:string] [])
-                         (if (set? 7) [:char] [])))]
+  (or (get scalar-mask-types m)
       (cond
-        (empty? members) :bottom
-        (= 1 (count members)) (first members)
-        :else (into [:union] (sort-members members))))))
+        (mask-bit? m 8) :any
+        (mask-bit? m 9) :unknown
+        :else
+        (let [set? (fn [b] (mask-bit? m b))
+              members (vec (concat
+                             (if (set? 0) [:nil] [])
+                             (if (set? 3)
+                               [:bool]
+                               (concat (if (set? 1) [:true] [])
+                                       (if (set? 2) [:false] [])))
+                             (cond
+                               (and (set? 4) (set? 5)) [:number]
+                               (set? 4) [:int]
+                               (set? 5) [:float]
+                               :else [])
+                             (if (set? 6) [:string] [])
+                             (if (set? 7) [:char] [])))]
+          (cond
+            (empty? members) :bottom
+            (= 1 (count members)) (first members)
+            :else (into [:union] (sort-members members)))))))
 
 ;; --- keyword/vector canonicalization + join ---------------------------------
 
@@ -246,6 +270,7 @@
     (nil? t) :unknown
     (keyword? t) t
     (dtype-type? t) t
+    (array-type? t) t
     (const-type? t)
     (let [tag (nth t 1)
           v   (nth t 2)]
@@ -331,6 +356,10 @@
     (if (dtype-type? b) (if (= a b) a :any) :any)
     (dtype-type? b)
     :any
+    ;; Two different array kinds, or an array against anything else, have no
+    ;; common native shape: :any, as for dtype (equal kinds hit (= a b) above).
+    (array-type? a) :any
+    (array-type? b) :any
     (= a :any) :any
     (= b :any) :any
     (= a :unknown) :unknown
@@ -433,11 +462,10 @@
   (let [s     @state
         facts (:inst-facts s)
         tch   (:touched s)
-        fv    @f
-        insts (:insts fv)
+        insts (ir/all-insts f)
         ;; types side table (see ir.data new-fn) — read it first, tuple slot 5
         ;; is the construction-time fallback, mirroring ir/type-of.
-        tys   (:types fv)
+        tys   (ir/all-types f)
         tn    (count tys)
         n     (count insts)]
     (loop [i 0]
@@ -450,17 +478,23 @@
           (recur (inc i)))
         state))))
 
+(defn join-inst-fact!
+  "Join fact into nid's fact in place. Returns true if the fact changed."
+  [state nid fact]
+  (let [old    (state-fact state nid)
+        joined (join-facts old fact)]
+    (if (= joined old)
+      false
+      (do (assoc-state-fact state nid joined)
+          true))))
+
 (defn join-inst-type! [state nid t]
-  (let [joined (join-facts (state-fact state nid) (fact-from-type t))]
-    (if (= joined (state-fact state nid))
-      state
-      (assoc-state-fact state nid joined))))
+  (join-inst-fact! state nid (fact-from-type t))
+  state)
 
 (defn join-inst-mask! [state nid mask]
-  (let [joined (join-facts (state-fact state nid) (mask-fact mask))]
-    (if (= joined (state-fact state nid))
-      state
-      (assoc-state-fact state nid joined))))
+  (join-inst-fact! state nid (mask-fact mask))
+  state)
 
 (defn flush-state-types! [state f]
   ;; Walk nids positionally and write back only the ones a join marked
@@ -468,7 +502,7 @@
   ;; changed" contract — seeded-but-unchanged :bottom nodes must not clobber
   ;; the inst's :unknown type.)
   (let [tch (:touched @state)
-        n   (count (:insts @f))]
+        n   (ir/inst-count f)]
     (loop [nid 0]
       (when (< nid n)
         (when (nth tch nid)

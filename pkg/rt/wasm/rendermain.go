@@ -17,12 +17,10 @@ const wasmMainTmpl = `package main
 
 import (
 	_ "embed"
-	"bytes"
 	"fmt"
 	"os"
 __LG_HOST_EVAL_IMPORTS__
 
-	"github.com/nooga/let-go/pkg/bytecode"
 	"github.com/nooga/let-go/pkg/compiler"
 	"github.com/nooga/let-go/pkg/resolver"
 	"github.com/nooga/let-go/pkg/rt"
@@ -39,24 +37,31 @@ func main() {
 	nsResolver := resolver.NewNSResolver(ctx, []string{"."})
 	rt.SetNSLoader(nsResolver)
 
-	// Route *out*/*err* to the JS host via _lgOutput (HostWriter), instead of
-	// os.Stdout/Stderr + the bundle's fs.writeSync fd interception. SetRoot,
-	// not a per-Run binding, because this generated main drives bytecode
-	// directly rather than through pkg/api. Guarded: if the core I/O vars
-	// aren't installed yet, output falls back to os.Stdout.
+	// Route *out*/*err* (and *test-out*, if loaded) to the JS host via
+	// _lgOutput (HostWriter), instead of os.Stdout/Stderr + the bundle's
+	// fs.writeSync fd interception. InstallHostOutputRoots, not a per-Run
+	// binding, because this generated main drives bytecode directly rather
+	// than through pkg/api; it updates *out*/*err*/*test-out* together so
+	// they never disagree regardless of load order. Guarded internally: if
+	// the core I/O vars aren't installed yet, output falls back to os.Stdout.
 	hostWriter := rt.NewHostWriter()
-	if v := rt.LookupCoreVar("*out*"); v != nil {
-		v.SetRoot(vm.NewBoxed(rt.NewWriterHandle("host-stdout", hostWriter)))
-	}
-	if v := rt.LookupCoreVar("*err*"); v != nil {
-		v.SetRoot(vm.NewBoxed(rt.NewWriterHandle("host-stderr", hostWriter)))
-	}
+	rt.InstallHostOutputRoots(
+		rt.NewWriterHandle("host-stdout", hostWriter),
+		rt.NewWriterHandle("host-stderr", hostWriter),
+	)
 
 	// Route (js/emit ...) to the JS host via _lgEmit (HostEmitter), the dual
 	// of the HostWriter *out* routing above. Same SetRoot rationale.
 	hostEmitter := rt.NewHostEmitter()
 	if v := rt.LookupCoreVar("*emit*"); v != nil {
 		v.SetRoot(vm.NewBoxed(hostEmitter))
+	}
+
+	// Route (surface/present ...) to the JS host via _lgSurface (HostSurface),
+	// the binary dual of the HostEmitter routing above. Same SetRoot rationale.
+	hostSurface := rt.NewHostSurface()
+	if v := rt.LookupCoreVar("*surface*"); v != nil {
+		v.SetRoot(vm.NewBoxed(hostSurface))
 	}
 
 	// Route storage through browser localStorage, scoped by the bundle's
@@ -66,39 +71,37 @@ func main() {
 		v.SetRoot(vm.NewBoxed(hostStorage))
 	}
 
-	resolve := func(nsName, name string) *vm.Var {
-		n := rt.DefNSBare(nsName)
-		v := n.LookupLocal(vm.Symbol(name))
-		if v == nil {
-			return n.DefStub(name)
-		}
-		return v
-	}
-
-	unit, err := bytecode.DecodeToExecUnit(bytes.NewReader(lgbData), resolve)
+	// rt.DecodeExecUnit, not an inline resolver: it also marks the embedded
+	// core namespaces the program references so (require 'zip) loads them
+	// (#954).
+	unit, err := rt.DecodeExecUnit(lgbData)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %%v\n", err)
 		return
 	}
 
+	// The unit's TypeScope is active while its chunks run, so its defrecord
+	// and deftype forms adopt the types its constants decoded to.
+	run := func(chunk *vm.CodeChunk) error {
+		return vm.WithTypeScope(unit.Types, func() error {
+			f := vm.NewFrame(chunk, nil)
+			_, err := f.RunProtected()
+			vm.ReleaseFrame(f)
+			return err
+		})
+	}
 	for _, name := range unit.NSOrder {
 		chunk := unit.NSChunks[name]
 		if chunk == nil || chunk == unit.MainChunk {
 			continue
 		}
-		f := vm.NewFrame(chunk, nil)
-		_, err := f.RunProtected()
-		vm.ReleaseFrame(f)
-		if err != nil {
+		if err := run(chunk); err != nil {
 			fmt.Fprintf(os.Stderr, "error loading %%s: %%v\n", name, err)
 			return
 		}
 	}
 
-	f := vm.NewFrame(unit.MainChunk, nil)
-	_, err = f.RunProtected()
-	vm.ReleaseFrame(f)
-	if err != nil {
+	if err := run(unit.MainChunk); err != nil {
 		fmt.Fprint(os.Stderr, vm.FormatError(err))
 	}
 __LG_HOST_EVAL_BODY__

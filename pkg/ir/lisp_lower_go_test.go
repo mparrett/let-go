@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nooga/let-go/pkg/compiler"
 	"github.com/nooga/let-go/pkg/rt"
@@ -70,6 +71,23 @@ func bindAndRenderGoDecl(t *testing.T, result *vm.PersistentMap) string {
 	varName := fmt.Sprintf("*lower-go-decl-%d*", passVarCounter)
 	rt.NS(rt.NameCoreNS).Def(varName, result.ValueAt(vm.Keyword("decl")))
 	rendered := runLispExpr(t, fmt.Sprintf(`(gogen/render %s)`, varName))
+	s, ok := rendered.(vm.String)
+	if !ok {
+		t.Fatalf("expected gogen/render string, got %T", rendered)
+	}
+	return string(s)
+}
+
+// bindAndRenderGoClosures renders a lowered result's :decl together with the
+// closure structs of its fn literals (:decls), which is where a literal's
+// body lives: the fn itself only calls the struct's constructor.
+func bindAndRenderGoClosures(t *testing.T, result *vm.PersistentMap) string {
+	t.Helper()
+	passVarCounter++
+	varName := fmt.Sprintf("*lower-go-result-%d*", passVarCounter)
+	rt.NS(rt.NameCoreNS).Def(varName, result)
+	rendered := runLispExpr(t, fmt.Sprintf(
+		`(clojure.string/join "\n" (map gogen/render (cons (:decl %s) (:decls %s))))`, varName, varName))
 	s, ok := rendered.(vm.String)
 	if !ok {
 		t.Fatalf("expected gogen/render string, got %T", rendered)
@@ -703,11 +721,11 @@ func TestLowerGoStrictIdentityClosureLowersToWrappedGoClosure(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v", got)
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
-	if !strings.Contains(rendered, "rt.BoxNativeFn") {
-		t.Fatalf("expected closure lowering to wrap a Go func literal\n--- go ---\n%s", rendered)
+	rendered := bindAndRenderGoClosures(t, result)
+	if !strings.Contains(rendered, "newClosure_") {
+		t.Fatalf("expected closure lowering to construct a closure struct\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "func(arg0 vm.Value) vm.Value") {
+	if !strings.Contains(rendered, "func(ec *vm.ExecContext, arg0 vm.Value) vm.Value") {
 		t.Fatalf("expected identity closure to lower to a vm.Value-typed Go closure\n--- go ---\n%s", rendered)
 	}
 	if !strings.Contains(rendered, "return arg0") {
@@ -738,6 +756,47 @@ func TestLowerGoClosureCapturingLoopCarriedBlockParam(t *testing.T) {
 	}
 }
 
+// TestLowerGoSequentialJoinsInLoopLowerInPolynomialTime: a loop body made of
+// many one-armed `when`s must lower in time polynomial in their number. licm
+// threads each hoisted constant through every block of the loop as a block
+// parameter, so every join carries parameters whose lineage runs back through
+// all the joins before it and around the back edge. Resolving those
+// parameters by a per-query walk that cannot cache answers reached through the
+// loop header visits every path through the joins, doubling the lowering time
+// with each `when`: at this size that is hours, against a few seconds when each
+// parameter is solved once per function.
+func TestLowerGoSequentialJoinsInLoopLowerInPolynomialTime(t *testing.T) {
+	ensureLoader()
+
+	const joins = 20
+	var body strings.Builder
+	for k := 0; k < joins; k++ {
+		fmt.Fprintf(&body, "\n\t\t\t\t(when (= %d (aget a i)) (aset a i 0))", k)
+	}
+	start := time.Now()
+	v := runLispExpr(t, fmt.Sprintf(
+		`(do (create-ns (quote joinsinloop))
+		     (intern (quote joinsinloop) (quote clear-matches))
+		     (ir.passes.pipeline/lower-ns-to-go "joinsinloop" (quote joinsinloop)
+		       [(quote (defn clear-matches [a n]
+		                 (loop [i 0]
+		                   (when (< i n)%s
+		                     (recur (inc i))))
+		                 nil))]))`, body.String()))
+	elapsed := time.Since(start)
+
+	got := string(v.(vm.String))
+	if !strings.Contains(got, "func ClearMatches(") {
+		t.Fatalf("expected clear-matches to lower to a Go function:\n%s", got)
+	}
+	if n := strings.Count(got, `"clojure.core", "aset")`); n != joins {
+		t.Fatalf("expected %d aset calls, one per when, got %d:\n%s", joins, n, got)
+	}
+	if elapsed > 2*time.Minute {
+		t.Fatalf("lowering %d sequential joins in a loop took %v; expected seconds", joins, elapsed)
+	}
+}
+
 func TestLowerGoStrictCapturedClosureUsesOuterGoLocal(t *testing.T) {
 	ensureLoader()
 
@@ -749,15 +808,18 @@ func TestLowerGoStrictCapturedClosureUsesOuterGoLocal(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v", got)
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
-	if !strings.Contains(rendered, "rt.BoxNativeFn") {
-		t.Fatalf("expected captured closure to lower via rt.BoxNativeFn\n--- go ---\n%s", rendered)
+	rendered := bindAndRenderGoClosures(t, result)
+	if !strings.Contains(rendered, "newClosure_") {
+		t.Fatalf("expected captured closure to construct a closure struct\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "func() vm.Value") {
-		t.Fatalf("expected captured closure to lower to a zero-arg Go closure\n--- go ---\n%s", rendered)
+	if !regexp.MustCompile(`func\(ec \*vm\.ExecContext, c[0-9]+_cap0 vm\.Value\) vm\.Value`).MatchString(rendered) {
+		t.Fatalf("expected captured closure to lower to a zero-arg Go closure taking its capture\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "return arg0") {
-		t.Fatalf("expected captured closure to close over the outer Go local\n--- go ---\n%s", rendered)
+	if !regexp.MustCompile(`return c[0-9]+_cap0`).MatchString(rendered) {
+		t.Fatalf("expected captured closure to return its capture\n--- go ---\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "(ec, arg0)") {
+		t.Fatalf("expected the constructor to receive the outer Go local\n--- go ---\n%s", rendered)
 	}
 }
 
@@ -772,12 +834,12 @@ func TestLowerGoStrictKeywordClosureLowersToVmKeyword(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v", got)
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
+	rendered := bindAndRenderGoClosures(t, result)
 	if !strings.Contains(rendered, `vm.Keyword("ok")`) {
 		t.Fatalf("expected keyword literal to lower through vm.Keyword\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "rt.BoxNativeFn") {
-		t.Fatalf("expected keyword-returning closure to lower via Go closure wrapping\n--- go ---\n%s", rendered)
+	if !strings.Contains(rendered, "newClosure_") {
+		t.Fatalf("expected keyword-returning closure to construct a closure struct\n--- go ---\n%s", rendered)
 	}
 }
 
@@ -792,11 +854,11 @@ func TestLowerGoStrictMultiArityClosureLowersToNativeMultiArity(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v", got)
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
+	rendered := bindAndRenderGoClosures(t, result)
 	if !strings.Contains(rendered, "rt.MakeNativeMultiArity") {
 		t.Fatalf("expected multi-arity closure to lower via rt.MakeNativeMultiArity\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "func() vm.Value") || !strings.Contains(rendered, "func(arg0 vm.Value) vm.Value") {
+	if !strings.Contains(rendered, "func(ec *vm.ExecContext) vm.Value") || !strings.Contains(rendered, "func(ec *vm.ExecContext, arg0 vm.Value) vm.Value") {
 		t.Fatalf("expected both arity branches to lower as Go closures\n--- go ---\n%s", rendered)
 	}
 }
@@ -812,12 +874,12 @@ func TestLowerGoStrictCapturedMultiArityClosureUsesOuterGoLocals(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v", got)
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
+	rendered := bindAndRenderGoClosures(t, result)
 	if !strings.Contains(rendered, "rt.MakeNativeMultiArity") {
 		t.Fatalf("expected captured multi-arity closure to lower via rt.MakeNativeMultiArity\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "return arg0") {
-		t.Fatalf("expected zero-arity branch to capture the outer Go local\n--- go ---\n%s", rendered)
+	if !regexp.MustCompile(`return c[0-9]+_cap0`).MatchString(rendered) {
+		t.Fatalf("expected zero-arity branch to return its capture of the outer Go local\n--- go ---\n%s", rendered)
 	}
 }
 
@@ -952,14 +1014,14 @@ func TestLowerGoStrictMultiArityDefnLowersToNativeMultiArity(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v (reason: %v)", got, result.ValueAt(vm.Keyword("reason")))
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
+	rendered := bindAndRenderGoClosures(t, result)
 	if !strings.Contains(rendered, "rt.MakeNativeMultiArity") {
 		t.Fatalf("expected multi-arity defn to lower via rt.MakeNativeMultiArity\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "func(arg0 vm.Value) vm.Value") {
+	if !strings.Contains(rendered, "func(ec *vm.ExecContext, arg0 vm.Value) vm.Value") {
 		t.Fatalf("expected single-arg branch to lower as Go closure\n--- go ---\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "func(arg0 vm.Value, arg1 vm.Value) vm.Value") {
+	if !strings.Contains(rendered, "func(ec *vm.ExecContext, arg0 vm.Value, arg1 vm.Value) vm.Value") {
 		t.Fatalf("expected two-arg branch to lower as Go closure\n--- go ---\n%s", rendered)
 	}
 }
@@ -1816,7 +1878,7 @@ func TestLowerNsToGoLiftsIntraNsCall(t *testing.T) {
 // call site. (count, formerly used here, is now a native-direct call into
 // corefns.Count, so it no longer exercises the cached-var fallback.)
 // Cross-ns cached-var dispatch: a call to a non-native fn in another namespace
-// lifts to shared rt.CachedVarFn IFn dispatch. Uses a user-defined fn (uxns/uxfn)
+// lifts to shared rt.CachedVarFnEC IFn dispatch. Uses a user-defined fn (uxns/uxfn)
 // rather than a core primitive — core primitives like str/deref are now //lg:
 // native and direct-link, so they no longer exercise this path; a user fn always
 // does.
@@ -1844,7 +1906,7 @@ func TestLowerNsToGoLiftsCrossNsCall(t *testing.T) {
 
 // IFn-dispatch lowering: a cross-ns callee (clojure.core/count) makes the
 // lowered package declare a package-level cached `var __v_* *vm.Var`. Resolution
-// + memoization happen at the call site via the shared rt.CachedVarFn helper (no
+// + memoization happen at the call site via the shared rt.CachedVarFnEC helper (no
 // per-callee accessor func is emitted), and NOT eagerly in init() — blank-
 // imported lowered packages run init() before the bundle replay loads
 // namespaces, where the lookup would return nil.
@@ -1874,14 +1936,14 @@ func TestLowerGoCrossNsEmitsCachedVar(t *testing.T) {
 		t.Fatalf("cached var %s has type %q, want *vm.Var", name, typ)
 	}
 
-	// 2. the call site resolves it via the shared rt.CachedVarFn helper, and NO
-	//    per-callee accessor func is emitted (that bloat is what rt.CachedVarFn
+	// 2. the call site resolves it via the shared rt.CachedVarFnEC helper, and NO
+	//    per-callee accessor func is emitted (that bloat is what rt.CachedVarFnEC
 	//    replaces).
 	if _, ok := findIFnDispatch(f); !ok {
-		t.Fatalf("expected rt.CachedVarFn IFn dispatch for str:\n%s", src)
+		t.Fatalf("expected rt.CachedVarFnEC IFn dispatch for str:\n%s", src)
 	}
 	if _, ok := findFunc(f, func(n string) bool { return strings.HasPrefix(n, "__getv_") }); ok {
-		t.Fatalf("no per-callee accessor func should be emitted (use rt.CachedVarFn):\n%s", src)
+		t.Fatalf("no per-callee accessor func should be emitted (use rt.CachedVarFnEC):\n%s", src)
 	}
 
 	// 3. resolution is lazy: no init() may eagerly call rt.LookupVar (that would
@@ -1896,7 +1958,7 @@ func TestLowerGoCrossNsEmitsCachedVar(t *testing.T) {
 // Task 2 (IFn-dispatch lowering): a cross-ns call lowers its CALL SITE to the
 // cached-var IFn dispatch
 //
-//	rt.CachedVarFn(&__v_<ns>_<name>, "ns", "name").Invoke([]vm.Value{...})
+//	ec.Invoke(rt.CachedVarFnEC(ec, &__v_<ns>_<name>, "ns", "name"), []vm.Value{...})
 //
 // keeping the per-call .Deref() as the override seam, and NO per-call
 // rt.LookupVar at the call site.
@@ -1926,7 +1988,7 @@ func TestLowerGoCrossNsCallLiftsToIFn(t *testing.T) {
 		t.Fatalf("dispatch var %q does not target uxfn", d.varName)
 	}
 	if d.nsArg != "uxns" || d.nameArg != "uxfn" {
-		t.Fatalf("CachedVarFn resolves (%q,%q), want (uxns,uxfn)", d.nsArg, d.nameArg)
+		t.Fatalf("CachedVarFnEC resolves (%q,%q), want (uxns,uxfn)", d.nsArg, d.nameArg)
 	}
 	// The call site must NOT do a per-call rt.LookupVar for str anymore.
 	if callsLookupVarNamed(caller, "str") {
@@ -2028,8 +2090,7 @@ func TestLowerGoStrictExactDTypeArgStaysConcrete(t *testing.T) {
 // c<nid>_. nid is unique only within one function IR, so two nested closure
 // templates can share a nid; a flat prefix then makes the inner closure's
 // param collide with the captured outer param it shadows — the same
-// "captured name shadowed by block param" miscompile this PR fixes, just one
-// level deeper. (Reported on PR #247.)
+// "captured name shadowed by block param" miscompile, one level deeper.
 func TestLowerGoNestedCapturedClosurePrefixesAreLexical(t *testing.T) {
 	ensureLoader()
 
@@ -2044,21 +2105,25 @@ func TestLowerGoNestedCapturedClosurePrefixesAreLexical(t *testing.T) {
 		t.Fatalf("expected :lowered status, got %v (reason: %v)", got, result.ValueAt(vm.Keyword("reason")))
 	}
 
-	rendered := bindAndRenderGoDecl(t, result)
+	rendered := bindAndRenderGoClosures(t, result)
 
 	// Each capturing closure names its first param <prefix>arg0 where prefix is
-	// one or more c<nid>_ segments. The two nested capturing closures appear in
-	// source order: outer first, inner second. The inner prefix must LEXICALLY
-	// EXTEND the outer (c<o>_ -> c<o>_c<i>_), which guarantees distinctness
-	// regardless of whether the two templates happen to share a nid. A flat
-	// per-nid scheme would instead emit sibling prefixes (c<o>_, c<i>_) that are
-	// only accidentally distinct.
-	re := regexp.MustCompile(`func\(((?:c[0-9]+_)+)arg0 vm\.Value\)`)
+	// one or more c<nid>_ segments. The inner prefix must LEXICALLY EXTEND the
+	// outer (c<o>_ -> c<o>_c<i>_), which guarantees distinctness regardless of
+	// whether the two templates happen to share a nid. A flat per-nid scheme
+	// would instead emit sibling prefixes (c<o>_, c<i>_) that are only
+	// accidentally distinct. The closure structs render in registration
+	// order (the inner literal lowers, and registers, before its outer), so
+	// the shorter prefix is the outer one.
+	re := regexp.MustCompile(`((?:c[0-9]+_)+)arg0 vm\.Value\)`)
 	ms := re.FindAllStringSubmatch(rendered, -1)
 	if len(ms) < 2 {
 		t.Fatalf("expected two nested prefixed closure params, found %d\n--- go ---\n%s", len(ms), rendered)
 	}
 	outer, inner := ms[0][1], ms[1][1]
+	if len(inner) < len(outer) {
+		outer, inner = inner, outer
+	}
 	if inner == outer || !strings.HasPrefix(inner, outer) {
 		t.Fatalf("inner closure prefix %q must lexically extend outer %q (else inner param can shadow captured outer param)\n--- go ---\n%s", inner, outer, rendered)
 	}
@@ -2101,7 +2166,7 @@ func TestLowerGoMultiArityEmitsDistinctPerArityHelperNames(t *testing.T) {
 	if !strings.Contains(rendered, "Foo_2(ec, arg0") {
 		t.Fatalf("expected sibling `(foo a b)` to lower to a direct `Foo_2(ec, arg0, …)` call, not a trampoline\n--- go ---\n%s", rendered)
 	}
-	if strings.Contains(rendered, `CachedVarFn(&__v_lgtest_foo`) {
+	if strings.Contains(rendered, `CachedVarFnEC(ec, &__v_lgtest_foo`) {
 		t.Fatalf("sibling call to multi-arity `foo` still trampolines via CachedVarFn\n--- go ---\n%s", rendered)
 	}
 	// Step 2b: one multi-arity override adapter registered under the bare name,
@@ -2144,6 +2209,116 @@ func TestGoExportNameGuardsDegenerateNames(t *testing.T) {
 		}
 		if !strings.HasPrefix(string(s), "LG_") {
 			t.Fatalf("go-export-name %q should fall back to an exported LG_ name; got %q", in, string(s))
+		}
+	}
+}
+
+// unchecked-add / unchecked-subtract / unchecked-multiply are first-class IR
+// ops (:unchecked-add/-sub/-mul). For int/int they lower to native Go
+// arithmetic — Go int ops already wrap at the platform width, which IS the
+// unchecked contract — and must not fall into the promoting
+// rt.AddValue/SubValue/MulValue helpers that share their op-str.
+func TestLowerGoStrictUncheckedIntLowersNative(t *testing.T) {
+	ensureLoader()
+
+	cases := []struct {
+		name   string
+		src    string
+		argtys string
+		want   string
+		reject string
+	}{
+		{name: "unchecked-add", src: `(defn uadd [x y] (unchecked-add x y))`, argtys: "[:int :int]", want: "+", reject: "AddValue"},
+		{name: "unchecked-subtract", src: `(defn usub [x y] (unchecked-subtract x y))`, argtys: "[:int :int]", want: "-", reject: "SubValue"},
+		{name: "unchecked-multiply", src: `(defn umul [x y] (unchecked-multiply x y))`, argtys: "[:int :int]", want: "*", reject: "MulValue"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := buildLispIR(t, tc.src)
+			seedArgTypes(t, fn, tc.argtys)
+			optimizeLispIR(t, fn)
+			result := lowerGo(t, fn, ":strict")
+
+			if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+				t.Fatalf("expected :lowered status, got %v (reason=%v)",
+					got, result.ValueAt(vm.Keyword("reason")))
+			}
+			rendered := bindAndRenderGoDecl(t, result)
+			if !strings.Contains(rendered, tc.want) {
+				t.Fatalf("expected %s to lower to native Go op %q, got:\n%s", tc.name, tc.want, rendered)
+			}
+			if strings.Contains(rendered, tc.reject) {
+				t.Fatalf("expected %s on int/int to stay native, but it routed through a runtime helper (%s):\n%s", tc.name, tc.reject, rendered)
+			}
+		})
+	}
+}
+
+// An operand that is not a proven int must go through the wrapping
+// rt.Unchecked<Op>Value helper — never the promoting rt.<Op>Value one, which
+// would turn (unchecked-add Long/MAX_VALUE 1) into an overflow error.
+func TestLowerGoUncheckedBoxedOperandRoutesToUncheckedHelper(t *testing.T) {
+	ensureLoader()
+
+	cases := []struct {
+		name   string
+		src    string
+		want   string
+		reject string
+	}{
+		{name: "unchecked-add", src: `(defn uadd [x y] (unchecked-add x y))`, want: "rt.UncheckedAddValue(", reject: "rt.AddValue("},
+		{name: "unchecked-subtract", src: `(defn usub [x y] (unchecked-subtract x y))`, want: "rt.UncheckedSubValue(", reject: "rt.SubValue("},
+		{name: "unchecked-multiply", src: `(defn umul [x y] (unchecked-multiply x y))`, want: "rt.UncheckedMulValue(", reject: "rt.MulValue("},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := buildLispIR(t, tc.src)
+			seedArgTypes(t, fn, "[:any :any]")
+			optimizeLispIR(t, fn)
+			result := lowerGo(t, fn, ":strict")
+
+			if got := result.ValueAt(vm.Keyword("status")); got != vm.Keyword("lowered") {
+				t.Fatalf("expected :lowered status, got %v (reason=%v)",
+					got, result.ValueAt(vm.Keyword("reason")))
+			}
+			rendered := bindAndRenderGoDecl(t, result)
+			if !strings.Contains(rendered, tc.want) {
+				t.Fatalf("expected %s with boxed operands to call %s, got:\n%s", tc.name, tc.want, rendered)
+			}
+			if strings.Contains(rendered, tc.reject) {
+				t.Fatalf("expected %s to avoid the promoting helper %s, got:\n%s", tc.name, tc.reject, rendered)
+			}
+		})
+	}
+}
+
+// Lowered code links a sibling directly, as Clojure's direct linking does: a
+// redefinition reaches its lowered callers only once they are recompiled. A
+// ^:redef or ^:dynamic fn is never linked directly; callers reach it through
+// its var, so with-redefs and binding apply.
+func TestLowerGoLinksSiblingsDirectlyExceptRedefAndDynamic(t *testing.T) {
+	ensureLoader()
+
+	v := runLispExpr(t, `(do (create-ns 'lgdl)
+	                        (doseq [s '[plain redefd dyn use]] (intern (the-ns 'lgdl) s))
+	                        (ir.passes.pipeline/lower-ns-to-go "lgdl" 'lgdl
+	                          '[(defn plain [x] x)
+	                            (defn ^:redef redefd [x] x)
+	                            (defn ^:dynamic dyn [x] x)
+	                            (defn use [a] [(plain a) (redefd a) (dyn a)])]))`)
+	src, ok := v.(vm.String)
+	if !ok {
+		t.Fatalf("expected lower-ns-to-go to return rendered Go source string, got %T (%v)", v, v)
+	}
+	rendered := string(src)
+	if !strings.Contains(rendered, "Plain(ec, arg0") {
+		t.Fatalf("expected `(plain a)` to lower to a direct `Plain(ec, arg0)` call\n--- go ---\n%s", rendered)
+	}
+	for _, name := range []string{"redefd", "dyn"} {
+		if !strings.Contains(rendered, "CachedVarFnEC(ec, &__v_lgdl_"+name) {
+			t.Fatalf("expected `(%s a)` to go through its var\n--- go ---\n%s", name, rendered)
 		}
 	}
 }

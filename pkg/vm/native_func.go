@@ -19,51 +19,144 @@ func (t *theNativeFnType) Unbox() any      { return reflect.TypeFor[*theNativeFn
 
 func (t *theNativeFnType) Name() string { return "let-go.lang.NativeFn" }
 
-// fastValueProxy returns a non-reflection proxy for the signatures the
-// IR-lowered code boxes most often: func(Value…N) (Value, error), all args and
-// the result already let-go Values. A direct typed call skips the per-invocation
-// []reflect.Value allocation, per-arg reflect boxing, and reflect.Call (whose
-// reflect.unsafe_New dominated the native optimize-pass alloc profile). Returns
-// (nil, 0) for any other signature, so Box falls through to the reflect proxy.
-func fastValueProxy(fn any) (func([]Value) (Value, error), int) {
-	switch f := fn.(type) {
-	case func() (Value, error):
-		return func(a []Value) (Value, error) {
-			if len(a) != 0 {
-				return NIL, fmt.Errorf("wrong number of args (%d), expected 0", len(a))
-			}
-			return f()
-		}, 0
-	case func(Value) (Value, error):
-		return func(a []Value) (Value, error) {
-			if len(a) != 1 {
-				return NIL, fmt.Errorf("wrong number of args (%d), expected 1", len(a))
-			}
-			return f(a[0])
-		}, 1
-	case func(Value, Value) (Value, error):
-		return func(a []Value) (Value, error) {
-			if len(a) != 2 {
-				return NIL, fmt.Errorf("wrong number of args (%d), expected 2", len(a))
-			}
-			return f(a[0], a[1])
-		}, 2
-	case func(Value, Value, Value) (Value, error):
-		return func(a []Value) (Value, error) {
-			if len(a) != 3 {
-				return NIL, fmt.Errorf("wrong number of args (%d), expected 3", len(a))
-			}
-			return f(a[0], a[1], a[2])
-		}, 3
-	case func(Value, Value, Value, Value) (Value, error):
-		return func(a []Value) (Value, error) {
-			if len(a) != 4 {
-				return NIL, fmt.Errorf("wrong number of args (%d), expected 4", len(a))
-			}
-			return f(a[0], a[1], a[2], a[3])
-		}, 4
+// fastArity reports the arity of a Go func whose shape call dispatches
+// directly, without reflection: Values in, a Value out, with or without a
+// trailing error. Variadic shapes report -1. ok is false for any other shape.
+func fastArity(fn any) (arity int, variadic bool, ok bool) {
+	switch fn.(type) {
+	case func() (Value, error), func() Value:
+		return 0, false, true
+	case func(Value) (Value, error), func(Value) Value:
+		return 1, false, true
+	case func(Value, Value) (Value, error), func(Value, Value) Value:
+		return 2, false, true
+	case func(Value, Value, Value) (Value, error), func(Value, Value, Value) Value:
+		return 3, false, true
+	case func(Value, Value, Value, Value) (Value, error), func(Value, Value, Value, Value) Value:
+		return 4, false, true
+	case func(...Value) (Value, error):
+		return -1, true, true
 	}
-	return nil, 0
+	return 0, false, false
+}
+
+// WrongArgCount is the error a fixed-arity native fn returns when called with
+// the wrong number of arguments: the ExecutionError the bytecode VM raises for
+// a bytecode fn of that arity, naming fn as the VM prints it. Lowered Go
+// closures (NativeBody) and typed override wrappers report their own arity
+// check through it.
+func WrongArgCount(fn Value, got, want int) error {
+	return NewExecutionError(fmt.Sprintf("function %s expected %d args, got %d", fn, want, got))
+}
+
+// TooFewArgs is the error a variadic native fn returns when called with fewer
+// arguments than its fixed parameters, as the bytecode VM reports it.
+func TooFewArgs(fn Value, got, min int) error {
+	return NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got %d", fn, min, got))
+}
+
+// NoArityVariant is the error a multi-arity native fn returns when no arity
+// matches the call, as the bytecode VM reports it for a multi-arity fn.
+func NoArityVariant(fn Value, got int) error {
+	return NewExecutionError(fmt.Sprintf("function %s doesn't have a %d-arity variant", fn, got))
+}
+
+// orNIL maps the nil interface a Go func may return in place of NIL to NIL,
+// as the reflect path's BoxValue does, so no fast shape hands nil to callers.
+func orNIL(v Value) Value {
+	if v == nil {
+		return NIL
+	}
+	return v
+}
+
+// orNILErr is orNIL for a (Value, error) result.
+func orNILErr(v Value, err error) (Value, error) {
+	return orNIL(v), err
+}
+
+// NativeBody is a callable that lives inside a larger Go struct, so that one
+// struct allocation holds the NativeFn, the body and everything the body
+// closes over. Lowered Go emits one such struct per fn literal: the captured
+// values are its fields and CallNative is the lowered body.
+type NativeBody interface {
+	CallNative(args []Value) (Value, error)
+}
+
+// InitNativeFn sets up n in place, without allocating, to dispatch to body
+// with the declared arity. n is normally the NativeFn embedded in the struct
+// that implements body, so the caller returns &n as the let-go value and the
+// whole closure is one allocation. arity counts the fixed parameters; for a
+// variadic body it is the minimum call width, which is what multi-arity
+// dispatch (MakeMultiArity) reads off a variadic native.
+func InitNativeFn(n *NativeFn, arity int, variadic bool, body NativeBody) {
+	n.arity = arity
+	n.isVariadric = variadic
+	n.fn = body
+}
+
+// callFast invokes l's func, which has a fastArity shape or is the NativeBody
+// of a lowered closure. A type switch on the stored func replaces a per-box
+// adapter closure, so boxing costs one allocation. The trailing error case is
+// a guard: Box admits only these shapes.
+func (l *NativeFn) callFast(a []Value) (Value, error) {
+	switch f := l.fn.(type) {
+	case NativeBody:
+		return f.CallNative(a)
+	case func() (Value, error):
+		if len(a) != 0 {
+			return NIL, WrongArgCount(l, len(a), 0)
+		}
+		return orNILErr(f())
+	case func(Value) (Value, error):
+		if len(a) != 1 {
+			return NIL, WrongArgCount(l, len(a), 1)
+		}
+		return orNILErr(f(a[0]))
+	case func(Value, Value) (Value, error):
+		if len(a) != 2 {
+			return NIL, WrongArgCount(l, len(a), 2)
+		}
+		return orNILErr(f(a[0], a[1]))
+	case func(Value, Value, Value) (Value, error):
+		if len(a) != 3 {
+			return NIL, WrongArgCount(l, len(a), 3)
+		}
+		return orNILErr(f(a[0], a[1], a[2]))
+	case func(Value, Value, Value, Value) (Value, error):
+		if len(a) != 4 {
+			return NIL, WrongArgCount(l, len(a), 4)
+		}
+		return orNILErr(f(a[0], a[1], a[2], a[3]))
+	case func() Value:
+		if len(a) != 0 {
+			return NIL, WrongArgCount(l, len(a), 0)
+		}
+		return orNIL(f()), nil
+	case func(Value) Value:
+		if len(a) != 1 {
+			return NIL, WrongArgCount(l, len(a), 1)
+		}
+		return orNIL(f(a[0])), nil
+	case func(Value, Value) Value:
+		if len(a) != 2 {
+			return NIL, WrongArgCount(l, len(a), 2)
+		}
+		return orNIL(f(a[0], a[1])), nil
+	case func(Value, Value, Value) Value:
+		if len(a) != 3 {
+			return NIL, WrongArgCount(l, len(a), 3)
+		}
+		return orNIL(f(a[0], a[1], a[2])), nil
+	case func(Value, Value, Value, Value) Value:
+		if len(a) != 4 {
+			return NIL, WrongArgCount(l, len(a), 4)
+		}
+		return orNIL(f(a[0], a[1], a[2], a[3])), nil
+	case func(...Value) (Value, error):
+		return orNILErr(f(a...))
+	}
+	return NIL, fmt.Errorf("callFast: unsupported shape %T", l.fn)
 }
 
 func (t *theNativeFnType) Box(fn any) (Value, error) {
@@ -72,111 +165,82 @@ func (t *theNativeFnType) Box(fn any) (Value, error) {
 		return NIL, NewTypeError(fn, "can't be boxed into", t)
 	}
 
-	// Fast path: exact func(Value…N) (Value, error) shapes dispatch directly,
-	// no reflection. Everything else uses the reflect proxy below.
-	if fp, arity := fastValueProxy(fn); fp != nil {
-		return &NativeFn{arity: arity, isVariadric: false, fn: fn, proxy: fp}, nil
+	// Fast path: the fastArity shapes — func(Value…N) returning Value or
+	// (Value, error), and func(...Value) (Value, error) — dispatch directly
+	// through callFast, no reflection. Everything else uses the reflect proxy
+	// below.
+	if arity, variadic, ok := fastArity(fn); ok {
+		return &NativeFn{arity: arity, isVariadric: variadic, fn: fn}, nil
 	}
 
-	variadric := ty.IsVariadic()
-	declArgs := ty.NumIn()
-	v := reflect.ValueOf(fn)
-
-	proxy := func(args []Value) (Value, error) {
-		rawArgs := make([]reflect.Value, len(args))
-
-		for i := range args {
-			// For variadic fns called via reflect.Call (not CallSlice),
-			// each variadic arg slot expects the slice's ELEMENT type, not
-			// the slice type itself. Previously the loop used the slice
-			// type ([]vm.Value) for variadic args, which sent vm.String
-			// through the slice-target branch of boxArgForReflect and out
-			// the Unbox fallback — surfacing a Go primitive that reflect
-			// rejected when dispatching through the let-go Value interface.
-			var in reflect.Type
-			if variadric && i >= declArgs-1 {
-				in = ty.In(declArgs - 1).Elem()
-			} else {
-				in = ty.In(i)
-			}
-			if args[i] != NIL {
-				rawArgs[i] = boxArgForReflect(args[i], in)
-				// Skip the .Convert() step when the prepared value is
-				// already assignable to the param's interface type — Convert
-				// to an interface erases the dynamic type info reflect.Call
-				// needs to dispatch through the let-go Value interface.
-				if rawArgs[i].IsValid() && rawArgs[i].Type().AssignableTo(in) {
-					// already valid as-is
-				} else if rawArgs[i].CanConvert(in) {
-					rawArgs[i] = rawArgs[i].Convert(in)
-				}
-			} else {
-				// NIL to an interface param: pass vm.NIL (falsy) instead of a
-				// nil interface (which IsTruthy treats as truthy, breaking
-				// (or nil []) patterns) — but ONLY when *vm.Nil actually
-				// satisfies the param interface (vm.Value or a super-interface).
-				// For unrelated interfaces (error, io.Reader, …) *vm.Nil is not
-				// assignable, so a genuine nil interface (reflect.Zero) is
-				// required or reflect.Call panics ("using *vm.Nil as type error").
-				nilVal := reflect.ValueOf(NIL)
-				if in.Kind() == reflect.Interface && nilVal.Type().AssignableTo(in) {
-					rawArgs[i] = nilVal
-				} else {
-					rawArgs[i] = reflect.Zero(in)
-				}
-			}
-		}
-		res := v.Call(rawArgs)
-		lr := len(res)
-		if lr == 0 {
-			return NIL, nil
-		}
-		if lr == 1 {
-			wv, err := BoxValue(res[0])
-			if err != nil {
-				return NIL, err
-			}
-			return wv, nil
-		}
-		// assume lr == 2 && res[1] is error
-		wv, err := BoxValue(res[0])
-		if err != nil {
-			return NIL, err
-		}
-		errorInterface := reflect.TypeFor[error]()
-		if res[1].Type() == errorInterface && res[1].Interface() != nil {
-			return wv, res[1].Interface().(error)
-		}
-		return wv, nil
-	}
-
-	f := &NativeFn{
-		arity:       declArgs,
-		isVariadric: variadric,
-		fn:          fn,
-		proxy:       proxy,
-	}
-
-	return f, nil
+	// Signature inspection + reflect.Call dispatch live in a build-tagged
+	// helper: the stock path reflects the Go signature and calls through it,
+	// while TinyGo's reflect can't do IsVariadic/NumIn/In/Value.Call (all
+	// unimplemented), so it returns a stub that errors only if actually
+	// invoked — letting interop namespaces install at boot without trapping.
+	return boxReflectFunc(t, fn, ty)
 }
 
 // boxArgForReflect prepares a let-go Value for reflect.Call into a Go fn.
 //
-// When the Go parameter is a slice/array kind, we want per-element
-// conversion (so e.g. []vm.Int can flow into []int). The struct_mapping
-// machinery already does this via unboxSliceInto, so we delegate to it.
-// For non-slice targets and for boxed Go values, plain Unbox is correct.
-func boxArgForReflect(v Value, target reflect.Type) reflect.Value {
+// When the Go parameter is a slice/array or map kind, we want per-element
+// conversion (so e.g. []vm.Int can flow into []int, and a let-go map into a
+// map[string]any). The struct_mapping machinery already does this via
+// unboxSliceInto and unboxMapInto, so we delegate to those. For other targets
+// and for boxed Go values, plain Unbox is correct.
+//
+// A failed conversion is reported only when the Unbox fallback cannot satisfy
+// the target either. The fallback is legitimate on its own — a *Boxed already
+// holding a Go map takes it and succeeds — so failing eagerly would break
+// working calls. But when neither path produces a usable value, returning the
+// conversion error is what lets the caller say
+//
+//	cannot convert map key 65 (let-go.lang.Integer) to string
+//
+// instead of letting reflect.Call panic with the diagnostic that started this
+// whole issue:
+//
+//	reflect: Call using *vm.PersistentMap as type map[string]interface {}
+func boxArgForReflect(v Value, target reflect.Type) (reflect.Value, error) {
 	if debugBoxArgs {
 		fmt.Fprintf(os.Stderr, "[boxArgForReflect] v=%T target=%s kind=%s\n", v, target.String(), target.Kind())
 	}
+	// Remembered from a slice or map attempt, surfaced only at the end.
+	var convErr error
+
 	if target.Kind() == reflect.Slice || target.Kind() == reflect.Array {
-		if sq, ok := v.(Sequable); ok {
-			out := reflect.New(target).Elem()
-			if err := unboxSliceInto(out, sq.Seq()); err == nil {
-				return out
+		// TypedArray is the mutable array boundary: when its native backing
+		// slice already satisfies the Go parameter, pass that slice through so
+		// writes made by APIs such as io.Reader.Read remain visible to let-go.
+		// Incompatible element types and fixed arrays still use the ordinary
+		// per-element conversion below, as do persistent collections.
+		if target.Kind() == reflect.Slice {
+			if arr, ok := v.(*TypedArray); ok && arr != nil {
+				backing := reflect.ValueOf(arr.Unbox())
+				if usableAsReflectArg(backing, target) {
+					return backing, nil
+				}
 			}
 		}
+		if sq, ok := v.(Sequable); ok {
+			out := reflect.New(target).Elem()
+			err := unboxSliceInto(out, sq.Seq())
+			if err == nil {
+				return out, nil
+			}
+			convErr = err
+		}
+	}
+	if target.Kind() == reflect.Map {
+		// Without this, a map target fell through to the Unbox fallback below
+		// and reflect.Call died, because (*PersistentMap).Unbox returns the
+		// map itself.
+		out := reflect.New(target).Elem()
+		err := unboxMapInto(out, v)
+		if err == nil {
+			return out, nil
+		}
+		convErr = err
 	}
 	// When the Go param is an interface (typically vm.Value itself), pass
 	// the boxed Value directly. Unboxing first would surface a Go-native
@@ -189,13 +253,24 @@ func boxArgForReflect(v Value, target reflect.Type) reflect.Value {
 			fmt.Fprintf(os.Stderr, "[boxArgForReflect]   interface path: rv.Type=%s assignable=%v\n", rv.Type().String(), rv.Type().AssignableTo(target))
 		}
 		if rv.IsValid() && rv.Type().AssignableTo(target) {
-			return rv
+			return rv, nil
 		}
 	}
 	if debugBoxArgs {
 		fmt.Fprintf(os.Stderr, "[boxArgForReflect]   FALLBACK Unbox: v.Unbox()=%T\n", v.Unbox())
 	}
-	return reflect.ValueOf(v.Unbox())
+	out := reflect.ValueOf(v.Unbox())
+	if convErr != nil && !usableAsReflectArg(out, target) {
+		return reflect.Value{}, convErr
+	}
+	return out, nil
+}
+
+// usableAsReflectArg mirrors what boxReflectFunc does with a prepared
+// argument: it is passed through when assignable, and converted when
+// convertible. Anything else makes reflect.Call panic.
+func usableAsReflectArg(v reflect.Value, target reflect.Type) bool {
+	return v.IsValid() && (v.Type().AssignableTo(target) || v.CanConvert(target))
 }
 
 var debugBoxArgs = os.Getenv("LG_BOXARGS_DEBUG") != ""
@@ -257,6 +332,22 @@ func NewCtxNativeFn(name string, fn func(ec *ExecContext, args []Value) (Value, 
 	return n
 }
 
+// NewArityNativeFn builds a context-aware native that DECLARES a fixed arity
+// (or a variadic minimum) rather than the -1/variadic default NewCtxNativeFn
+// uses. The declared arity is what MakeMultiArity dispatches on: an arm whose
+// Arity() is -1 and isVariadric is true is indistinguishable from a rest-arm,
+// so a wrapper built the ordinary way collapses every arm of a multi-arity fn
+// into ma.rest and leaves ma.fns empty. Callers that wrap an opaque callable
+// (ir.direct's invokers) use this to keep the arity visible to dispatch.
+func NewArityNativeFn(name string, arity int, variadic bool, fn func(ec *ExecContext, args []Value) (Value, error)) *NativeFn {
+	n := &NativeFn{name: name, arity: arity, isVariadric: variadic, ctxProxy: fn}
+	n.proxy = func(args []Value) (Value, error) { return fn(RootExecContext, args) }
+	return n
+}
+
+// IsVariadic reports whether this native declares a variadic tail.
+func (l *NativeFn) IsVariadic() bool { return l.isVariadric }
+
 func (l *NativeFn) SetName(n string) { l.name = n }
 
 func (l *NativeFn) Type() ValueType { return NativeFnType }
@@ -272,7 +363,17 @@ func (l *NativeFn) Arity() int {
 
 func (l *NativeFn) Invoke(args []Value) (ret Value, err error) {
 	defer RecoverPanic(&err)
-	return l.proxy(args)
+	return l.call(args)
+}
+
+// call runs the native without panic recovery: through its proxy when it has
+// one (reflected and context-aware natives), else straight to its Go func — a
+// fast shape, or the NativeBody a lowered closure embeds this NativeFn in.
+func (l *NativeFn) call(args []Value) (Value, error) {
+	if l.proxy != nil {
+		return l.proxy(args)
+	}
+	return l.callFast(args)
 }
 
 func (l *NativeFn) String() string {
@@ -297,4 +398,48 @@ func (l *NativeFn) WithMeta(m Value) Value {
 	cp := *l
 	cp.meta = m
 	return &cp
+}
+
+// NewCheckedCtxNativeFn builds a context-aware native that checks a call's
+// argument count before running fn, and reports a mismatch as the bytecode VM
+// does for a fn of the same shape: fixed holds the exact arities fn accepts,
+// and restMin, when not negative, the minimum count of a rest arm. Lowered Go
+// uses it for a capture-free fn literal that is variadic or multi-arity, which
+// it builds once per literal and shares, as the VM shares the fn constant; fn
+// only dispatches on the count. A single arm declares its own arity, so
+// multi-arity dispatch over it sees what the VM's fn would show.
+func NewCheckedCtxNativeFn(name string, fixed []int, restMin int, fn func(ec *ExecContext, args []Value) (Value, error)) *NativeFn {
+	n := &NativeFn{name: name, arity: -1, isVariadric: true}
+	switch {
+	case len(fixed) == 1 && restMin < 0:
+		n.arity, n.isVariadric = fixed[0], false
+	case len(fixed) == 0 && restMin >= 0:
+		n.arity = restMin
+	}
+	accepts := func(got int) bool {
+		if restMin >= 0 && got >= restMin {
+			return true
+		}
+		for _, a := range fixed {
+			if a == got {
+				return true
+			}
+		}
+		return false
+	}
+	n.ctxProxy = func(ec *ExecContext, args []Value) (Value, error) {
+		if !accepts(len(args)) {
+			switch {
+			case len(fixed) == 1 && restMin < 0:
+				return NIL, WrongArgCount(n, len(args), fixed[0])
+			case len(fixed) == 0:
+				return NIL, TooFewArgs(n, len(args), restMin)
+			default:
+				return NIL, NoArityVariant(n, len(args))
+			}
+		}
+		return fn(ec, args)
+	}
+	n.proxy = func(args []Value) (Value, error) { return n.ctxProxy(RootExecContext, args) }
+	return n
 }

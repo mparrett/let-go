@@ -8,6 +8,7 @@ package rt
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"unicode/utf8"
 
@@ -60,12 +61,74 @@ func UpperCase(v vm.Value) (string, error) {
 	return strings.ToUpper(strValue(v)), nil
 }
 
+// Escape returns s with each character c replaced by (cmap c) wherever that is
+// truthy. Mirrors clojure.string/escape — `(escape s cmap)`, where cmap is a
+// map or a function. A map is read with ValueAt rather than invoked, so the
+// usual HTML-escape call allocates no argument slice per character, and a
+// string with nothing to replace comes back as is. Registered in
+// clojure.string namespace.
+//
+//lg:native
+//lg:ns clojure.string
+//lg:name escape
+func Escape(s vm.Value, cmap vm.Value) (vm.Value, error) {
+	str, ok := s.(vm.String)
+	if !ok {
+		return vm.NIL, fmt.Errorf("escape expected String")
+	}
+	var lookup func(vm.Char) (vm.Value, error)
+	switch m := cmap.(type) {
+	case *vm.PersistentMap:
+		lookup = func(c vm.Char) (vm.Value, error) { return m.ValueAt(c), nil }
+	case vm.Map:
+		lookup = func(c vm.Char) (vm.Value, error) { return m.ValueAt(c), nil }
+	case vm.Fn:
+		lookup = func(c vm.Char) (vm.Value, error) { return m.Invoke([]vm.Value{c}) }
+	default:
+		// Fail on the first lookup, not up front: Clojure never calls cmap on
+		// an empty string, so (escape "" nil) returns "".
+		lookup = func(vm.Char) (vm.Value, error) {
+			return vm.NIL, fmt.Errorf("escape expected a map or a function, got %s", cmap.Type().Name())
+		}
+	}
+	src := string(str)
+	var b strings.Builder
+	started := false
+	for i := 0; i < len(src); {
+		r, size := utf8.DecodeRuneInString(src[i:])
+		rep, err := lookup(vm.Char(r))
+		if err != nil {
+			return vm.NIL, err
+		}
+		if !vm.IsTruthy(rep) {
+			// Copy the original bytes, not r, so invalid UTF-8 survives as it
+			// does on the no-replacement path.
+			if started {
+				b.WriteString(src[i : i+size])
+			}
+			i += size
+			continue
+		}
+		if !started {
+			b.Grow(len(src) + len(src)/2)
+			b.WriteString(src[:i])
+			started = true
+		}
+		b.WriteString(strValue(rep))
+		i += size
+	}
+	if !started {
+		return str, nil
+	}
+	return vm.String(b.String()), nil
+}
+
 // Subs returns a substring from index start to the end.
 // Mirrors clojure.core/subs with 2 arguments — `(subs s start)`.
 //
 //lg:native
 //lg:name subs
-func Subs(s string, start int) (string, error) {
+func Subs(s string, start int64) (string, error) {
 	if start < 0 {
 		return "", fmt.Errorf("string index out of range")
 	}
@@ -76,7 +139,8 @@ func Subs(s string, start int) (string, error) {
 	// is hot in parsers, and the full conversion dominated allocation.
 	str := string(s)
 	byteStart := -1
-	ri, bo := 0, 0
+	var ri int64
+	bo := 0
 	for {
 		if ri == start {
 			byteStart = bo
@@ -100,7 +164,7 @@ func Subs(s string, start int) (string, error) {
 //
 //lg:native
 //lg:name subs
-func Subs3(s string, start, end int) (string, error) {
+func Subs3(s string, start, end int64) (string, error) {
 	if start < 0 {
 		return "", fmt.Errorf("string index out of range")
 	}
@@ -115,7 +179,8 @@ func Subs3(s string, start, end int) (string, error) {
 	// Stop as soon as both offsets are known (i.e. at max(start, end) runes).
 	str := string(s)
 	byteStart, byteEnd := -1, -1
-	ri, bo := 0, 0
+	var ri int64
+	bo := 0
 	for {
 		if ri == start {
 			byteStart = bo
@@ -149,7 +214,7 @@ func Subs3(s string, start, end int) (string, error) {
 //
 //lg:native
 //lg:name nth
-func Nth(coll vm.Value, i int) (vm.Value, error) {
+func Nth(coll vm.Value, i int64) (vm.Value, error) {
 	if coll == vm.NIL {
 		return vm.NIL, nil
 	}
@@ -159,20 +224,22 @@ func Nth(coll vm.Value, i int) (vm.Value, error) {
 	// This path is the only correct route for positional-but-not-seqable
 	// types (transient vectors, chunks): the seq walk would return nil.
 	if ix, ok := coll.(vm.Indexed); ok {
-		if i < 0 || i >= ix.RawCount() {
+		if i < 0 || i >= int64(ix.RawCount()) {
 			return vm.NIL, fmt.Errorf("nth index out of bounds")
 		}
-		return ix.Nth(i), nil
+		return ix.Nth(int(i)), nil
 	}
-	// Seq path: linear walk
-	if i < 0 {
+	// Seq path: linear walk. The MaxInt guard matters only where int is
+	// narrower than the index: no in-memory seq has that many elements, so
+	// the index is out of bounds rather than something to truncate into range.
+	if i < 0 || i > math.MaxInt {
 		return vm.NIL, fmt.Errorf("nth index out of bounds")
 	}
 	s, err := seqOf(coll)
 	if err != nil {
 		return vm.NIL, err
 	}
-	if v, ok := nthInSeq(forceSeq(s), i); ok {
+	if v, ok := nthInSeq(forceSeq(s), int(i)); ok {
 		return v, nil
 	}
 	return vm.NIL, fmt.Errorf("nth index out of bounds")
@@ -185,7 +252,7 @@ func Nth(coll vm.Value, i int) (vm.Value, error) {
 //
 //lg:native
 //lg:name nth
-func Nth3(coll vm.Value, i int, notFound vm.Value) (vm.Value, error) {
+func Nth3(coll vm.Value, i int64, notFound vm.Value) (vm.Value, error) {
 	if coll == vm.NIL {
 		return notFound, nil
 	}
@@ -195,20 +262,20 @@ func Nth3(coll vm.Value, i int, notFound vm.Value) (vm.Value, error) {
 	// This path is the only correct route for positional-but-not-seqable
 	// types (transient vectors, chunks): the seq walk would return nil.
 	if ix, ok := coll.(vm.Indexed); ok {
-		if i < 0 || i >= ix.RawCount() {
+		if i < 0 || i >= int64(ix.RawCount()) {
 			return notFound, nil
 		}
-		return ix.Nth(i), nil
+		return ix.Nth(int(i)), nil
 	}
-	// Seq path: linear walk
-	if i < 0 {
+	// Seq path: linear walk. See Nth for why MaxInt is an out-of-bounds index.
+	if i < 0 || i > math.MaxInt {
 		return notFound, nil
 	}
 	s, err := seqOf(coll)
 	if err != nil {
 		return notFound, nil
 	}
-	if v, ok := nthInSeq(forceSeq(s), i); ok {
+	if v, ok := nthInSeq(forceSeq(s), int(i)); ok {
 		return v, nil
 	}
 	return notFound, nil
@@ -233,12 +300,12 @@ func Deref(ref vm.Value) (vm.Value, error) {
 //
 //lg:native
 //lg:name deref
-func Deref3(bref vm.Value, ms int, timeoutVal vm.Value) (vm.Value, error) {
+func Deref3(bref vm.Value, ms int64, timeoutVal vm.Value) (vm.Value, error) {
 	b, ok := bref.(vm.BlockingDeref)
 	if !ok {
 		return vm.NIL, fmt.Errorf("deref with timeout expects a blocking ref (promise or future)")
 	}
-	return b.DerefTimeout(int64(ms), timeoutVal), nil
+	return b.DerefTimeout(ms, timeoutVal), nil
 }
 
 // Str concatenates the string representation of its arguments.
@@ -381,6 +448,87 @@ func reduceColl(ec *vm.ExecContext, mfn vm.Fn, coll vm.Value, hasInit bool, init
 			}
 		}
 	}
+	// Resolve a bytecode reducer once and reuse one frame for the whole
+	// fold; per-element ec.Invoke pays resolution, frame-pool traffic, and
+	// frame init on every element. Non-bytecode/variadic reducers fall back
+	// to the generic invoke below.
+	// The PreparedCall lives on this stack frame and its argument slots in
+	// the pooled VM frame, so a short reduce (the IR compiler does thousands
+	// per compile) pays no heap allocation for the preparation itself.
+	var pc vm.PreparedCall
+	prepared := ec.PrepareCallInto(&pc, mfn, 2)
+	if prepared {
+		defer pc.Release()
+	}
+	// Reused two-arg buffer, shared by every path below: ec.Invoke does not
+	// retain its argument slice, so one buffer per reduce beats one per
+	// element — the single largest allocation site in a reduce loop.
+	fargs := []vm.Value{nil, nil}
+	// ArrayVector fast path: flat slice with O(1) indexing — reduce by
+	// direct index with zero seq/chunk allocation instead of via seqOf.
+	if av, ok := coll.(vm.ArrayVector); ok {
+		var acc vm.Value
+		i := 0
+		if hasInit {
+			acc = initVal
+		} else {
+			acc = av[0]
+			i = 1
+		}
+		for ; i < len(av); i++ {
+			var res vm.Value
+			var err error
+			if prepared {
+				res, err = pc.Call2(acc, av[i])
+			} else {
+				fargs[0] = acc
+				fargs[1] = av[i]
+				res, err = ec.Invoke(mfn, fargs)
+			}
+			if err != nil {
+				return vm.NIL, err
+			}
+			if r, ok := res.(*vm.Reduced); ok {
+				return r.Deref(), nil
+			}
+			acc = res
+		}
+		return acc, nil
+	}
+	// Range fast path: a range is (start, end, step) arithmetic — reduce
+	// by direct iteration with zero seq/chunk allocation. Mirrors the
+	// ArrayVector fast path above.
+	if rng, ok := coll.(*vm.Range); ok {
+		start, end, step := rng.Bounds()
+		var acc vm.Value
+		i := start
+		if hasInit {
+			acc = initVal
+		} else {
+			acc = vm.Int(i)
+			i += step
+		}
+		for (step > 0 && i < end) || (step < 0 && i > end) {
+			var res vm.Value
+			var err error
+			if prepared {
+				res, err = pc.Call2(acc, vm.Int(i))
+			} else {
+				fargs[0] = acc
+				fargs[1] = vm.Int(i)
+				res, err = ec.Invoke(mfn, fargs)
+			}
+			if err != nil {
+				return vm.NIL, err
+			}
+			if r, ok := res.(*vm.Reduced); ok {
+				return r.Deref(), nil
+			}
+			acc = res
+			i += step
+		}
+		return acc, nil
+	}
 	seq, err := seqOf(coll)
 	if err != nil {
 		return vm.NIL, fmt.Errorf("reduce expected Seq")
@@ -414,7 +562,13 @@ func reduceColl(ec *vm.ExecContext, mfn vm.Fn, coll vm.Value, hasInit bool, init
 			c := cs.ChunkedFirst()
 			n := c.ChunkCount()
 			for i := 0; i < n; i++ {
-				acc, err = ec.Invoke(mfn, []vm.Value{acc, c.Nth(i)})
+				if prepared {
+					acc, err = pc.Call2(acc, c.Nth(i))
+				} else {
+					fargs[0] = acc
+					fargs[1] = c.Nth(i)
+					acc, err = ec.Invoke(mfn, fargs)
+				}
 				if err != nil {
 					return vm.NIL, err
 				}
@@ -425,7 +579,13 @@ func reduceColl(ec *vm.ExecContext, mfn vm.Fn, coll vm.Value, hasInit bool, init
 			seq = cs.ChunkedNext()
 			continue
 		}
-		acc, err = ec.Invoke(mfn, []vm.Value{acc, seq.First()})
+		if prepared {
+			acc, err = pc.Call2(acc, seq.First())
+		} else {
+			fargs[0] = acc
+			fargs[1] = seq.First()
+			acc, err = ec.Invoke(mfn, fargs)
+		}
 		if err != nil {
 			return vm.NIL, err
 		}
@@ -436,4 +596,207 @@ func reduceColl(ec *vm.ExecContext, mfn vm.Fn, coll vm.Value, hasInit bool, init
 	}
 
 	return acc, nil
+}
+
+// Namespace implements (namespace x) for Named values.
+//
+//lg:native
+//lg:name namespace
+func Namespace(v vm.Value) (vm.Value, error) {
+	named, ok := v.(vm.Named)
+	if !ok {
+		return vm.NIL, fmt.Errorf("namespace expected Named")
+	}
+	return named.Namespace(), nil
+}
+
+// PushBinding implements (push-binding! v val) — the dynamic-binding
+// lifecycle, so it needs the ExecContext holding the binding stack.
+//
+//lg:native
+//lg:name push-binding!
+func PushBinding(ec *vm.ExecContext, v vm.Value, val vm.Value) (vm.Value, error) {
+	vr, ok := v.(*vm.Var)
+	if !ok {
+		return vm.NIL, fmt.Errorf("push-binding expected Var")
+	}
+	ec.PushBinding(vr, val)
+	return vm.NIL, nil
+}
+
+// PopBinding implements (pop-binding! v).
+//
+//lg:native
+//lg:name pop-binding!
+func PopBinding(ec *vm.ExecContext, v vm.Value) (vm.Value, error) {
+	vr, ok := v.(*vm.Var)
+	if !ok {
+		return vm.NIL, fmt.Errorf("pop-binding expected Var")
+	}
+	ec.PopBinding(vr)
+	return vm.NIL, nil
+}
+
+// regexSubmatchVector renders every capture group, with nil for groups that
+// did not participate in the match. Promoted from a lang.go closure alongside
+// regexSubmatchValue; both original call sites are same-package and unaffected.
+func regexSubmatchVector(s string, indices []int) vm.ArrayVector {
+	result := make(vm.ArrayVector, len(indices)/2)
+	for i := range result {
+		start, end := indices[2*i], indices[2*i+1]
+		if start < 0 {
+			result[i] = vm.NIL
+			continue
+		}
+		result[i] = vm.String(s[start:end])
+	}
+	return result
+}
+
+// regexSubmatchValue shapes a submatch-index result: a bare match returns the
+// String, a grouped match returns the vector. Promoted from a closure inside
+// lang.go's install fn so the direct-call natives here can share it — the two
+// original call sites are in the same package and are unaffected.
+func regexSubmatchValue(s string, indices []int) vm.Value {
+	if len(indices) == 2 {
+		return vm.String(s[indices[0]:indices[1]])
+	}
+	return regexSubmatchVector(s, indices)
+}
+
+// Some implements (some pred coll). Body extracted verbatim from lang.go's
+// closure (including the chunked fast path) rather than retyped, so the
+// direct-call path cannot drift from the interpreter path. Needs the
+// ExecContext to invoke the predicate.
+//
+//lg:native
+//lg:name some
+func Some(ec *vm.ExecContext, pred vm.Value, coll vm.Value) (vm.Value, error) {
+	f, ok := vm.AsFn(pred)
+	if !ok {
+		return vm.NIL, fmt.Errorf("some expected Fn")
+	}
+	seq, err := seqOf(coll)
+	if err != nil {
+		return vm.NIL, fmt.Errorf("some expected Seq")
+	}
+	// seqOf returns LazySeq directly; resolve here so an unresolved-empty
+	// LazySeq becomes nil instead of invoking the predicate once with nil.
+	if ls, ok := seq.(*vm.LazySeq); ok {
+		seq = ls.Resolve()
+	}
+	// Resolve a bytecode predicate once and reuse one frame for the whole
+	// walk: per-element ec.Invoke would pay resolution, frame-pool traffic,
+	// and frame init on every element. Non-bytecode/variadic predicates fall
+	// back to the generic invoke below.
+	var pc vm.PreparedCall
+	prepared := ec.PrepareCallInto(&pc, f, 1)
+	if prepared {
+		defer pc.Release()
+	}
+	fargs := []vm.Value{nil}
+	for seq != nil {
+		// Chunked fast path: walk whole chunks via Nth to avoid per-element
+		// seq.Next()/First() churn on chunked sources such as vectors/ranges.
+		if cs, ok := vm.AsChunkedSeq(seq); ok {
+			c := cs.ChunkedFirst()
+			n := c.ChunkCount()
+			for i := 0; i < n; i++ {
+				var v vm.Value
+				var err error
+				if prepared {
+					v, err = pc.Call1(c.Nth(i))
+				} else {
+					fargs[0] = c.Nth(i)
+					v, err = ec.Invoke(f, fargs)
+				}
+				if err != nil {
+					return vm.NIL, err
+				}
+				if vm.IsTruthy(v) {
+					return v, nil
+				}
+			}
+			seq = cs.ChunkedNext()
+			continue
+		}
+		var v vm.Value
+		var err error
+		if prepared {
+			v, err = pc.Call1(seq.First())
+		} else {
+			fargs[0] = seq.First()
+			v, err = ec.Invoke(f, fargs)
+		}
+		if err != nil {
+			return vm.NIL, err
+		}
+		if vm.IsTruthy(v) {
+			return v, nil
+		}
+		seq = seq.Next()
+	}
+
+	return vm.NIL, nil
+}
+
+// Int implements (int x). Body extracted verbatim from lang.go's closure —
+// including the int32 range guard and the per-type coercion table — rather
+// than retyped, so the direct-call path cannot drift from the interpreter.
+//
+//lg:native
+//lg:name int
+func Int(v vm.Value) (vm.Value, error) {
+	const minInt32 = -2147483648
+	const maxInt32 = 2147483647
+	coerce := func(f float64) (vm.Value, error) {
+		if f < minInt32 || f > maxInt32 {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to int", v)
+		}
+		return vm.MakeInt(int(math.Trunc(f))), nil
+	}
+	switch v := v.(type) {
+	case vm.Int:
+		if v < minInt32 || v > maxInt32 {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to int", v)
+		}
+		return v, nil
+	case vm.Float:
+		return coerce(float64(v))
+	case vm.Char:
+		return vm.Int(int(v)), nil
+	case *vm.BigInt:
+		if !v.Val().IsInt64() {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to int", v)
+		}
+		i := v.Val().Int64()
+		if i < minInt32 || i > maxInt32 {
+			return vm.NIL, fmt.Errorf("%s can't be coerced to int", v)
+		}
+		return vm.MakeInt(int(i)), nil
+	case *vm.BigDecimal:
+		f, _ := v.Val().Float64()
+		return coerce(f)
+	case *vm.Ratio:
+		f, _ := v.Val().Float64()
+		return coerce(f)
+	case vm.Boolean:
+		if bool(v) {
+			return vm.MakeInt(1), nil
+		}
+		return vm.MakeInt(0), nil
+	default:
+		return vm.NIL, fmt.Errorf("%s can't be coerced to int", v)
+	}
+}
+
+// rangeInt coerces a range bound: Int passes through; anything else is a
+// graceful error (a raw .(vm.Int) assertion panics). Promoted from a lang.go
+// closure so the direct-call range arities can share it.
+func rangeInt(v vm.Value, what string) (vm.Int, error) {
+	if n, ok := v.(vm.Int); ok {
+		return n, nil
+	}
+	return 0, fmt.Errorf("range %s must be an integer, got %s",
+		what, v.Type().Name())
 }

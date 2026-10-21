@@ -7,17 +7,28 @@ package rt
 
 import (
 	"fmt"
+	"math"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/nooga/let-go/pkg/vm"
 )
 
-// defStaticNS returns (creating if needed) a bare namespace that holds host
-// static members (e.g. `Util/hash`, `Long/parseLong`). Unlike DefNSBare it does
-// NOT auto-refer clojure.core, so defining a member whose name overlaps a core
-// var (`Util/hash` vs `clojure.core/hash`) does not print a shadow WARNING at
-// every `lg` startup. These namespaces only carry static members; they never
-// resolve core names, so the missing refer is harmless.
+// staticNSs are the host-class namespaces defStaticNS created before
+// referStaticNamespaces ran; staticNSsReferred records that it has.
+var (
+	staticNSs         []*vm.Namespace
+	staticNSsReferred bool
+)
+
+// defStaticNS returns (creating if needed) a namespace that holds host static
+// members (e.g. `Util/hash`, `Long/parseLong`). Code evaluated in one, after
+// (in-ns 'Float) say, must see clojure.core like any namespace, so it gets the
+// core and baseline refers — but only once the installers have defined its
+// members (referStaticNamespaces): defining a member whose name overlaps a core
+// var (`Util/hash` vs `clojure.core/hash`) into a namespace that already refers
+// core prints a shadow WARNING at every `lg` startup.
 func defStaticNS(name string) *vm.Namespace {
 	name = resolveNSAlias(name)
 	nsMu.RLock()
@@ -30,8 +41,36 @@ func defStaticNS(name string) *vm.Namespace {
 	ns := vm.NewNamespace(name)
 	nsMu.Lock()
 	nsRegistry[name] = ns
+	referNow := staticNSsReferred
+	if !referNow {
+		staticNSs = append(staticNSs, ns)
+	}
 	nsMu.Unlock()
+	if referNow {
+		referCoreAndBaselines(ns)
+	}
 	return ns
+}
+
+// referStaticNamespaces gives every host-class namespace created so far the
+// clojure.core and baseline refers, after the host installers have defined
+// their members. A static namespace created later is referred on creation.
+func referStaticNamespaces() {
+	nsMu.Lock()
+	pending := staticNSs
+	staticNSs = nil
+	staticNSsReferred = true
+	nsMu.Unlock()
+	for _, ns := range pending {
+		referCoreAndBaselines(ns)
+	}
+}
+
+func referCoreAndBaselines(ns *vm.Namespace) {
+	if CoreNS != nil && ns != CoreNS {
+		ns.Refer(CoreNS, "", true)
+	}
+	referBaselines(ns)
 }
 
 // installJVMStatics registers JVM static methods and (instance? Class x) markers
@@ -120,13 +159,28 @@ func installJVMStatics(ns *vm.Namespace) {
 		if !ok {
 			return vm.NIL, fmt.Errorf("parseLong expects a string")
 		}
-		// strconv.Atoi (returns int) + MakeInt matches let-go's own parse-long
-		// and avoids an int64->int conversion (CodeQL "incorrect conversion").
-		n, err := strconv.Atoi(string(s))
+		// ParseInt(..., 64) + MakeInt64 keeps the full 64-bit range on hosts
+		// where Go's int is 32 bits (TinyGo's wasm target). Atoi returns int
+		// and silently lost that range there. There is no narrowing conversion
+		// here, so CodeQL's "incorrect conversion" check stays satisfied.
+		n, err := strconv.ParseInt(string(s), 10, 64)
 		if err != nil {
 			return vm.NIL, err
 		}
-		return vm.MakeInt(n), nil
+		return vm.MakeInt64(n), nil
+	})
+	parseInteger := mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		s, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("parseInt expects a string")
+		}
+		// java.lang.Integer/parseInt always enforces a signed 32-bit range,
+		// even when the host's int can hold a larger value.
+		n, err := strconv.ParseInt(string(s), 10, 32)
+		if err != nil {
+			return vm.NIL, err
+		}
+		return vm.MakeInt64(n), nil
 	})
 	parseFloat := mustWrap(func(vs []vm.Value) (vm.Value, error) {
 		s, ok := vs[0].(vm.String)
@@ -140,9 +194,74 @@ func installJVMStatics(ns *vm.Namespace) {
 		return vm.Float(f), nil
 	})
 	defStaticNS("Long").Def("parseLong", parseLong)
-	defStaticNS("Integer").Def("parseInt", parseLong)
+	defStaticNS("Integer").Def("parseInt", parseInteger)
 	defStaticNS("Float").Def("parseFloat", parseFloat)
 	defStaticNS("Double").Def("parseDouble", parseFloat)
+
+	// --- java.util.Locale constants. Code reaches for these to force
+	// locale-independent casing (honeysql upper-cases SQL keywords with
+	// toUpperCase(Locale/US) to dodge the Turkish-I trap). Go's case mapping
+	// is locale-independent already, so the constants are opaque markers the
+	// string .toUpperCase/.toLowerCase methods accept and ignore.
+	// getDefault/setDefault/forLanguageTag are honest no-ops over the same
+	// markers: a default-locale change genuinely cannot affect let-go's case
+	// mapping, which is what code testing locale independence asserts.
+	localeGetDefault := mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		return vm.Symbol("java.util.Locale/US"), nil
+	})
+	localeSetDefault := mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("Locale/setDefault expects 1 argument")
+		}
+		return vm.NIL, nil
+	})
+	localeForTag := mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("Locale/forLanguageTag expects 1 argument")
+		}
+		s, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("Locale/forLanguageTag expects a string")
+		}
+		return vm.Symbol("java.util.Locale/" + string(s)), nil
+	})
+	for _, nm := range []string{"Locale", "java.util.Locale"} {
+		lns := defStaticNS(nm)
+		for _, c := range []string{"US", "ROOT", "ENGLISH"} {
+			lns.Def(c, vm.Symbol("java.util.Locale/"+c))
+		}
+		lns.Def("getDefault", localeGetDefault)
+		lns.Def("setDefault", localeSetDefault)
+		lns.Def("forLanguageTag", localeForTag)
+	}
+
+	// --- java.net.URLEncoder/encode. Go's url.QueryEscape implements the
+	// same application/x-www-form-urlencoded rules Java does (space -> '+').
+	// The optional second argument is a charset; let-go strings are UTF-8 by
+	// construction, so only UTF-8 is accepted.
+	urlEncode := mustWrap(func(vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 && len(vs) != 2 {
+			return vm.NIL, fmt.Errorf("URLEncoder/encode expects 1 or 2 arguments, got %d", len(vs))
+		}
+		s, ok := vs[0].(vm.String)
+		if !ok {
+			return vm.NIL, fmt.Errorf("URLEncoder/encode expects a string")
+		}
+		if len(vs) == 2 {
+			enc, ok := vs[1].(vm.String)
+			if !ok {
+				return vm.NIL, fmt.Errorf("URLEncoder/encode charset must be a string")
+			}
+			e := strings.ToUpper(string(enc))
+			if e != "UTF-8" && e != "UTF8" {
+				return vm.NIL, fmt.Errorf("URLEncoder/encode: only UTF-8 supported, got %q", string(enc))
+			}
+		}
+		return vm.String(url.QueryEscape(string(s))), nil
+	})
+	for _, nm := range []string{"URLEncoder", "java.net.URLEncoder"} {
+		defStaticNS(nm).Def("encode", urlEncode)
+	}
 
 	// bare UUID/fromString (lang.go registers only the fully-qualified
 	// java.util.UUID namespace).
@@ -157,4 +276,178 @@ func installJVMStatics(ns *vm.Namespace) {
 		}
 		return u, nil
 	}))
+}
+
+// installMathStatics registers java.lang.Math. Go's math package is close but
+// not a drop-in: Math/round returns a long and rounds half toward POSITIVE
+// infinity (JVM: floor(x + 0.5)), where Go's math.Round returns a float64 and
+// rounds half away from zero, so -2.5 differs (-2 on the JVM, -3 in Go).
+// Math/abs preserves long-in/long-out, and Math/getExponent has no Go
+// equivalent at all. Non-finite inputs propagate rather than raising, as on
+// the JVM.
+func installMathStatics() {
+	ns := defStaticNS("Math")
+	for _, nm := range []string{"Math", "java.lang.Math"} {
+		if nm != "Math" {
+			ns = defStaticNS(nm)
+		}
+		mathNS := ns
+
+		unary := func(name string, fn func(float64) float64) {
+			mathNS.Def(name, mustWrap(func(vs []vm.Value) (vm.Value, error) {
+				if len(vs) != 1 {
+					return vm.NIL, fmt.Errorf("%s expects 1 arg", name)
+				}
+				f, ok := vm.ToFloat(vs[0])
+				if !ok {
+					return vm.NIL, fmt.Errorf("%s expected number, got %s", name, vs[0].Type().Name())
+				}
+				return vm.Float(fn(float64(f))), nil
+			}))
+		}
+		unary("floor", math.Floor)
+		unary("ceil", math.Ceil)
+		unary("sqrt", math.Sqrt)
+		unary("log", math.Log)
+		unary("exp", math.Exp)
+
+		// Go's math.Pow follows IEEE 754, which differs from java.lang.Math on
+		// three cases involving a base of magnitude 1: IEEE says pow(1, y) is 1
+		// for every y, while Java returns NaN for a NaN or infinite exponent.
+		mathNS.Def("pow", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+			if len(vs) != 2 {
+				return vm.NIL, fmt.Errorf("pow expects 2 args")
+			}
+			bv, ok1 := vm.ToFloat(vs[0])
+			ev, ok2 := vm.ToFloat(vs[1])
+			if !ok1 || !ok2 {
+				return vm.NIL, fmt.Errorf("pow expected numbers")
+			}
+			b, e := float64(bv), float64(ev)
+			switch {
+			case e == 0:
+				// Java: a zero exponent is 1.0 even for a NaN base.
+				return vm.Float(1), nil
+			case math.IsNaN(e):
+				return vm.Float(math.NaN()), nil
+			case math.Abs(b) == 1 && math.IsInf(e, 0):
+				return vm.Float(math.NaN()), nil
+			}
+			return vm.Float(math.Pow(b, e)), nil
+		}))
+
+		// long in -> long out, double in -> double out, matching the JVM's
+		// overloads. Returning a float for an integer argument would break
+		// integer callers.
+		mathNS.Def("abs", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+			if len(vs) != 1 {
+				return vm.NIL, fmt.Errorf("abs expects 1 arg")
+			}
+			if i, ok := vs[0].(vm.Int); ok {
+				if int64(i) < 0 {
+					return vm.MakeInt64(-int64(i)), nil
+				}
+				return i, nil
+			}
+			f, ok := vm.ToFloat(vs[0])
+			if !ok {
+				return vm.NIL, fmt.Errorf("abs expected number, got %s", vs[0].Type().Name())
+			}
+			return vm.Float(math.Abs(float64(f))), nil
+		}))
+
+		// JVM Math.round: half rounds toward POSITIVE infinity, so -2.5 is -2
+		// (math.Round would give -3). NaN is 0, and out-of-range saturates to
+		// Long.MAX_VALUE / Long.MIN_VALUE rather than wrapping.
+		//
+		// Do NOT implement this as floor(x + 0.5): the addition rounds before
+		// floor runs, so 0.49999999999999994 would give 1 instead of 0 and
+		// 4503599627370497.0 would gain one. Java itself abandoned that formula
+		// for this reason (JDK-6430675). Compare the fraction against 0.5
+		// instead, which never perturbs the input.
+		mathNS.Def("round", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+			if len(vs) != 1 {
+				return vm.NIL, fmt.Errorf("round expects 1 arg")
+			}
+			f, ok := vm.ToFloat(vs[0])
+			if !ok {
+				return vm.NIL, fmt.Errorf("round expected number, got %s", vs[0].Type().Name())
+			}
+			x := float64(f)
+			if math.IsNaN(x) {
+				return vm.MakeInt(0), nil
+			}
+			r := math.Floor(x)
+			if x-r >= 0.5 {
+				r++
+			}
+			// JVM overloads on the argument type: round(float) returns an int
+			// and saturates at Integer.MAX_VALUE, round(double) returns a long.
+			if _, isF32 := vs[0].(vm.Float32); isF32 {
+				if r >= 2147483647.0 {
+					return vm.MakeInt(math.MaxInt32), nil
+				}
+				if r <= -2147483648.0 {
+					return vm.MakeInt(math.MinInt32), nil
+				}
+				return vm.MakeInt(int(r)), nil
+			}
+			// float64(math.MaxInt64) rounds up to 2^63, so compare against that
+			// boundary rather than the constant itself.
+			if r >= 9223372036854775808.0 {
+				return longCompatValue(math.MaxInt64), nil
+			}
+			if r <= -9223372036854775808.0 {
+				return longCompatValue(math.MinInt64), nil
+			}
+			return longCompatValue(int64(r)), nil
+		}))
+
+		mathNS.Def("scalb", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+			if len(vs) != 2 {
+				return vm.NIL, fmt.Errorf("scalb expects 2 args")
+			}
+			f, ok1 := vm.ToFloat(vs[0])
+			e, ok2 := vm.ToInt(vs[1])
+			if !ok1 || !ok2 {
+				return vm.NIL, fmt.Errorf("scalb expected (double, int)")
+			}
+			return vm.Float(math.Ldexp(float64(f), int(e))), nil
+		}))
+
+		// JVM Math.getExponent: unbiased exponent as an int. Zero and
+		// subnormals give MIN_EXPONENT-1 (-1023); NaN and the infinities give
+		// MAX_EXPONENT+1 (1024). Go has no equivalent, so read the biased
+		// exponent bits directly.
+		mathNS.Def("getExponent", mustWrap(func(vs []vm.Value) (vm.Value, error) {
+			if len(vs) != 1 {
+				return vm.NIL, fmt.Errorf("getExponent expects 1 arg")
+			}
+			f, ok := vm.ToFloat(vs[0])
+			if !ok {
+				return vm.NIL, fmt.Errorf("getExponent expected number, got %s", vs[0].Type().Name())
+			}
+			x := float64(f)
+			// JVM overloads here too: the float form uses the single-precision
+			// bias (127), so zero gives -127 and NaN/infinity give 128.
+			if _, isF32 := vs[0].(vm.Float32); isF32 {
+				if math.IsNaN(x) || math.IsInf(x, 0) {
+					return vm.MakeInt(128), nil
+				}
+				biased := int((math.Float32bits(float32(x)) >> 23) & 0xFF)
+				if biased == 0 { // zero or subnormal
+					return vm.MakeInt(-127), nil
+				}
+				return vm.MakeInt(biased - 127), nil
+			}
+			if math.IsNaN(x) || math.IsInf(x, 0) {
+				return vm.MakeInt(1024), nil
+			}
+			biased := int((math.Float64bits(x) >> 52) & 0x7FF)
+			if biased == 0 { // zero or subnormal
+				return vm.MakeInt(-1023), nil
+			}
+			return vm.MakeInt(biased - 1023), nil
+		}))
+	}
 }

@@ -29,6 +29,7 @@ import (
 
 	"github.com/nooga/let-go/pkg/buildmeta"
 	"github.com/nooga/let-go/pkg/bundle"
+	"github.com/nooga/let-go/pkg/bytecode"
 	"github.com/nooga/let-go/pkg/rt"
 	"github.com/nooga/let-go/pkg/vm"
 
@@ -82,8 +83,8 @@ func storageIDDefault(script string) string {
 	return rt.StorageIDFrom("", script, cwd, exe)
 }
 
-func runUnit(data []byte) int {
-	unit, err := rt.DecodeExecUnit(data)
+func runUnit(data []byte, artifactPath string) int {
+	unit, err := rt.DecodeExecUnitWithDebugFile(data, artifactPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -116,7 +117,12 @@ func runBundle(lgbData, resData []byte, bakedStoreID string) int {
 		}
 		rt.SetResourceProvider(rt.NewEmbeddedResourceProvider(files))
 	}
-	return runUnit(lgbData)
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: finding executable: %v\n", err)
+		return 1
+	}
+	return runUnit(lgbData, exe)
 }
 
 func runMain() int {
@@ -142,7 +148,7 @@ func runMain() int {
 
 	flag.Parse()
 	if showVersion {
-		fmt.Printf("lg-runtime %s\n", versionString())
+		fmt.Print(bytecode.FormatVersionReport("lg-runtime", versionString()))
 		return 0
 	}
 	args := flag.Args()
@@ -163,7 +169,7 @@ func runMain() int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	return runUnit(data)
+	return runUnit(data, program)
 }
 
 func main() {

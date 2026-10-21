@@ -15,6 +15,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/signal"
@@ -151,7 +152,7 @@ func deriveGoLoweringOrder() ([]embeddedNamespace, error) {
 // from embedded source on demand. This skip is intentionally scoped to
 // the BUNDLE only — the Go-lowering path (deriveGoLoweringOrder) must
 // still see ir.* so `core_go_lowered/ir/**` is generated for the
-// `-tags gogen_ir` build, so it does NOT consult isIRBundleSkipped.
+// `-tags gogen_ir` build, so it does NOT consult isBundleSkippedTool.
 func discoverEmbeddedNS() ([]embeddedNamespace, error) {
 	names := rt.EmbeddedNSNames()
 	allowed := map[string]string{}
@@ -180,11 +181,27 @@ func discoverEmbeddedNS() ([]embeddedNamespace, error) {
 	return out, nil
 }
 
-// isIRBundleSkipped reports whether namespace n belongs to the ir.* AOT
-// pipeline and should be excluded from the BYTECODE bundle (but not the
-// Go-lowering output). Matches the `ir` root and any `ir.` descendant.
-func isIRBundleSkipped(n string) bool {
-	return n == "ir" || strings.HasPrefix(n, "ir.")
+// isBundleSkippedTool reports whether namespace n is a build-time tool that
+// should be excluded from the BYTECODE bundle (but not from the Go-lowering
+// output). Three families qualify, for one reason: a plain `lg` script never
+// touches them, so decoding them on every process start is pure cost. All
+// load from embedded source on demand instead.
+//
+//   - the ir.* AOT/lowering pipeline, the `ir` root and any `ir.` descendant
+//   - lg.compiler, the AOT compile driver, and any lg.compiler.* descendant.
+//     Match the family, not the exact name: the roadmap moves ir.* under
+//     lg.compiler.ir.*, where an exact-name check would match neither name and
+//     restore the regression silently.
+//   - lg.commands.*, the CLI subcommands (lg.commands.compile). They require
+//     lg.compiler, so bundling one would load the driver from source at boot.
+//
+// lg.compiler is 30 chunks on its own, but its requires drag the whole IR
+// pipeline into the const pool: bundling it cost 308K→1.07M and 4.1ms→23.4ms
+// of boot, past the 8ms budget (measured 2026-09-02).
+func isBundleSkippedTool(n string) bool {
+	return n == "ir" || strings.HasPrefix(n, "ir.") ||
+		n == "lg.compiler" || strings.HasPrefix(n, "lg.compiler.") ||
+		strings.HasPrefix(n, "lg.commands.")
 }
 
 // hasLgbgenSkipDirective reports whether the source begins with a line
@@ -388,6 +405,13 @@ func main() {
 	fs.StringVar(&cpuProfilePath, "cpuprofile", "", "write Go CPU profile for the lgbgen process")
 	fs.StringVar(&memProfilePath, "memprofile", "", "write Go allocation profile (allocs) for the lgbgen process")
 	fs.StringVar(&codeDir, "code-dir", "", "base dir for generated gogen_ir wireup files (default: repo root)")
+	// --compress DEFLATE-compresses the bundle body. Default OFF for the
+	// committed core: it trims the binary but adds work and allocations to every
+	// process start (the core is decoded on every boot), and that tradeoff is a
+	// policy call for the maintainer, not a silent default. Decode inflates it
+	// transparently either way (see the FlagCompressed path in pkg/bytecode).
+	compress := false
+	fs.BoolVar(&compress, "compress", false, "DEFLATE-compress the .lgb bundle body (smaller binary, slower boot)")
 	fs.Parse(os.Args[1:])
 
 	switch target {
@@ -462,11 +486,12 @@ func main() {
 	// rt.init() has already run — native builtins are registered in CoreNS.
 	consts := vm.NewConsts()
 
-	// Phase 0: bootstrap ir.data (same for both modes). ir.data is
-	// marked lgbgen:skip so it doesn't end up in the bundle, but its
-	// consts still need to be interned in the VM so other NSes that
-	// reference IR data can compile.
-	{
+	// Phase 0: bootstrap ir.data. It is marked lgbgen:skip so it has no
+	// namespace chunk in the bundle, but the ir.* namespaces compiled for Go
+	// lowering need its consts interned. It compiles into the shared pool, and
+	// EncodeBundleOrdered emits every const in the pool, so it must run AFTER
+	// writeBundle (like the rest of ir.*) or its chunks leak into the .lgb.
+	bootstrapIRData := func() {
 		src, ok := rt.EmbeddedSource("ir.data")
 		if !ok {
 			fmt.Fprintln(os.Stderr, "ir.data bootstrap: source not found in embed FS")
@@ -501,18 +526,24 @@ func main() {
 	}
 	nsChunks := make(map[string]*vm.CodeChunk)
 	bundleOrder := make([]string, 0, len(embeddedNS)) // non-ir: encoded into the .lgb
+	// nsConstRanges records the pool range each namespace's compilation
+	// appended: the encoder proves from it which namespaces a process can
+	// leave undecoded until required (bytecode.EncodeBundleDeferrable).
+	nsConstRanges := make(map[string]bytecode.ConstRange)
 
 	compileNS := func(ns embeddedNamespace) {
 		coreNS := rt.NS(rt.NameCoreNS)
 		c := compiler.NewCompiler(consts, coreNS)
 		c.SetSource("<embedded:" + ns.name + ">")
 
+		lo := len(consts.Values())
 		chunk, _, err := c.CompileMultiple(strings.NewReader(ns.src))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s compilation failed: %v\n", ns.name, err)
 			os.Exit(1)
 		}
 		nsChunks[ns.name] = chunk
+		nsConstRanges[ns.name] = bytecode.ConstRange{Lo: lo, Hi: len(consts.Values())}
 		// Self-hosting (3b): if a Go-lowered native override is queued for this
 		// namespace (only under -tags gogen_ir), apply it now so the lowering
 		// pipeline runs on the NATIVE passes instead of the bytecode we just
@@ -526,31 +557,34 @@ func main() {
 		}
 	}
 
-	// Phase 1a: compile every NON-ir namespace into the shared const pool, in
-	// dependency order. The ir.* AOT/lowering pipeline is deliberately kept OUT
-	// of the bytecode bundle (it loads from source on demand at runtime — see
-	// isIRBundleSkipped and core.lg's *ir-compile*). It must be excluded HERE,
+	// Phase 1a: compile every non-build-tool namespace into the shared const
+	// pool, in dependency order. The ir.* pipeline and the lg.compiler driver
+	// are deliberately kept OUT of the bytecode bundle (they load from source on
+	// demand at runtime — see isBundleSkippedTool and core.lg's *ir-compile*).
+	// They must be excluded HERE,
 	// before the bundle is encoded, because EncodeBundleOrdered emits every
 	// const in the pool (encoder.go) and each func const drags in its chunk —
 	// so filtering only the ns-order would NOT keep ir bytecode out of the
 	// .lgb; ir must never enter the pool before writeBundle.
-	var irNS []embeddedNamespace
+	var toolNS []embeddedNamespace
 	for _, ns := range embeddedNS {
-		if isIRBundleSkipped(ns.name) {
-			irNS = append(irNS, ns)
+		if isBundleSkippedTool(ns.name) {
+			toolNS = append(toolNS, ns)
 			continue
 		}
 		compileNS(ns)
 		bundleOrder = append(bundleOrder, ns.name)
 	}
 
-	// compileIRForLowering compiles the ir.* namespaces into VM state so the
-	// Go-lowering pass can resolve them. Kept in the order derived above, which
-	// carries the synthetic ir.build-after-passes edge (deriveGoLoweringOrder)
-	// — losing it makes lowering emit untyped arithmetic. Always runs AFTER the
-	// bundle is written so ir consts never reach the .lgb pool.
-	compileIRForLowering := func() {
-		for _, ns := range irNS {
+	// compileToolsForLowering compiles the bundle-skipped namespaces into VM
+	// state so the Go-lowering pass can resolve them. Kept in the order derived
+	// above, which carries the synthetic ir.build-after-passes edge
+	// (deriveGoLoweringOrder) — losing it makes lowering emit untyped
+	// arithmetic. Always runs AFTER the bundle is written so their consts never
+	// reach the .lgb pool.
+	compileToolsForLowering := func() {
+		bootstrapIRData()
+		for _, ns := range toolNS {
 			compileNS(ns)
 		}
 	}
@@ -558,7 +592,7 @@ func main() {
 	// Emit artifacts. `both` writes the (ir-free) bundle first, then compiles
 	// ir and lowers the whole program to Go.
 	if targetGo {
-		compileIRForLowering()
+		compileToolsForLowering()
 		runGoTarget(goOutDir, codeDir)
 		// Skip the manifest refresh when lowering into a throwaway codeDir —
 		// the canonical generated.sums must only move under a real regen.
@@ -568,44 +602,110 @@ func main() {
 		return
 	}
 	if targetBoth {
-		writeBundle(outPath, consts, nsChunks, bundleOrder)
-		compileIRForLowering()
+		writeBundle(outPath, consts, nsChunks, bundleOrder, nsConstRanges, compress)
+		compileToolsForLowering()
 		runGoTarget(goOutDir, codeDir)
 		return
 	}
 
 	// Bytecode mode: write .lgb bundle (ir.* excluded).
-	writeBundle(outPath, consts, nsChunks, bundleOrder)
+	writeBundle(outPath, consts, nsChunks, bundleOrder, nsConstRanges, compress)
 }
 
 // writeBundle encodes the compiled namespace chunks into the .lgb bundle at
-// outPath and closes the file before returning (so callers may proceed to the
-// Go-lowering target against the same in-memory state).
-func writeBundle(outPath string, consts *vm.Consts, nsChunks map[string]*vm.CodeChunk, nsOrder []string) {
-	f, err := os.Create(outPath)
+// outPath atomically before returning (so callers may proceed to the Go-lowering
+// target against the same in-memory state). Encoding happens in a temporary
+// file in the destination directory; the previous bundle remains intact unless
+// encoding, flushing, and closing all succeed.
+func writeBundle(outPath string, consts *vm.Consts, nsChunks map[string]*vm.CodeChunk, nsOrder []string, nsConstRanges map[string]bytecode.ConstRange, compress bool) {
+	// The core bundle is decoded on every process start, so the decode path
+	// inflates it transparently; compressing here trims the embedded bytes from
+	// every binary (see the FlagCompressed decode path in pkg/bytecode).
+	size, err := writeFileAtomically(outPath, func(w io.Writer) error {
+		return bytecode.EncodeBundleDeferrable(w, consts, nsChunks, nsOrder, nsConstRanges, compress)
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "create %s: %v\n", outPath, err)
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", outPath, err)
 		os.Exit(1)
 	}
 
-	if err := bytecode.EncodeBundleOrdered(f, consts, nsChunks, nsOrder); err != nil {
-		f.Close()
-		fmt.Fprintf(os.Stderr, "encode failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Stat is best-effort: success here is just for the byte-count in the
-	// success line. If it fails, we still wrote the bundle, so report what we
-	// know without dereferencing a nil FileInfo.
-	if fi, err := f.Stat(); err == nil {
-		fmt.Printf("wrote %s (%d bytes, %d consts, %d namespaces)\n",
-			outPath, fi.Size(), len(consts.Values()), len(nsChunks))
-	} else {
-		fmt.Printf("wrote %s (%d consts, %d namespaces; stat failed: %v)\n",
-			outPath, len(consts.Values()), len(nsChunks), err)
-	}
-	f.Close()
+	fmt.Printf("wrote %s (%d bytes, %d consts, %d namespaces)\n",
+		outPath, size, len(consts.Values()), len(nsChunks))
 	refreshManifest()
+}
+
+// writeFileAtomically writes path through a same-directory temporary file and
+// replaces path only after the contents are synced and closed successfully.
+// Any failure leaves an existing destination untouched.
+//
+// The directory is synced after the rename as well. Syncing the file persists
+// its contents; it does not persist the directory entry that names it, so a
+// crash between the two can leave the rename lost even though the data
+// survived. That is durability rather than atomicity — the destination is
+// never torn either way — but it is cheap here, and this tool writes the
+// artifact the whole build then trusts.
+func writeFileAtomically(path string, write func(io.Writer) error) (int64, error) {
+	mode := fs.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return 0, fmt.Errorf("stat destination: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return 0, fmt.Errorf("create temporary file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	closeOnError := func(err error) (int64, error) {
+		_ = tmp.Close()
+		return 0, err
+	}
+	if err := write(tmp); err != nil {
+		return closeOnError(fmt.Errorf("encode temporary file: %w", err))
+	}
+	if err := tmp.Sync(); err != nil {
+		return closeOnError(fmt.Errorf("sync temporary file: %w", err))
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return closeOnError(fmt.Errorf("set temporary file mode: %w", err))
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, fmt.Errorf("close temporary file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return 0, fmt.Errorf("replace destination: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return 0, fmt.Errorf("sync destination directory: %w", err)
+	}
+
+	// Report the destination's own size rather than the temporary file's. The
+	// bytes are the same; reading it off the file the caller is told about is
+	// what makes the number checkable.
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, fmt.Errorf("stat destination: %w", err)
+	}
+	return info.Size(), nil
+}
+
+// syncDir flushes a directory entry to disk. lgbgen is a bootstrap-tagged
+// build tool that runs on developer machines and Linux CI, so the POSIX
+// behaviour is the only one in play.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // refreshManifest records the content digest of all .lg + lgbgen sources
@@ -804,16 +904,21 @@ func runGoTarget(outDir, codeDir string) {
 	// every caller (make generate, make lowered, make check-generated) gets
 	// the same crash-safety.
 	realOutDir := outDir
-	outDir = realOutDir + ".stage"
-	if err := os.RemoveAll(outDir); err != nil {
-		fmt.Fprintf(os.Stderr, "clear staging dir %s: %v\n", outDir, err)
+	// Stage into an OS tempdir OUT OF THE MODULE TREE, then copy into the real
+	// dir on success (installGeneratedTree). Out-of-tree so a hard-killed run
+	// (SIGKILL bypasses the `defer os.RemoveAll` below) can never leave a
+	// half-written staging dir inside the module that a later `go test`/`go
+	// build ./...` then fails to compile (`undefined: builtins.*`, because the
+	// staged tree references natives from a different generation). Copy — not
+	// rename — because the tempdir may be on a different filesystem than the
+	// repo; the sentinel written last still makes a torn copy detectable.
+	stageDir, err := os.MkdirTemp("", "lgbgen-lowered-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create staging tempdir: %v\n", err)
 		os.Exit(1)
 	}
+	outDir = stageDir
 	defer os.RemoveAll(outDir)
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "create staging dir %s: %v\n", outDir, err)
-		os.Exit(1)
-	}
 
 	embeddedNS, err := discoverEmbeddedNS()
 	if err != nil {
@@ -871,7 +976,7 @@ func runGoTarget(outDir, codeDir string) {
 				fmt.Fprintf(os.Stderr, "%s: read error: %v\n", ns.name, err)
 				os.Exit(1)
 			}
-			if isDefnOnly(form) || isMultimethodForm(form) {
+			if isDefnOnly(form) || isMultimethodForm(form) || isTypeDeclForm(form) {
 				defnForms = append(defnForms, form)
 			}
 		}
@@ -938,6 +1043,7 @@ func runGoTarget(outDir, codeDir string) {
 		goSrc, ok := goSrcVal.(vm.String)
 		if !ok {
 			fmt.Fprintf(os.Stderr, "%s: Go lowering failed (no source)\n", spec.nsName)
+			fmt.Fprintf(os.Stderr, "  actual value: %#v (type %T)\n", goSrcVal, goSrcVal)
 			failed = append(failed, spec.nsName)
 			continue
 		}
@@ -961,7 +1067,7 @@ func runGoTarget(outDir, codeDir string) {
 		fmt.Fprintf(os.Stderr, "lgbgen: %d namespace(s) failed: %v\n", len(failed), failed)
 		os.Exit(1)
 	}
-	// Success: install the staged tree (fast per-file renames — the exposed
+	// Success: install the staged tree (fast per-file copies — the exposed
 	// window shrinks from the whole lowering to milliseconds), then emit the
 	// //go:build gogen_ir blank-import wireup files from exactly the set we
 	// just installed — so namespaces that were skipped are never imported
@@ -976,10 +1082,11 @@ func runGoTarget(outDir, codeDir string) {
 // installGeneratedTree moves the staged generation into the real output dir:
 // the completeness sentinel is invalidated first, previously-generated
 // (bannered) files in realDir are removed — same orphan-cleanup contract as
-// before staging existed — then every staged file is renamed into place and
-// the sentinel is installed last. Rename is cheap and same-filesystem
-// (sibling dirs), so the tree is only ever inconsistent for the duration of
-// this loop — and that window is positively detectable via the sentinel
+// before staging existed — then every staged file is COPIED into place and
+// the sentinel is installed last. The staging tempdir may be on a different
+// filesystem than the module tree, so copy (not rename) is used to avoid EXDEV;
+// copies are still fast, so the tree is only ever inconsistent for the duration
+// of this loop — and that window is positively detectable via the sentinel
 // (genmanifest.CheckTreeManifest).
 //
 // The manifest is computed from the STAGE dir, not the real dir: it must list
@@ -1014,13 +1121,30 @@ func installGeneratedTree(stageDir, realDir string) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 			return err
 		}
-		return os.Rename(path, dst)
+		return copyFile(path, dst)
 	}); err != nil {
 		return err
 	}
-	return os.Rename(
+	// Sentinel copied LAST, so a torn copy (crash mid-loop) leaves the tree
+	// without a valid manifest and CheckTreeManifest reports it.
+	return copyFile(
 		filepath.Join(stageDir, genmanifest.TreeManifestName),
 		filepath.Join(realDir, genmanifest.TreeManifestName))
+}
+
+// copyFile copies src to dst, preserving the source's permission bits. Used
+// by installGeneratedTree because the staging tempdir may sit on a different
+// filesystem than the repo, where os.Rename would fail with EXDEV.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode().Perm())
 }
 
 // writeGogenWireup emits the //go:build gogen_ir blank-import files that
@@ -1097,31 +1221,10 @@ func writeGogenWireup(pkgNames []string, codeDir string) {
 // silently drop their native lowering and fall back to bytecode. Callers
 // must additionally gate on isSingleArityDefn — see its note on why
 // multi-arity forms cannot lower to a single Go function.
-func isDefnOnly(form vm.Value) bool {
-	list, ok := form.(vm.Sequable)
-	if !ok {
-		return false
-	}
-	seq := list.Seq()
-	if seq == nil {
-		return false
-	}
-	head := seq.First()
-	sym, ok := head.(vm.Symbol)
-	if !ok {
-		return false
-	}
-	return string(sym) == "defn" || string(sym) == "defn-"
-}
-
-// isMultimethodForm returns true for (defmulti ...) / (defmethod ...) forms.
-// They are forwarded to the Go-lowering pipeline (alongside defn forms) so
-// lower-ns-to-go can capture the dispatcher, lower type-dispatched methods to
-// native Go funcs, and devirtualize matching call sites to a `switch v.(type)`
-// (with a runtime-vm.MultiFn default arm). The pipeline filters them by
-// decl-kind; non-type-dispatched multimethods conservatively stay on the
-// runtime path.
-func isMultimethodForm(form vm.Value) bool {
+// formHeadIs reports whether form is a list whose head symbol equals any of
+// the given names. It is the shared shape behind the isDefnOnly /
+// isMultimethodForm / isTypeDeclForm form-triage predicates.
+func formHeadIs(form vm.Value, names ...string) bool {
 	list, ok := form.(vm.Sequable)
 	if !ok {
 		return false
@@ -1134,7 +1237,41 @@ func isMultimethodForm(form vm.Value) bool {
 	if !ok {
 		return false
 	}
-	return string(sym) == "defmulti" || string(sym) == "defmethod"
+	for _, n := range names {
+		if string(sym) == n {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefnOnly(form vm.Value) bool {
+	return formHeadIs(form, "defn", "defn-")
+}
+
+// isMultimethodForm returns true for (defmulti ...) / (defmethod ...) forms.
+// They are forwarded to the Go-lowering pipeline (alongside defn forms) so
+// lower-ns-to-go can capture the dispatcher, lower type-dispatched methods to
+// native Go funcs, and devirtualize matching call sites to a `switch v.(type)`
+// (with a runtime-vm.MultiFn default arm). The pipeline filters them by
+// decl-kind; non-type-dispatched multimethods conservatively stay on the
+// runtime path.
+func isMultimethodForm(form vm.Value) bool {
+	return formHeadIs(form, "defmulti", "defmethod")
+}
+
+// isTypeDeclForm returns true for (defprotocol ...) / (deftype ...) forms.
+// They are forwarded to the Go-lowering pipeline so lower-ns-to-go can
+// capture them, emit native decls (interface / struct + constructor +
+// receiver methods), and bind the deftype-ctor + protocol-method registries
+// that let the namespace's own defns type (->T ...) as [:dtype T], lower the
+// constructor to a native call, and devirtualize protocol-method calls on a
+// known-concrete receiver to a direct recv.Method(ec, ...) call. Without
+// this forwarding the registries bind to nil and every such call silently
+// takes the boxed rt.CachedVarFn trampoline (the T9 gap: the .lg capture
+// machinery existed but the driver starved it of the decl forms).
+func isTypeDeclForm(form vm.Value) bool {
+	return formHeadIs(form, "defprotocol", "deftype")
 }
 
 // isSingleArityDefn reports whether a defn/defn- form has exactly one arity.

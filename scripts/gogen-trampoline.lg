@@ -21,7 +21,7 @@
 ;; Usage:
 ;;   ./lg scripts/gogen-trampoline.lg                 # all of test/gogen/*.lg
 ;;   ./lg scripts/gogen-trampoline.lg FILE.lg [...]   # specific fixtures
-;;   flags: --go <path> (default "go")  --lg <path> (default "./lg")
+;;   flags: --go <path> (default "go")  --lg <path> (default "build/lg")
 
 (require 'ir.passes.pipeline)
 (require 'string)
@@ -36,7 +36,7 @@
 
 (def argv     *command-line-args*)
 (def go-bin   (flag argv "--go" "go"))
-(def lg-bin   (flag argv "--lg" "./lg"))
+(def lg-bin   (flag argv "--lg" "build/lg"))
 (def fixtures
   (let [given (filter (fn [a] (re-find #"\.lg$" (str a))) argv)]
     (if (seq given)
@@ -79,7 +79,7 @@
 ;; The lowered Go package's relative dir for a fixture, read independently of
 ;; lowering so cleanup can remove the tree even when lowering/building threw.
 (defn fixture-reldir [fixture]
-  (let [forms (read-string (str "[" (slurp fixture) "]"))
+  (let [forms (read-code-string (str "[" (slurp fixture) "]"))
         nsd   (first (filter ns-form? forms))]
     (when nsd (nsname->reldir (second nsd)))))
 
@@ -88,7 +88,7 @@
 ;; first (so build-fn can resolve the fixture's own ->T / protocol / sibling
 ;; names) — the native Go is emitted separately from the captured forms.
 (defn lower-fixture! [fixture out-dir]
-  (let [forms   (read-string (str "[" (slurp fixture) "]"))
+  (let [forms   (read-code-string (str "[" (slurp fixture) "]"))
         ns-decl (first (filter ns-form? forms))
         ns-name (when ns-decl (second ns-decl))]
     (when (nil? ns-name) (die (str "no (ns ...) form in " fixture)))

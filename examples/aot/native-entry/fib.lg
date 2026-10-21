@@ -1,0 +1,16 @@
+(ns fib)
+
+;; Minimal #425 native-entry demo: typed fib + variadic -main.
+;;
+;;   ./examples/aot/native-entry/build.sh
+;;   ./examples/aot/native-entry/out/fib.native           ; => 55 (fib 10)
+;;   ./examples/aot/native-entry/out/fib.native x         ; => 5702887 (fib 34)
+;;
+;; Any CLI arg forces n=34 (the spike input).
+
+(defn fib [n]
+  (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(defn -main [& args]
+  (let [n (if (seq args) 34 10)]
+    (println (fib n))))

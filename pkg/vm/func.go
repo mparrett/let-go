@@ -8,6 +8,7 @@ package vm
 import (
 	"fmt"
 	"reflect"
+	"unsafe"
 )
 
 type theFuncType struct{}
@@ -29,6 +30,10 @@ type Func struct {
 	isVariadric bool
 	chunk       *CodeChunk
 	meta        Value // IMeta support; nil until (with-meta fn m) copies one in
+	// multi is the *MultiArityFn a capture-free multi-arity literal built
+	// with this Func as its first arm (see CodeChunk.multiArityAt); accessed
+	// atomically.
+	multi unsafe.Pointer
 }
 
 func MakeFunc(arity int, variadric bool, c *CodeChunk) *Func {
@@ -58,9 +63,9 @@ func (l *Func) Meta() Value {
 // than mutate — otherwise every evaluation of the fn literal would observe the
 // metadata. The chunk is immutable, so sharing it across the copy is safe.
 func (l *Func) WithMeta(m Value) Value {
-	cp := *l
-	cp.meta = m
-	return &cp
+	// Field by field: the copy is not a literal's arm, so it carries no
+	// multi-arity cache.
+	return &Func{name: l.name, arity: l.arity, isVariadric: l.isVariadric, chunk: l.chunk, meta: m}
 }
 
 type FuncInterface func(any)
@@ -97,6 +102,89 @@ func boxRest(rest []Value) (Value, error) {
 	return ListType.Box(rest)
 }
 
+// bytecodeCallTarget is the resolved, frame-independent description of a
+// directly executable bytecode call. Frame allocation and same-frame tail
+// replacement are deliberately separate transitions so this resolver can be
+// shared with the constant-space tail-call work in #620.
+type bytecodeCallTarget struct {
+	fn          *Func
+	args        []Value
+	closedOvers []Value
+}
+
+// resolveBytecodeCall unwraps metadata, selects multi-arity variants,
+// preserves closure captures, validates arity, and packs variadic arguments.
+// It returns false for callables that must continue through ExecContext.Invoke.
+//
+// Fixed-arity args may still borrow the caller's operand stack. A transition
+// that reuses that same frame must copy them into frame-owned storage before
+// resetting the operand stack. Variadic packing always returns a fresh slice.
+func resolveBytecodeCall(fn Fn, args []Value) (bytecodeCallTarget, bool, error) {
+	t, closedOvers, display, ok, err := unwrapBytecodeFn(fn, len(args))
+	if err != nil || !ok {
+		return bytecodeCallTarget{}, false, err
+	}
+	prepared := args
+	if t.isVariadric {
+		if len(prepared) < t.arity-1 {
+			return bytecodeCallTarget{}, false, NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got %d", display, t.arity-1, len(prepared)))
+		}
+		restlist, boxErr := boxRest(prepared[t.arity-1:])
+		if boxErr != nil {
+			return bytecodeCallTarget{}, false, boxErr
+		}
+		// Never append into prepared: it may be a window into the
+		// caller's operand stack or a host-owned argument slice.
+		packed := make([]Value, t.arity)
+		copy(packed, prepared[:t.arity-1])
+		packed[t.arity-1] = restlist
+		prepared = packed
+	} else if len(prepared) != t.arity {
+		return bytecodeCallTarget{}, false, NewExecutionError(fmt.Sprintf("function %s expected %d args, got %d", display, t.arity, len(prepared)))
+	}
+	return bytecodeCallTarget{
+		fn:          t,
+		args:        prepared,
+		closedOvers: closedOvers,
+	}, true, nil
+}
+
+// unwrapBytecodeFn walks the MetaFn / MultiArityFn / Closure wrappers around
+// fn to the *Func that an argc-argument call would run, carrying the closure
+// captures along. ok is false for callables that are not bytecode (native,
+// protocol, ...). It allocates nothing, so callers that only need to inspect
+// the target — PrepareCallInto rejecting variadic or wrong-arity fns — can
+// decide before any argument packing happens.
+func unwrapBytecodeFn(fn Fn, argc int) (target *Func, closedOvers []Value, display Fn, ok bool, err error) {
+	display = fn
+	for {
+		switch t := fn.(type) {
+		case *MetaFn:
+			fn = t.Wrapped()
+		case *MultiArityFn:
+			variant, verr := t.variantFor(display, argc)
+			if verr != nil {
+				return nil, nil, display, false, verr
+			}
+			fn = variant
+		case *Closure:
+			closedOvers = t.closedOvers
+			fn = t.fn
+		case *Func:
+			return t, closedOvers, display, true, nil
+		default:
+			return nil, nil, display, false, nil
+		}
+	}
+}
+
+func runBytecodeCallTarget(ec *ExecContext, target bytecodeCallTarget) (Value, error) {
+	f := newFrameForBytecodeCall(target, ec)
+	result, err := f.Run()
+	ReleaseFrame(f)
+	return result, err
+}
+
 func (l *Func) Invoke(pargs []Value) (result Value, err error) {
 	return l.invokeIn(RootExecContext, pargs)
 }
@@ -105,26 +193,14 @@ func (l *Func) Invoke(pargs []Value) (result Value, err error) {
 // so dynamic bindings propagate into the call. Invoke is invokeIn against the
 // root context.
 func (l *Func) invokeIn(ec *ExecContext, pargs []Value) (result Value, err error) {
-	args := pargs
-	if l.isVariadric {
-		if len(args) < l.arity-1 {
-			return NIL, NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got %d", l, l.arity-1, len(args)))
-		}
-		sargs := args[0 : l.arity-1]
-		rest := args[l.arity-1:]
-		restlist, boxErr := boxRest(rest)
-		if boxErr != nil {
-			return NIL, boxErr
-		}
-		args = append(sargs, restlist)
-	} else if len(args) != l.arity {
-		return NIL, NewExecutionError(fmt.Sprintf("function %s expected %d args, got %d", l, l.arity, len(args)))
+	target, ok, err := resolveBytecodeCall(l, pargs)
+	if err != nil {
+		return NIL, err
 	}
-	f := NewFrame(l.chunk, args)
-	f.ec = ec
-	result, err = f.Run()
-	ReleaseFrame(f)
-	return result, err
+	if !ok {
+		return NIL, NewExecutionError("unsupported function type")
+	}
+	return runBytecodeCallTarget(ec, target)
 }
 
 func (l *Func) String() string {
@@ -206,47 +282,18 @@ func (l *Closure) Invoke(pargs []Value) (result Value, err error) {
 // so dynamic bindings propagate into the call. Invoke delegates to invokeIn
 // against the root context.
 func (l *Closure) invokeIn(ec *ExecContext, pargs []Value) (result Value, err error) {
-	if f, ok := l.fn.(*Func); ok {
-		args := pargs
-		if f.isVariadric {
-			if len(args) < f.arity-1 {
-				return NIL, NewExecutionError(fmt.Sprintf("function %s expected at least %d args, got %d", l, f.arity-1, len(args)))
-			}
-			sargs := args[0 : f.arity-1]
-			rest := args[f.arity-1:]
-			restlist, boxErr := boxRest(rest)
-			if boxErr != nil {
-				return NIL, boxErr
-			}
-			args = append(sargs, restlist)
-		} else if len(args) != f.arity {
-			return NIL, NewExecutionError(fmt.Sprintf("function %s expected %d args, got %d", l, f.arity, len(args)))
-		}
-		frame := NewFrame(f.chunk, args)
-		frame.closedOvers = l.closedOvers
-		frame.ec = ec
-		result, err = frame.Run()
-		ReleaseFrame(frame)
-		return result, err
+	target, ok, err := resolveBytecodeCall(l, pargs)
+	if err != nil {
+		return NIL, err
+	}
+	if ok {
+		return runBytecodeCallTarget(ec, target)
 	}
 
 	if mfn, ok := l.fn.(*MultiArityFn); ok {
-		le := len(pargs)
-		var variant Fn
-		if f, ok := mfn.fns[le]; ok {
-			variant = f
-		} else if mfn.rest != nil && le >= mfn.rest.Arity() {
-			variant = mfn.rest
-		} else {
-			return NIL, NewExecutionError(fmt.Sprintf("function %s doesn't have a %d-arity variant", l, le))
-		}
-
-		if f, ok := variant.(*Func); ok {
-			subClosure := &Closure{
-				closedOvers: l.closedOvers,
-				fn:          f,
-			}
-			return subClosure.invokeIn(ec, pargs)
+		variant, variantErr := mfn.variantFor(l, len(pargs))
+		if variantErr != nil {
+			return NIL, variantErr
 		}
 		return ec.Invoke(variant, pargs)
 	}
@@ -310,18 +357,42 @@ func (l *MultiArityFn) Invoke(pargs []Value) (Value, error) {
 	return l.invokeIn(RootExecContext, pargs)
 }
 
+func (l *MultiArityFn) variantFor(display Fn, arity int) (Fn, error) {
+	if f, ok := l.fns[arity]; ok {
+		return f, nil
+	}
+	if l.rest != nil && arity >= restMinArgs(l.rest) {
+		return l.rest, nil
+	}
+	return nil, NewExecutionError(fmt.Sprintf("function %s doesn't have a %d-arity variant", display, arity))
+}
+
+// restMinArgs is the minimum call width the variadic rest arm accepts. A
+// variadic *Func's arity counts its rest SLOT — ([a b & c]) has arity 3 with
+// two fixed args — so exactly-min is arity-1, matching resolveBytecodeCall's
+// `len < arity-1` check. A NativeFn rest arm (NewArityNativeFn) declares its
+// variadic minimum directly, so its Arity() already IS the floor (and
+// NewCtxNativeFn's -1 sentinel accepts any width).
+func restMinArgs(rest Fn) int {
+	f := rest
+	if c, ok := f.(*Closure); ok {
+		f = c.fn
+	}
+	if ff, ok := f.(*Func); ok {
+		return ff.arity - 1
+	}
+	return f.Arity()
+}
+
 // invokeIn runs the multi-arity function with the given ExecContext active,
 // so dynamic bindings propagate into the selected variant's call. Invoke delegates
 // to invokeIn against the root context.
 func (l *MultiArityFn) invokeIn(ec *ExecContext, pargs []Value) (Value, error) {
-	le := len(pargs)
-	if f, ok := l.fns[le]; ok {
-		return ec.Invoke(f, pargs)
+	variant, err := l.variantFor(l, len(pargs))
+	if err != nil {
+		return NIL, err
 	}
-	if l.rest != nil && le >= l.rest.Arity() {
-		return ec.Invoke(l.rest, pargs)
-	}
-	return NIL, NewExecutionError(fmt.Sprintf("function %s doesn't have a %d-arity variant", l, le))
+	return ec.Invoke(variant, pargs)
 }
 
 func (l *MultiArityFn) String() string {
@@ -348,6 +419,12 @@ func MakeMultiArity(fns []Value) (*MultiArityFn, error) {
 			ma.arity = a
 		}
 		if rest, ok := f.(*Func); ok && rest.isVariadric {
+			ma.rest = rest
+		} else if rest, ok := f.(*NativeFn); ok && rest.isVariadric {
+			// A wrapped callable declaring a variadic tail (ir.direct's
+			// invokers via NewArityNativeFn). Without this arm it would be
+			// filed as a FIXED arity in ma.fns, so (f a b c) past the
+			// declared minimum would find no match instead of the rest-arm.
 			ma.rest = rest
 		} else if rest, ok := f.(*Closure); ok {
 			if ff, ok := rest.fn.(*Func); ok && ff.isVariadric {

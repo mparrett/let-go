@@ -1,6 +1,6 @@
 ---
 status: active
-last-verified: 2026-06-30
+last-verified: 2026-10-03
 authoritative-for:
   - benchmark-ratchet
 human-verified:
@@ -44,10 +44,10 @@ capture-then-aggregate-then-(compare|write|print).
 | `docs/perf/baseline.json` | The current committed baseline. |
 | `docs/perf/historical/*.json` | Frozen historical snapshots (e.g. `v1.8.0.json`). Captured against the same anchor so any current run can `-baseline docs/perf/historical/v1.8.0.json check` and see "how much have we drifted since release N." |
 | `docs/perf/timeline/*.json` | Append-only full perf snapshots captured on pushes to `main`. These drive trend charts and record actual runs over time. |
-| `docs/perf/index.html` | Static "Are we fast yet?" page generated from the committed baseline, historical snapshots, and timeline snapshots. |
+| `docs/perf/index.html` | Static "Are we fast yet?" page, generated on demand by `make perf-page` from the committed baseline and historical snapshots. Gitignored: the deployed page is built fresh by `pages.yml`, which also pulls timeline snapshots from the `perf-data` branch. |
 | `cmd/perf-page/main.go` | Static page generator. It renders HTML only; it never runs benchmarks. |
 | `docs/perf/.runs/*.jsonl` | Raw capture output. Gitignored; recreated on each run. |
-| `.github/workflows/perf-timeline.yml` | Main-only CI job that records timeline snapshots and commits the regenerated static page. |
+| `.github/workflows/perf-timeline.yml` | Main-only CI job that records timeline snapshots and pushes them to the `perf-data` branch. It does not touch the static page. |
 | `Makefile` targets | `bench-ratchet`, `bench-ratchet-update`, `bench-ratchet-show`, `perf-snapshot`, `perf-page`. |
 
 ## Scope
@@ -60,17 +60,18 @@ Full profile (`-full`): the broad timeline/deep-dive profile. It runs
 the full `pkg/vm` benchmark fleet under `-tags gogen_ir`, plus the
 suite and IR compile benchmark under both bytecode and `gogen_ir`.
 
+The six b.N=1 `BenchmarkClojureTestSuite*` variants remain observational:
+they run and appear in reports, but `update`, forced rebaseline, and
+`seed-baseline` filter them from the active ratchet because repeated samples
+mutate shared runtime state and are too noisy for a blocking timing bar.
+
 > **Reading the `gogen_ir` / `aot_native` numbers.** These exercise the
 > natively-lowered IR passes (the dispatch is guarded by
-> `TestIRBenchDispatchesNativeUnderTag`), but the lowered Go currently
-> *boxes* most cross-namespace and `clojure.core` calls — runtime
-> `LookupVar`/`Deref` + a fresh `[]vm.Value` arg slice per call — rather
-> than emitting direct calls. So the `gogen_ir` variant can allocate
-> **more** than `bytecode` (e.g. IRCompile ~1.7×) and is only marginally
-> faster. Treat these as "native dispatch works, codegen not yet
-> optimized" — not "native is fast." Direct-call lowering (cross-ns +
-> IFn-typed + `clojure.core`) is the lever that would push them below the
-> bytecode line.
+> `TestIRBenchDispatchesNativeUnderTag`). The lowered Go reaches a
+> cross-namespace or `clojure.core` callee through a cached var
+> (`rt.CachedVarFnEC`) and passes one to four arguments as parameters, so a
+> call builds no argument slice. A call of five or more arguments still
+> builds one, and is the remaining per-call allocation in lowered calls.
 
 Deliberately out of scope: `pkg/compiler` (compile time — measured by
 parity scripts) and `pkg/bytecode` (decode time — measured at `make
@@ -79,6 +80,82 @@ doesn't trip a runtime gate AND each in-scope bench gets more of the
 sample budget.
 
 Override via `-packages "github.com/nooga/let-go/pkg/X github.com/.../Y"`.
+
+### When the pre-push gate runs
+
+The ratchet is a blocking `pre-push` hook, but it does not run on every push.
+It runs when the pushed range can change what it measures:
+
+- any file the toolchain says is **compiled into or embedded by** a package in
+  the benchmark binaries — the IR and the VM **and everything they transitively
+  depend on**;
+- `pkg/rt/generated.sums` and `pkg/rt/generated.manifest`, which belong to no
+  package but whose change means the generated artifacts were rebuilt;
+- `go.mod`, `go.sum`, `mise.toml`, which change generated code beneath every
+  package (a Go version bump can move allocation counts by itself);
+- `test/compat/` and the `test/clojure-test-suite` submodule, which
+  `BenchmarkClojureTestSuite` reads from disk at run time: its namespace loader
+  is rooted there and it compiles `test/compat/clojure/core-test/portability.lg`
+  directly. A submodule bump appears as the bare gitlink path, so that spelling
+  is matched as well as the directory prefix;
+- a **deleted** file anywhere beneath a directory that still holds measured
+  files. The closure is computed from the tree after the push, so a removed
+  benchmark or embedded asset is never in it; treating deletions under the
+  closure as affected over-approximates rather than miss one.
+
+The closure is **computed**, not approximated by a path list: `cmd/ratchet-scope`
+expands the benchmarked packages with `go list -deps -test` under each build-tag
+configuration the ratchet captures, and reads each package's real file list —
+`GoFiles`, `EmbedFiles`, the test variants, and `IgnoredGoFiles` for files a
+build constraint excludes here but includes elsewhere.
+
+Matching on the file list rather than the directory tree cuts both ways, and
+both matter:
+
+- `pkg/rt` **embeds** every `core/**/*.lg` file and `core_compiled.lgb`, so
+  those are in scope automatically. They are deliberately *not* in the trigger
+  list — a hand-kept copy of what is embedded is the copy that goes stale.
+- `test/*.lg` sits in the `test` package's directory but is part of no build,
+  and `BenchmarkClojureTestSuite` reads only the vendored corpus and
+  `test/compat/`. Tree matching made every contributor
+  touching a `.lg` test pay a full benchmark run for a file that cannot affect
+  a benchmark.
+
+So `pkg/rt/lang.go` requires a run though it is not a benchmark root, while
+`docs/`, `cmd/bench-ratchet`, the baseline file and `scripts/` do not.
+
+This preserves the original reason the hook ran unconditionally — a Go runtime
+change or a regenerated bundle can regress the numbers with no benchmark file
+in the diff — while removing its worst consequence: because the gate compares
+against a committed bar, a bar that has gone stale used to fail **every** push
+from that machine regardless of content, so unrelated work could only proceed
+by first rebaselining. See #912 and #913 for the instance that prompted this.
+
+The range is the pushed tip (`PRE_COMMIT_TO_REF` under prek, else the
+checkout) against its fork point with upstream main, because the bar describes
+main. The decision reads the checked-out tree — `go list` for the closure, the
+filesystem for deletions — so it is only made when that tree **is** the pushed
+tip. Pushing a different ref, or pushing with uncommitted changes, runs the
+ratchet.
+
+It fails toward running. An undeterminable range, a pushed tip that is not the
+checkout, an empty change set, a build failure, or an unrecognised decision all
+run the ratchet: a false run costs one benchmark, a false skip defeats the gate.
+
+To check what a change set would do, without pushing:
+
+```bash
+jj diff --summary --from 'fork_point(@ | main@upstream)' --to @ \
+  | go run ./cmd/ratchet-scope -v -summary
+```
+
+`--summary` rather than `--name-only`: a rename prints as one new path under
+`--name-only`, so moving a measured file out of the closure would read as an
+unrelated addition. `-summary` reports both sides, and the old side reaches
+the deletion rule.
+
+Note that the `ir-stress-gate` hook still runs unconditionally; scoping it the
+same way is a separate change.
 
 ## Build tags
 
@@ -99,9 +176,31 @@ One-shot (Makefile):
 make bench-ratchet           # check current vs baseline (CI mode)
 make bench-ratchet-update    # overwrite baseline with current numbers
 make bench-ratchet-show      # capture & print, write nothing
-make perf-page               # refresh docs/perf/index.html from committed JSON
+make perf-page               # render docs/perf/index.html locally from committed JSON
 make perf-snapshot           # full capture into docs/perf/timeline/<ts>-<sha>.json
 ```
+
+Every *Make target* above that runs `bench-ratchet` prefixes the command with
+`$BENCH_WRAP`. Where `caffeinate` exists (macOS) it defaults to `caffeinate -is`,
+so the machine cannot idle-sleep mid-capture and move the anchor. Set it from the
+environment to substitute another wrapper, or empty to run bare:
+
+```sh
+BENCH_WRAP= make bench-ratchet
+BENCH_WRAP="systemd-inhibit --what=idle:sleep" make bench-ratchet
+BENCH_WRAP="taskset -c 0-7" make bench-ratchet
+```
+
+`systemd-inhibit` is the Linux counterpart to `caffeinate`, and deliberately not
+the default there: CI runners and headless servers do not idle-sleep, so it would
+be a no-op, and taking an inhibitor lock goes through polkit, which can prompt or
+be refused over SSH or in a container. A default that can break `make
+bench-ratchet` is worse than no default. `taskset` addresses a different source of
+drift — scheduler migration rather than sleep — and composes the same way.
+
+**The wrapper reaches Make targets only.** The two-phase `go run ./cmd/bench-ratchet`
+invocations below and `scripts/recapture-release-baseline.sh` build and run the tool
+directly, so they are unwrapped; prefix them by hand on a machine that might sleep.
 
 Explicit two-phase (useful when you want progress visibility, or are
 capturing on one machine and aggregating on another):
@@ -124,6 +223,78 @@ go run ./cmd/bench-ratchet -count 3 -benchtime 2s update     # rigorous
 go run ./cmd/bench-ratchet -baseline docs/perf/historical/v1.8.0.json check
                                                              # vs v1.8.0
 ```
+
+### Seeding from CI
+
+The active baseline is seeded from CI timeline snapshots via the `seed-baseline`
+command. It reduces a WINDOW of recent snapshots per machine key — not the
+newest one — and merges the result with any existing local M3 profile:
+
+```sh
+# Fetch the perf-data branch containing timeline snapshots
+git fetch origin perf-data
+
+# Seed the baseline from amd64 profiles (preserving local M3)
+bench-ratchet -perf-data-dir <perf-data-root>/timeline \
+  -baseline docs/perf/baseline.json \
+  seed-baseline
+```
+
+The command:
+- Scans the timeline directory for snapshot files named `TIMESTAMP-SHORTSHA-MACHINE.json`, reporting any name it cannot parse
+- Filters to one architecture (`-seed-arch`, default amd64 per #651), on the file's CONTENT as well as its name
+- Groups every profile it reads by the machine key derived from the file's CONTENT, reporting a filename that names a different machine than it carries
+- Takes the newest `-seed-window` snapshots (default 5) per machine key
+- Skips a machine key with fewer than `-seed-min-window` snapshots (default 3): a tier that has only just started reporting has no window to disagree with, so it stays ungated until the runs accrue
+- Rejects a snapshot whose `ratio_to_anchor` values sit more than `-seed-coherence-tolerance` (default 5%) off the rest of its window
+- Medians each benchmark across the survivors **in ratio space**, deriving `ns_per_op` back from the window's anchor
+- Skips a benchmark present in fewer than half the surviving snapshots, rather than seeding it from one observation
+- Reports `b.N` movement across the window and any exclusion-list entry that matched nothing
+- Preserves any existing arm64/Apple M3 profile for local developer gating
+- Excludes the six BenchmarkClojureTestSuite* variants (too noisy to ratchet, per #651)
+
+`captured_at_sha` names the newest *surviving* snapshot in the window, which is
+the identity of the profile rather than the sole source of its numbers. The seed
+log prints the window size and how many snapshots contributed. Every seeded
+entry is stamped with that same identity, as its `best_since_sha` /
+`best_since_at` and as its `allocs_since_*` / `bytes_since_*` stamps:
+a deterministic floor with no commit attached is one the
+[deterministic gate](#the-deterministic-gate-allocsop-bytesop) cannot place in
+time, and a tier that later stops reporting would leave an unattributable row
+behind.
+
+Future work (#597, separate) will backfill per-tier v1.8.0 release-reference
+snapshots.
+
+### Why a window, and why not gate on the anchor
+
+**One snapshot is one CI run, and one CI run is one sample.** Seeded from the
+newest snapshot versus a median of five, on the same corpus (2026-08-05): 22.6%
+of the 758 (tier, benchmark) floors differ by more than the 5% regression
+budget, and 11.3% by more than 10%. Part of that is real code movement across
+the window and part is sampling — but either way, seeding from one snapshot sets
+a fifth of the gate's thresholds from a single observation of it.
+
+**The reduction happens in ratio space** because raw `ns_per_op` carries host
+speed and `ratio_to_anchor` does not. Over the 24 most recent amd64 snapshots,
+anchor deviation from the tier median ranges −22.4%..+3.1% while
+`ratio_to_anchor` holds to a median 0.03% and a worst 1.75%.
+
+**The gate is on ratio coherence, not on anchor drift** — which is the obvious
+design and is wrong. Snapshot `a588a69d2759` (EPYC 9V74) sits 22.4% off its
+window's anchor and is uniformly 22.4% fast in raw `ns/op` across all 162 of its
+benchmarks, agreeing with its window on every ratio to within 0.1%: the host was
+fast and the anchor divided that back out, which is what the anchor is for.
+Gating on anchor deviation would discard it and two more like it, two of which
+are snapshots this baseline is seeded from.
+
+What does need rejecting is the *mixed* capture — anchor caught the slow tail,
+benchmarks did not — where every ratio is uniformly wrong while the raw numbers
+look ordinary. That shows up as a whole-snapshot offset in normalized space,
+well clear of the 1.75% the corpus exhibits.
+
+This approach makes the baseline auditable (provenance is in git history), CI-sourced
+(no local machine capture noise), and reproducible across runs (idempotent).
 
 ## Streaming visibility
 
@@ -176,7 +347,13 @@ into a second `.jsonl` and aggregating both.
       "ns_per_op": 45590.0,
       "allocs_per_op": 720,
       "bytes_per_op": 41200,
-      "ratio_to_anchor": 41862.4
+      "ratio_to_anchor": 41862.4,
+      "best_since_sha": "<short-sha>",
+      "best_since_at": "2026-09-07T05:34:02Z",
+      "allocs_since_sha": "<short-sha>",
+      "allocs_since_at": "2026-09-07T05:34:02Z",
+      "bytes_since_sha": "<short-sha>",
+      "bytes_since_at": "2026-09-07T05:34:02Z"
     }
   }
 }
@@ -186,6 +363,52 @@ into a second `.jsonl` and aggregating both.
   drift checks. Comparisons across machines should ignore them.
 - `ratio_to_anchor` = `ns_per_op / anchor.ns_per_op`. This is what the
   `check` mode actually compares.
+- `best_since_sha` / `best_since_at` date the entry as a whole: the run that
+  last moved **any** of its metrics toward better. They are what the timing
+  report's "best since" column names.
+- `allocs_since_sha` / `allocs_since_at` date `allocs_per_op`, and
+  `bytes_since_sha` / `bytes_since_at` date `bytes_per_op` — each the run that
+  most recently **confirmed** that metric (measured it equal to or better than
+  the stored value), and so the newest run that measured what is stored. A run
+  that measures a metric worse leaves its value and stamp untouched — the
+  ratchet only tightens — but a run that merely re-measures the same value
+  still restamps, because it is current evidence for the code state, and the
+  gate ranks by newest evidence. They exist because `best_since_*` also moves
+  on a timing-only win, which would date
+  a pinned allocation floor to a commit that never measured it. The two metrics
+  are dated **separately** because the ratchet takes each one's minimum
+  separately: a run that lowers allocs while regressing bytes leaves this run's
+  allocs stored beside an older run's bytes, and one stamp over both would date
+  the kept metric to a commit that never produced it. The
+  [deterministic gate](#the-deterministic-gate-allocsop-bytesop) selects its
+  reference per metric by these stamps, falling back to the profile's capture
+  identity only for a row that was never ratcheted (see that section for the two
+  cases).
+
+### Where the recorded SHA comes from
+
+Every stamp above, and the `<sha>-<ts>.jsonl` capture filename, names the commit
+whose tree was benchmarked. It is resolved from the version control state of the
+directory the run started in:
+
+- **In a jj repository**, from this workspace's own commit — `@` when the working
+  copy differs from its parent, the parent when it does not (a clean checkout's
+  `@` is an empty commit that describes nothing). jj keeps its commits in the git
+  object store, so the result is an ordinary git sha that `git cat-file` resolves;
+  the tool verifies that before recording it, exporting first if jj has not yet.
+- **Otherwise**, from `git rev-parse HEAD`.
+
+`git rev-parse HEAD` is deliberately *not* used in a jj repository. A colocated
+jj repo keeps one git HEAD for the whole repository, tracking whatever the
+default workspace last exported, so every workspace reports the same value no
+matter which commit it is on — a capture taken in a workspace sitting on `main`
+can be stamped with an unrelated local commit. The failure is silent and the
+recorded sha looks plausible.
+
+A run whose commit is not reachable from any remote-tracking ref prints a
+warning. Such a baseline is still valid evidence locally, but nobody who has not
+fetched that commit can reproduce it, so publish the commit or pass `-sha
+<published commit>` when the run represents one.
 
 ## How the check works
 
@@ -207,6 +430,64 @@ current run that don't appear in the baseline are flagged **NEW**.
 The default budget is **5%**. Raise it for noisy benchmarks via
 `-budget`. Lower it once you've improved benchmark stability (e.g.
 `-benchtime 5s -count 5`).
+
+### The deterministic gate (allocs/op, bytes/op)
+
+`allocs/op` and `bytes/op` carry no CPU-dependent noise, so they are gated
+separately from timing, at a tight 2% budget, and on every machine — including
+one with no timing profile of its own.
+
+They are a property of **the code at a commit**, not of a machine. That is what
+makes them portable across profiles, and it is also why the reference is **not**
+a minimum across profiles. Each profile is captured at whatever commit its
+machine last ran at, and a tier keeps its last numbers indefinitely once its
+runner stops reporting — so the profiles present at any moment describe several
+different code states. A minimum over them answers "the least anyone has ever
+measured", which is a fact about the fleet's history rather than about any one
+commit, and gates current code against whichever code state happened to allocate
+least.
+
+So for each benchmark the reference is **the value with the newest provenance
+among the profiles that carry it** — the most recent commit anyone measured it
+at — with rows from the **same commit** reduced to their minimum, so the bar
+still ratchets across repeated measurements of one code state.
+
+`allocs_per_op` and `bytes_per_op` are selected **separately**, since they are
+dated separately: a profile can hold a freshly measured allocs figure beside a
+bytes figure the ratchet kept from an older run, and taking both from whichever
+row won on one of them would either throw away the fresh measurement or adopt
+the stale one.
+
+Provenance is the metric's own `allocs_since_*` / `bytes_since_*` stamp when it
+has one. A value predating those fields is read in one of two ways:
+
+- **No `best_since_*` either** — the entry has never been ratcheted, so seed or
+  capture wrote every one of its numbers in the run the profile records. The
+  profile's `captured_at_sha` / `captured_at` is then their exact provenance and
+  is used.
+- **`best_since_*` set, deterministic stamp absent** — the entry HAS been
+  ratcheted, and `best_since_*` moves whenever any metric improves, timing
+  included, so on a row whose allocs/bytes were pinned from an older run it
+  names a commit that never measured them. The profile's `captured_at` is no
+  better: it dates the run that wrote the file, not the run that set a bar the
+  ratchet carried forward. Such a value has **unknown** provenance: it sorts
+  oldest, ties with the other undated values at their minimum, and is displaced
+  by any row that can name its commit.
+
+The reported regression line names the commit the reference came from (`—` when
+unknown), so a surprising bar can be traced to the run that set it.
+
+Same-commit is decided by the SHA, not by the clock. Two machines run one commit
+whenever their queues allow, so equal timestamps neither identify a shared code
+state nor are needed to; conversely two different commits that happen to be
+stamped in the same second are ranked rather than mixed, since a bar assembled
+from two commits describes code that never existed. A merged same-commit group
+then carries the **newest** of its members' timestamps: its claim on describing
+current code rests on its latest capture, not on whichever profile happened to be
+read first. The timestamp orders groups across commits (a SHA cannot be ordered
+without the repository, and baselines are read on machines that lack the
+history), and breaks a remaining tie by SHA so the selection does not depend on
+map order.
 
 ## Running the check on a PR (the `perf` label)
 
@@ -257,25 +538,43 @@ The anchor's absolute `ns_per_op` between baseline and current is
 printed at the top of every `check` report. If it has drifted a lot,
 the ratio comparison is on shakier ground.
 
-## The baseline starts at v1.8.0
+## Baseline seeding and machine-key selection
 
-The active `docs/perf/baseline.json` is initialized as a copy of
-`docs/perf/historical/v1.8.0.json`. This means `make bench-ratchet`
-asks "how does the current code compare to the v1.8.0 release?",
-not "to whatever main looked like yesterday." A regression bar
-anchored to a release is meaningful; one anchored to yesterday's
-main just tracks noise.
+The active `docs/perf/baseline.json` is seeded from CI timeline snapshots and
+gates against the incremental (newest) snapshot for real-time drift tracking:
 
-Two consequences:
+- **amd64 profiles**: Seeded from a median over the most recent snapshots per
+  amd64 machine key (e.g. AMD EPYC 7763, 9V74) to survive runner rotation. The
+  gate budget is 5%; no null control has been run on these tiers, so the floor
+  beneath that budget — the gap between two builds that cannot differ — is not
+  yet measured here.
 
-- Some current benchmarks (e.g. `BenchmarkRatchetAnchor` itself,
-  `BenchmarkIRPipelineCompile`) didn't exist at v1.8.0. They'll be
-  flagged **NEW** in every check, which is informational, not a
-  regression. Once they've matured into "things we want to gate on,"
-  do a deliberate `update` to lift them into the bar.
-- Some v1.8.0 benchmarks may have been renamed or removed. They'll
-  appear as **MISSING**. Same treatment — `update` clears them
-  out of the comparison once you confirm the removal was intentional.
+- **arm64/Apple M3**: Preserved from any existing local baseline, allowing M3
+  developers to gate against a machine-specific baseline without CI noise.
+
+- **arm64/Apple M1 (Virtual)**: Deliberately excluded (per #651) because CI
+  runner noise (27.2% of entries) is too high for reliable ratcheting; reverts
+  to deterministic-only gating at `main.go:452-459`.
+
+The `captured_at_sha` field in each machine entry points to the incremental SHA,
+representing the "current" state for `make bench-ratchet check` comparisons.
+
+The `bench-ratchet seed-baseline` command (§ [Seeding from CI](#seeding-from-ci))
+reduces a window of timeline snapshots from the perf-data branch, making the
+baseline reproducible, auditable, and independent of local machine captures.
+
+## Current baseline: amd64-seeded with M3 fallback
+
+The active `docs/perf/baseline.json` is seeded from CI timeline snapshots via
+`seed-baseline`, with amd64 as the primary machine tier and the existing local
+M3 profile (arm64/Apple M3) preserved for local developer gating. This means
+`make bench-ratchet` gates against a median of the most recent successful amd64
+builds in CI, providing a durable, reproducible baseline free of local machine
+noise.
+
+A future release-reference baseline (#597, separate) will backfill v1.8.0
+reference snapshots for each machine tier to answer "how do we compare to the
+last release?"; that work will coexist with the current drift-tracking baseline.
 
 ## Updating the baseline (the ratchet)
 
@@ -289,7 +588,7 @@ metric)` is the MIN of (existing baseline, current). So:
 | Bench got faster than baseline | New (faster) value adopted. |
 | Bench got more allocs but the same speed | Speed adopted (it didn't change); allocs **pinned at baseline** — the new (higher) alloc count is rejected. |
 | Bench is brand new (not in baseline) | Adopted as-is. There's no prior bar to ratchet against. |
-| Bench in baseline but missing from current | **Kept in baseline** — a removed/renamed benchmark shouldn't release the bar. Use `-force` to drop it intentionally. |
+| Bench in baseline but missing from current | **Kept in baseline** — a removed/renamed benchmark shouldn't release the bar accidentally. |
 
 `update` prints a summary of what tightened, what would-have-regressed-
 but-was-pinned, what's new, and what's missing-but-kept. A pinned
@@ -300,14 +599,49 @@ run.
 
 ### `-force`
 
-`go run ./cmd/bench-ratchet -force update` bypasses the ratchet and
-writes current numbers as-is, including any regressions. Use only
-when:
+`go run ./cmd/bench-ratchet -force update` bypasses the ratchet for the current
+machine's **timing**: it writes this run's `ns_per_op` / `ratio_to_anchor` as-is,
+regressions included, stamped with this run's commit, and writes no other
+profile. Unmeasured entries are retained, so a fast-gate rebaseline cannot erase
+full-profile history.
+
+`allocs/op` and `bytes/op` are not part of that bargain. Timing is a property of
+the host, so a machine may re-declare its own; the deterministic pair is a
+property of the code at a commit and every profile is gated against it, so a
+local recapture that allocates more is a regression everywhere rather than a
+number this host gets to reset. A forced update therefore keeps any stored
+deterministic value it measured worse, along with its
+`allocs_since_*` or `bytes_since_*` stamp — each metric keeps or adopts on its
+own — and prints what it declined:
+
+```
+  NOT ACCEPTED (deterministic regression; stored bar kept — re-run with -accept-deterministic to record it):
+    ! pkg/ir.BenchmarkIRCompile [bytecode]   bytes/op  kept 4941030 (since 477a5d36e25f), measured 5232922
+```
+
+A forced update is gated on **both** bars, not just this machine's. A value can
+be an improvement over a stale local row and still be a regression against the
+newest row any profile carries; since the gate selects by newest provenance,
+adopting it would stamp it as the newest evidence and raise the bar everyone is
+measured against, so the regression it represents would stop being reported.
+Either violation keeps the stored value and its date, and the rejection names
+whichever bar was exceeded.
+
+An improvement needs no ceremony: it is lower, so it ratchets and takes this
+run's stamp. So does a value measured **equal** to the stored one: a timing
+recapture that re-measures the same allocations is current evidence for them,
+and dating it keeps a legacy row from losing to an older, worse profile. To record a regression deliberately, add
+`-accept-deterministic`, which writes the measured pair and dates it to this run.
+Accepted values reach the
+[deterministic gate](#the-deterministic-gate-allocsop-bytesop) by being the
+newest measurement of them, so no other tier has to be told; copying them into
+the other profiles would record one machine's local capture as those tiers'
+stored floor under a commit they never ran.
+
+Use only when:
 
 - A regression has been investigated, discussed, and accepted as
   the new floor (rare; should have a paper trail in the commit).
-- A benchmark was renamed or removed and you want to drop the
-  historical entry.
 - Initial seeding — though a missing `baseline.json` triggers a
   one-shot write without `-force`.
 
@@ -316,6 +650,9 @@ What NOT to do:
 - Don't `-force` to silence a regression you can't explain. The
   whole point of the system is to surface regressions; force-updating
   defeats it. Investigate first.
+- Don't reach for `-accept-deterministic` to clear the "NOT ACCEPTED" lines. An
+  allocation regression the gate reports on every machine needs the paper trail,
+  not the flag.
 - Don't bundle a baseline update with the change being measured —
   split them so the reviewer sees which numbers moved and why.
 

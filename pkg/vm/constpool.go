@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"reflect"
 	"unsafe"
 )
 
@@ -122,6 +123,39 @@ func (c *Consts) Append(v Value) int {
 	return idx
 }
 
+// AppendDeferred takes the next index for a value that is not decoded yet and
+// leaves the slot nil. The slot is not entered into the dedup table — Intern
+// cannot hand its index to new code — so nothing can observe it before
+// SetDeferred fills it. Used by the bundle decoder for the function constants
+// of a namespace whose chunks decode on first require.
+func (c *Consts) AppendDeferred() int {
+	idx := c.base + len(c.consts)
+	c.consts = append(c.consts, nil)
+	return idx
+}
+
+// SetDeferred fills a slot taken by AppendDeferred. It reports whether the
+// slot was still empty; a slot that was already filled is left untouched so a
+// second materialization cannot replace a value code may already hold. The
+// value stays out of the dedup table (see AppendDeferred): a decoded function
+// is a fresh pointer no compilation can intern.
+func (c *Consts) SetDeferred(i int, v Value) bool {
+	if i < c.base {
+		return c.parent.SetDeferred(i, v)
+	}
+	if c.consts[i-c.base] != nil {
+		return false
+	}
+	c.consts[i-c.base] = v
+	return true
+}
+
+// IsDeferred reports whether index i is a slot taken by AppendDeferred that
+// SetDeferred has not filled yet.
+func (c *Consts) IsDeferred(i int) bool {
+	return c.get(i) == nil
+}
+
 func (c *Consts) get(i int) Value {
 	if i >= c.base {
 		return c.consts[i-c.base]
@@ -217,7 +251,33 @@ func (c *Consts) grow() {
 
 // constHash computes a hash for deduplication in the const pool.
 // Pointer-identity types hash by address; structural types use hashValue.
+// collectionIdentity is the identity of a collection constant: its pointer,
+// map or slice header. A collection literal is its own constant, as Clojure
+// registers constants by identity: two literals of equal content stay two
+// values, so a map literal keeps its own key order (map equality ignores it)
+// and two literal sites are never one object.
+func collectionIdentity(v Value) (uintptr, int, bool) {
+	if _, ok := v.(Collection); !ok {
+		return 0, 0, false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map:
+		return rv.Pointer(), 0, true
+	case reflect.Slice:
+		return rv.Pointer(), rv.Len(), true
+	}
+	return 0, 0, false
+}
+
 func constHash(v Value) uint32 {
+	if p, n, ok := collectionIdentity(v); ok {
+		// The pool keys a collection by identity, but still fills its hash
+		// cache here: a constant is shared by every goroutine that runs its
+		// chunk, and a collection caches its hash without synchronization.
+		Prehash(v)
+		return hashUint64(uint64(p) ^ uint64(n)<<1)
+	}
 	switch x := v.(type) {
 	case *Func:
 		return hashUint64(uint64(uintptr(unsafe.Pointer(x))))
@@ -253,7 +313,14 @@ func constHash(v Value) uint32 {
 // Pointer-identity types use pointer equality; value types use same-type
 // structural comparison (never merging across types like Int/Float/BigInt).
 func constEqual(a, b Value) bool {
-	switch a.(type) {
+	if pa, na, ok := collectionIdentity(a); ok {
+		pb, nb, okb := collectionIdentity(b)
+		return okb && pa == pb && na == nb && a.Type() == b.Type()
+	}
+	switch a := a.(type) {
+	case DefMetaPairs:
+		other, ok := b.(DefMetaPairs)
+		return ok && a.Equals(other)
 	case *Func, *Var, *BigInt, *Ratio, *BigDecimal, *Record, *RecordType, *Regex, *Atom:
 		return a == b
 	default:

@@ -24,7 +24,7 @@
    [ir.data]
    [string :as str]))
 
-(def terminator-ops #{:tail-call :return :branch :branch-if})
+(def terminator-ops #{:tail-call :recur-fn :return :branch :branch-if})
 
 (defn op-display-name [op-kw]
   "Convert an ir op keyword (e.g. :branch-if, :load-arg) to its
@@ -136,11 +136,8 @@
                       "")
                     "\n")
         body   (str/join "" (map (fn [id] (write-node f id)) insts))
-        ;; The Go version emits the terminator if Term != 0 OR the block has any body insts.
-        ;; Term defaults to 0; blocks without a real terminator skip it.
-        term-line (if (or (not= term 0) (seq insts))
-                    (write-node f term)
-                    "")]
+        ;; :term is nil when unset; InstId 0 is a real terminator.
+        term-line (if term (write-node f term) "")]
     (str header body term-line "\n")))
 
 (defn dump [f]

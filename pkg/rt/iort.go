@@ -33,6 +33,24 @@ func NewIOHandle(f *os.File) *IOHandle {
 	return &IOHandle{name: f.Name(), file: f, writer: f, reader: f}
 }
 
+// stdStreamWriter defers to the CURRENT value of a std-stream package
+// variable (os.Stdout / os.Stderr) at every write. The *out*/*err* handles
+// live for the whole process, but tests silence output by swapping the
+// package variable (the documented mechanism in BenchmarkClojureTestSuite);
+// capturing the *os.File value at install time made those swaps no-ops, and
+// the suite's prints then landed between go test's benchmark name and its
+// metrics line, breaking benchfmt parsing in cmd/bench-ratchet.
+type stdStreamWriter struct{ cur func() *os.File }
+
+func (w stdStreamWriter) Write(p []byte) (int, error) { return w.cur().Write(p) }
+
+// newStdStreamHandle builds the boot-time handle for a std stream: writes
+// re-read the package variable via cur; file keeps the ORIGINAL *os.File so
+// Fd()/Sync() (term raw mode) still target the real descriptor.
+func newStdStreamHandle(orig *os.File, cur func() *os.File) *IOHandle {
+	return &IOHandle{name: orig.Name(), file: orig, writer: stdStreamWriter{cur}}
+}
+
 // NewWriterHandle wraps an arbitrary io.Writer. No reads.
 func NewWriterHandle(name string, w io.Writer) *IOHandle {
 	return &IOHandle{name: name, writer: w}
@@ -52,6 +70,25 @@ func (h *IOHandle) File() *os.File { return h.file }
 // refactor consults.
 func (h *IOHandle) Writer() io.Writer    { return h.writer }
 func (h *IOHandle) ReaderRaw() io.Reader { return h.reader }
+
+// ProcessWriter returns the writer to hand a child process. Go's os/exec
+// passes an *os.File through as the child's descriptor and pipes anything
+// else, so file-backed handles yield their file: the std-stream handles
+// resolve the CURRENT os.Stdout/os.Stderr (test-time swaps still redirect
+// the child), and a handle over a file from `open` yields that file.
+// Handles over arbitrary writers (with-out-str, io/buffer) keep the writer.
+func (h *IOHandle) ProcessWriter() io.Writer {
+	if w, ok := h.writer.(stdStreamWriter); ok {
+		if f := w.cur(); f != nil {
+			return f
+		}
+		return h.writer
+	}
+	if h.file != nil && h.writer == io.Writer(h.file) {
+		return h.file
+	}
+	return h.writer
+}
 
 // Write is the convenience write-string path used by the print fns and
 // (write! handle x). Returns an error if the handle isn't writable.
@@ -320,9 +357,11 @@ func installIOBuiltins(ns *vm.Namespace) {
 		return vm.NIL, os.MkdirAll(string(path), 0755)
 	})
 
-	// *in*, *out*, *err* — stdin, stdout, stderr as IOHandle
-	stdoutHandle := vm.NewBoxed(NewIOHandle(os.Stdout))
-	stderrHandle := vm.NewBoxed(NewIOHandle(os.Stderr))
+	// *in*, *out*, *err* — stdin, stdout, stderr as IOHandle. Writers defer
+	// to the CURRENT os.Stdout/os.Stderr per write (see stdStreamWriter) so
+	// test-time swaps of the package variables still silence lg output.
+	stdoutHandle := vm.NewBoxed(newStdStreamHandle(os.Stdout, func() *os.File { return os.Stdout }))
+	stderrHandle := vm.NewBoxed(newStdStreamHandle(os.Stderr, func() *os.File { return os.Stderr }))
 
 	ns.Def("open", openf)
 	ns.Def("close!", closef)
@@ -336,6 +375,21 @@ func installIOBuiltins(ns *vm.Namespace) {
 	ns.Def("*in*", stdinHandle)
 	ns.Def("*out*", stdoutHandle)
 	ns.Def("*err*", stderrHandle)
+
+	// register-test-out — (register-test-out (var *test-out*)). Called by
+	// test.lg right after *test-out* is interned so InstallHostOutputRoots
+	// can update it alongside *out*/*err* regardless of load order.
+	ns.Def("register-test-out", vm.NewCtxNativeFn("register-test-out", func(ec *vm.ExecContext, vs []vm.Value) (vm.Value, error) {
+		if len(vs) != 1 {
+			return vm.NIL, fmt.Errorf("register-test-out expects 1 arg")
+		}
+		v, ok := vs[0].(*vm.Var)
+		if !ok {
+			return vm.NIL, fmt.Errorf("register-test-out expected Var")
+		}
+		RegisterTestOut(v)
+		return vm.NIL, nil
+	}))
 
 	// *emit* — host event sink for (js/emit ...). Defaults to a no-op so
 	// emit is harmless when no host is listening; the WASM bundle installs
@@ -354,6 +408,63 @@ func installIOBuiltins(ns *vm.Namespace) {
 	// per-process memory so native dev/tests get deterministic behavior even
 	// when no persistent host binding is installed.
 	ns.Def("*storage*", vm.NewBoxed(NewMemoryStorage()))
+
+	// *surface* — host RGBA frame sink for the surface namespace. Defaults to a
+	// no-op so (surface/present ...) is harmless and (surface/available?) is
+	// false when nothing is wired, the same way *emit* does. See surface.go.
+	ns.Def("*surface*", vm.NewBoxed(nopSurface{}))
+}
+
+// registeredHostStdout is the host's stdout handle after
+// InstallHostOutputRoots; nil until a host installs one. Written only by
+// InstallHostOutputRoots and read by RegisterTestOut; both run during
+// single-threaded host/guest setup before any concurrent guest execution
+// begins, so no lock is needed here.
+var registeredHostStdout *IOHandle
+
+// testOutVar is test/*test-out* once interned (RegisterTestOut), so a later
+// InstallHostOutputRoots can update it in the same operation as *out*. Same
+// single-threaded-setup assumption as registeredHostStdout above.
+var testOutVar *vm.Var
+
+// InstallHostOutputRoots replaces the process roots of *out* and *err* with
+// the host's handles, and *test-out* too if the test namespace is already
+// loaded. Hosts must use this instead of SetRoot on *out* directly so the
+// two vars never disagree. Spec 10.2.
+func InstallHostOutputRoots(stdout, stderr *IOHandle) {
+	registeredHostStdout = stdout
+	core := NS(NameCoreNS)
+	// One shared Boxed for *out* and *test-out* so they stay `identical?`
+	// after install, matching the pre-install path where *test-out*'s root
+	// is seeded directly from *out*'s current Boxed value.
+	stdoutBox := vm.NewBoxed(stdout)
+	if v := core.LookupLocal(vm.Symbol("*out*")); v != nil {
+		v.SetRoot(stdoutBox)
+	}
+	if v := core.LookupLocal(vm.Symbol("*err*")); v != nil {
+		v.SetRoot(vm.NewBoxed(stderr))
+	}
+	if testOutVar != nil {
+		testOutVar.SetRoot(stdoutBox)
+	}
+}
+
+// RegisterTestOut records test/*test-out* and seeds its root: the host
+// stdout if one is installed, else the current root of *out*. Called by
+// test.lg immediately after the var is interned, so either load order works.
+func RegisterTestOut(v *vm.Var) {
+	testOutVar = v
+	if registeredHostStdout != nil {
+		v.SetRoot(vm.NewBoxed(registeredHostStdout))
+		return
+	}
+	if out := NS(NameCoreNS).LookupLocal(vm.Symbol("*out*")); out != nil {
+		// Root(), not Deref(): Deref returns the current dynamic top
+		// binding when one is pushed (e.g. inside an api.WithStdout Run),
+		// which would bake a per-Run writer into *test-out*'s ROOT. The
+		// brief specifies the current ROOT of *out*.
+		v.SetRoot(out.Root())
+	}
 }
 
 // resolveIOHandleVar looks up a var (e.g. "*out*") in the core namespace
@@ -382,6 +493,8 @@ func resolveIOHandleVar(ec *vm.ExecContext, varName string) *IOHandle {
 		return u
 	case *os.File:
 		return NewIOHandle(u)
+	case *LGBuffer:
+		return &IOHandle{name: "io/buffer", writer: u}
 	}
 	return nil
 }
